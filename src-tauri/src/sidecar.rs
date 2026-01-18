@@ -1053,7 +1053,8 @@ impl SidecarManager {
 
         let body = serde_json::json!({
             "command": command,
-            "arguments": ""
+            "arguments": "",
+            "agent": "build"
         });
 
         let response = self
