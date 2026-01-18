@@ -662,107 +662,121 @@ export function Chat({
     }
   };
 
-  const handleSend = async (content: string, attachments?: FileAttachment[]) => {
-    setError(null);
+  const handleSend = useCallback(
+    async (content: string, attachments?: FileAttachment[]) => {
+      setError(null);
 
-    // If sidecar isn't running, try to start it
-    let currentStatus = sidecarStatus;
-    if (currentStatus !== "running") {
-      try {
-        await connectSidecar();
-        currentStatus = await getSidecarStatus();
-      } catch (e) {
-        console.error("Failed to connect:", e);
-        return;
-      }
+      // If sidecar isn't running, try to start it
+      let currentStatus = sidecarStatus;
       if (currentStatus !== "running") {
-        return;
-      }
-    }
-
-    // Create session if needed
-    let sessionId = currentSessionId;
-    if (!sessionId) {
-      try {
-        const session = await createSession();
-        sessionId = session.id;
-        setCurrentSessionId(session.id);
-        onSessionCreated?.(session.id);
-      } catch (e) {
-        setError(`Failed to create session: ${e}`);
-        return;
-      }
-    }
-
-    // Add user message
-    const userMessage: MessageProps = {
-      id: crypto.randomUUID(),
-      role: "user",
-      content,
-      timestamp: new Date(),
-      // Show attachments in message if any
-      attachments: attachments?.map((a) => ({
-        name: a.name,
-        type: a.type,
-        preview: a.preview,
-      })),
-    };
-    setMessages((prev) => [...prev, userMessage]);
-
-    // Add placeholder assistant message
-    const assistantMessage: MessageProps = {
-      id: crypto.randomUUID(),
-      role: "assistant",
-      content: "",
-      timestamp: new Date(),
-    };
-    setMessages((prev) => [...prev, assistantMessage]);
-    setIsGenerating(true);
-    currentAssistantMessageRef.current = "";
-    currentAssistantMessageIdRef.current = null; // Reset the message ID ref
-    lastEventAtRef.current = Date.now();
-    if (generationTimeoutRef.current) {
-      clearTimeout(generationTimeoutRef.current);
-    }
-    generationTimeoutRef.current = setTimeout(() => {
-      if (lastEventAtRef.current && Date.now() - lastEventAtRef.current >= 60000) {
-        setError("Response timed out. Try again or stop and restart the chat.");
-        setIsGenerating(false);
-        currentAssistantMessageRef.current = "";
-      }
-    }, 60000);
-
-    try {
-      // Convert attachments to API format
-      const attachmentInputs: FileAttachmentInput[] | undefined = attachments?.map((a) => ({
-        mime: a.mime,
-        filename: a.name,
-        url: a.url,
-      }));
-
-      // Send message and stream response
-      await sendMessageStreaming(sessionId, content, attachmentInputs);
-    } catch (e) {
-      const errorMessage = e instanceof Error ? e.message : String(e);
-      setError(`Failed to send message: ${errorMessage}`);
-      setIsGenerating(false);
-
-      // Update the assistant message with error
-      setMessages((prev) => {
-        const lastMessage = prev[prev.length - 1];
-        if (lastMessage && lastMessage.role === "assistant" && !lastMessage.content) {
-          return [
-            ...prev.slice(0, -1),
-            {
-              ...lastMessage,
-              content: `Error: ${errorMessage}`,
-            },
-          ];
+        try {
+          await connectSidecar();
+          currentStatus = await getSidecarStatus();
+        } catch (e) {
+          console.error("Failed to connect:", e);
+          return;
         }
-        return prev;
-      });
-    }
-  };
+        if (currentStatus !== "running") {
+          return;
+        }
+      }
+
+      // Create session if needed
+      let sessionId = currentSessionId;
+      if (!sessionId) {
+        try {
+          const session = await createSession();
+          sessionId = session.id;
+          setCurrentSessionId(session.id);
+          onSessionCreated?.(session.id);
+        } catch (e) {
+          setError(`Failed to create session: ${e}`);
+          return;
+        }
+      }
+
+      // Add user message
+      const userMessage: MessageProps = {
+        id: crypto.randomUUID(),
+        role: "user",
+        content,
+        timestamp: new Date(),
+        // Show attachments in message if any
+        attachments: attachments?.map((a) => ({
+          name: a.name,
+          type: a.type,
+          preview: a.preview,
+        })),
+      };
+      setMessages((prev) => [...prev, userMessage]);
+
+      // Add placeholder assistant message
+      const assistantMessage: MessageProps = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: "",
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, assistantMessage]);
+      setIsGenerating(true);
+      currentAssistantMessageRef.current = "";
+      currentAssistantMessageIdRef.current = null; // Reset the message ID ref
+      lastEventAtRef.current = Date.now();
+      if (generationTimeoutRef.current) {
+        clearTimeout(generationTimeoutRef.current);
+      }
+      generationTimeoutRef.current = setTimeout(() => {
+        if (lastEventAtRef.current && Date.now() - lastEventAtRef.current >= 60000) {
+          setError("Response timed out. Try again or stop and restart the chat.");
+          setIsGenerating(false);
+          currentAssistantMessageRef.current = "";
+        }
+      }, 60000);
+
+      try {
+        // Convert attachments to API format
+        const attachmentInputs: FileAttachmentInput[] | undefined = attachments?.map((a) => ({
+          mime: a.mime,
+          filename: a.name,
+          url: a.url,
+        }));
+
+        // Send message and stream response
+        await sendMessageStreaming(sessionId, content, attachmentInputs);
+      } catch (e) {
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        setError(`Failed to send message: ${errorMessage}`);
+        setIsGenerating(false);
+
+        // Update the assistant message with error
+        setMessages((prev) => {
+          const lastMessage = prev[prev.length - 1];
+          if (lastMessage && lastMessage.role === "assistant" && !lastMessage.content) {
+            return [
+              ...prev.slice(0, -1),
+              {
+                ...lastMessage,
+                content: `Error: ${errorMessage}`,
+              },
+            ];
+          }
+          return prev;
+        });
+      }
+    },
+    [
+      sidecarStatus,
+      currentSessionId,
+      onSessionCreated,
+      connectSidecar,
+      getSidecarStatus,
+      createSession,
+      sendMessageStreaming,
+      setError,
+      setIsGenerating,
+      setMessages,
+    ]
+  );
 
   const handleStop = async () => {
     if (currentSessionId) {
