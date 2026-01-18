@@ -623,7 +623,7 @@ export function Chat({
         }
       }
     },
-    [isGenerating]
+    [isGenerating, currentSessionId, propSessionId]
   );
 
   // Listen for sidecar events
