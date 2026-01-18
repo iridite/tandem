@@ -155,98 +155,101 @@ export function Chat({
     checkGitRepo();
   }, [workspacePath]);
 
-  const loadSessionHistory = async (sessionId: string) => {
-    setIsLoadingHistory(true);
-    try {
-      // Check if sidecar is running before attempting to load
-      const status = await getSidecarStatus();
-      if (status !== "running") {
-        console.log("[LoadHistory] Sidecar not running, skipping history load");
-        setIsLoadingHistory(false);
-        return;
-      }
-
-      const sessionMessages = await getSessionMessages(sessionId);
-
-      console.log("[LoadHistory] Received", sessionMessages.length, "messages from OpenCode");
-
-      // Log FULL message structure to see all available fields
-      if (sessionMessages.length > 0) {
-        console.log(
-          "[LoadHistory] FULL message structure sample:",
-          JSON.stringify(sessionMessages[0], null, 2)
-        );
-      }
-
-      console.log(
-        "[LoadHistory] Messages with flags:",
-        sessionMessages.map((m) => ({
-          id: m.info.id,
-          role: m.info.role,
-          reverted: m.info.reverted,
-          deleted: m.info.deleted,
-          hasRevertedFlag: "reverted" in m.info,
-          hasDeletedFlag: "deleted" in m.info,
-        }))
-      );
-
-      // Convert session messages to our format
-      const convertedMessages: MessageProps[] = [];
-
-      for (const msg of sessionMessages) {
-        // Skip reverted or deleted messages
-        if (msg.info.reverted || msg.info.deleted) {
-          console.log(`[LoadHistory] Skipping reverted/deleted message: ${msg.info.id}`);
-          continue;
+  const loadSessionHistory = useCallback(
+    async (sessionId: string) => {
+      setIsLoadingHistory(true);
+      try {
+        // Check if sidecar is running before attempting to load
+        const status = await getSidecarStatus();
+        if (status !== "running") {
+          console.log("[LoadHistory] Sidecar not running, skipping history load");
+          setIsLoadingHistory(false);
+          return;
         }
 
-        const role = msg.info.role as "user" | "assistant" | "system";
+        const sessionMessages = await getSessionMessages(sessionId);
 
-        // Extract text content from parts
-        let content = "";
-        const toolCalls: MessageProps["toolCalls"] = [];
+        console.log("[LoadHistory] Received", sessionMessages.length, "messages from OpenCode");
 
-        for (const part of msg.parts) {
-          const partObj = part as Record<string, unknown>;
-          if (partObj.type === "text" && partObj.text) {
-            content += partObj.text as string;
-          } else if (partObj.type === "tool" || partObj.type === "tool-invocation") {
-            const state = partObj.state as Record<string, unknown> | undefined;
-            toolCalls.push({
-              id: (partObj.id || partObj.callID || "") as string,
-              tool: (partObj.tool || "unknown") as string,
-              args: (state?.input || partObj.args || {}) as Record<string, unknown>,
-              result: state?.output ? String(state.output) : undefined,
-              status:
-                state?.status === "completed"
-                  ? "completed"
-                  : state?.status === "failed"
-                    ? "failed"
-                    : "pending",
+        // Log FULL message structure to see all available fields
+        if (sessionMessages.length > 0) {
+          console.log(
+            "[LoadHistory] FULL message structure sample:",
+            JSON.stringify(sessionMessages[0], null, 2)
+          );
+        }
+
+        console.log(
+          "[LoadHistory] Messages with flags:",
+          sessionMessages.map((m) => ({
+            id: m.info.id,
+            role: m.info.role,
+            reverted: m.info.reverted,
+            deleted: m.info.deleted,
+            hasRevertedFlag: "reverted" in m.info,
+            hasDeletedFlag: "deleted" in m.info,
+          }))
+        );
+
+        // Convert session messages to our format
+        const convertedMessages: MessageProps[] = [];
+
+        for (const msg of sessionMessages) {
+          // Skip reverted or deleted messages
+          if (msg.info.reverted || msg.info.deleted) {
+            console.log(`[LoadHistory] Skipping reverted/deleted message: ${msg.info.id}`);
+            continue;
+          }
+
+          const role = msg.info.role as "user" | "assistant" | "system";
+
+          // Extract text content from parts
+          let content = "";
+          const toolCalls: MessageProps["toolCalls"] = [];
+
+          for (const part of msg.parts) {
+            const partObj = part as Record<string, unknown>;
+            if (partObj.type === "text" && partObj.text) {
+              content += partObj.text as string;
+            } else if (partObj.type === "tool" || partObj.type === "tool-invocation") {
+              const state = partObj.state as Record<string, unknown> | undefined;
+              toolCalls.push({
+                id: (partObj.id || partObj.callID || "") as string,
+                tool: (partObj.tool || "unknown") as string,
+                args: (state?.input || partObj.args || {}) as Record<string, unknown>,
+                result: state?.output ? String(state.output) : undefined,
+                status:
+                  state?.status === "completed"
+                    ? "completed"
+                    : state?.status === "failed"
+                      ? "failed"
+                      : "pending",
+              });
+            }
+          }
+
+          if (content || toolCalls.length > 0 || role === "user") {
+            convertedMessages.push({
+              id: msg.info.id,
+              role,
+              content,
+              timestamp: new Date(msg.info.time.created),
+              toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
             });
           }
         }
 
-        if (content || toolCalls.length > 0 || role === "user") {
-          convertedMessages.push({
-            id: msg.info.id,
-            role,
-            content,
-            timestamp: new Date(msg.info.time.created),
-            toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-          });
-        }
+        console.log("[LoadHistory] Converted to", convertedMessages.length, "UI messages");
+        setMessages(convertedMessages);
+      } catch (e) {
+        console.error("Failed to load session history:", e);
+        setError("Failed to load chat history");
+      } finally {
+        setIsLoadingHistory(false);
       }
-
-      console.log("[LoadHistory] Converted to", convertedMessages.length, "UI messages");
-      setMessages(convertedMessages);
-    } catch (e) {
-      console.error("Failed to load session history:", e);
-      setError("Failed to load chat history");
-    } finally {
-      setIsLoadingHistory(false);
-    }
-  };
+    },
+    [getSidecarStatus, getSessionMessages, setError, setIsLoadingHistory, setMessages]
+  );
 
   // Helper to determine activity type from tool name
   const getActivityType = (tool: string): ActivityItem["type"] => {
@@ -856,15 +859,14 @@ export function Chat({
         setCurrentSessionId(newSession.id);
         onSessionCreated?.(newSession.id);
 
-        // Clear and reload messages
-        setMessages([]);
-        setIsLoadingHistory(true);
+        // Load the history for the new session
+        await loadSessionHistory(newSession.id);
       } catch (e) {
         const errorMessage = e instanceof Error ? e.message : String(e);
         setError(`Failed to rewind: ${errorMessage}`);
       }
     },
-    [currentSessionId, onSessionCreated]
+    [currentSessionId, onSessionCreated, loadSessionHistory]
   );
 
   const handleRegenerate = useCallback(
