@@ -4,7 +4,7 @@
 use crate::error::{Result, TandemError};
 use crate::keystore::SecureKeyStore;
 use crate::sidecar::{
-    CreateSessionRequest, FilePartInput, Message, ModelInfo, ModelSpec, Project, ProviderInfo,
+    CreateSessionRequest, FilePartInput, ModelInfo, ModelSpec, Project, ProviderInfo,
     SendMessageRequest, Session, SessionMessage, SidecarState, StreamEvent,
 };
 use crate::sidecar_manager::{self, SidecarStatus};
@@ -490,7 +490,7 @@ pub async fn store_api_key(
 
     let key_name = key_type_enum.to_key_name();
     let api_key_value = api_key.clone();
-    let key_type_for_log = key_type.clone();
+    let _key_type_for_log = key_type.clone();
 
     // Clone app handle so we can move it into spawn_blocking
     let app_clone = app.clone();
@@ -1052,7 +1052,7 @@ pub async fn rewind_to_message(
         }
     }
 
-    let target_index = target_index.ok_or_else(|| {
+    let _target_index = target_index.ok_or_else(|| {
         TandemError::Sidecar(format!("Message {} not found in session", message_id))
     })?;
 
@@ -1364,7 +1364,7 @@ pub async fn deny_tool(
     tool_call_id: String,
     tool: Option<String>,
     args: Option<serde_json::Value>,
-    message_id: Option<String>,
+    _message_id: Option<String>,
 ) -> Result<()> {
     // Record denied operations for visibility/debugging (no undo action).
     if let (Some(tool_name), Some(args_val)) = (tool.clone(), args.clone()) {

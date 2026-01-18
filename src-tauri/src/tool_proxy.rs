@@ -7,7 +7,7 @@ use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 /// Journal entry for tracking operations
@@ -198,6 +198,7 @@ impl ToolProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     #[test]
     fn test_operation_journal() {

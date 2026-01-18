@@ -1,7 +1,7 @@
 // Tandem LLM Router
 // Provider-agnostic routing to different LLM backends
 
-use crate::error::{Result, TandemError};
+use crate::error::Result;
 use crate::state::ProvidersConfig;
 use serde::{Deserialize, Serialize};
 

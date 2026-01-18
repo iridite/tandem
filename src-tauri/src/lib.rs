@@ -15,10 +15,7 @@ mod vault;
 use std::sync::RwLock;
 use tauri::Manager;
 use tauri_plugin_store::StoreExt;
-use tauri_plugin_stronghold::stronghold::Stronghold;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-use crate::stronghold::ApiKeyType;
 
 /// Vault state - tracks whether the vault is unlocked and stores the master key
 pub struct VaultState {
