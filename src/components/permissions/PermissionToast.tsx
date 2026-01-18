@@ -5,7 +5,14 @@ import { cn } from "@/lib/utils";
 
 export interface PermissionRequest {
   id: string;
-  type: "read_file" | "write_file" | "create_file" | "delete_file" | "run_command" | "fetch_url" | "list_directory";
+  type:
+    | "read_file"
+    | "write_file"
+    | "create_file"
+    | "delete_file"
+    | "run_command"
+    | "fetch_url"
+    | "list_directory";
   path?: string;
   url?: string;
   command?: string;
@@ -15,6 +22,10 @@ export interface PermissionRequest {
     after: string;
   };
   riskLevel: "low" | "medium" | "high";
+  // Metadata for journaling/undo. Not required by the toast UI.
+  tool?: string;
+  args?: Record<string, unknown>;
+  messageId?: string;
 }
 
 interface PermissionToastProps {
@@ -85,9 +96,7 @@ export function PermissionToast({ request, onApprove, onDeny }: PermissionToastP
       {/* Header */}
       <div className="flex items-center justify-between border-b border-border bg-surface-elevated px-4 py-3">
         <div className="flex items-center gap-3">
-          <div className={cn("rounded-lg border p-2", getRiskColor())}>
-            {getIcon()}
-          </div>
+          <div className={cn("rounded-lg border p-2", getRiskColor())}>{getIcon()}</div>
           <div>
             <h3 className="font-semibold text-text">{getTitle()}</h3>
             <p className="text-xs text-text-subtle">Tandem wants to perform this action</p>
@@ -137,9 +146,7 @@ export function PermissionToast({ request, onApprove, onDeny }: PermissionToastP
             </div>
             <div className="max-h-40 overflow-auto bg-background p-3">
               <pre className="font-mono text-xs">
-                {request.diff.before && (
-                  <div className="text-error">- {request.diff.before}</div>
-                )}
+                {request.diff.before && <div className="text-error">- {request.diff.before}</div>}
                 <div className="text-success">+ {request.diff.after}</div>
               </pre>
             </div>
@@ -169,17 +176,10 @@ export function PermissionToast({ request, onApprove, onDeny }: PermissionToastP
             Deny Always
           </Button>
           <div className="flex gap-2">
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => onApprove("once")}
-            >
+            <Button variant="secondary" size="sm" onClick={() => onApprove("once")}>
               Allow Once
             </Button>
-            <Button
-              size="sm"
-              onClick={() => onApprove("session")}
-            >
+            <Button size="sm" onClick={() => onApprove("session")}>
               Allow
             </Button>
           </div>

@@ -24,7 +24,17 @@ export interface ProvidersConfig {
 export interface AppStateInfo {
   workspace_path: string | null;
   has_workspace: boolean;
+  user_projects: UserProject[];
+  active_project_id: string | null;
   providers_config: ProvidersConfig;
+}
+
+export interface UserProject {
+  id: string;
+  name: string;
+  path: string;
+  created_at: string;
+  last_accessed: string;
 }
 
 // API Key types
@@ -87,6 +97,8 @@ export interface MessageInfo {
   };
   agent?: string;
   model?: unknown;
+  deleted?: boolean;
+  reverted?: boolean;
 }
 
 export interface SessionMessage {
@@ -205,6 +217,34 @@ export async function setWorkspacePath(path: string): Promise<void> {
 
 export async function getWorkspacePath(): Promise<string | null> {
   return invoke("get_workspace_path");
+}
+
+// ============================================================================
+// Project Management
+// ============================================================================
+
+export async function isGitRepo(path: string): Promise<boolean> {
+  return invoke("is_git_repo", { path });
+}
+
+export async function addProject(path: string, name?: string): Promise<UserProject> {
+  return invoke("add_project", { path, name });
+}
+
+export async function removeProject(projectId: string): Promise<void> {
+  return invoke("remove_project", { projectId });
+}
+
+export async function getUserProjects(): Promise<UserProject[]> {
+  return invoke("get_user_projects");
+}
+
+export async function setActiveProject(projectId: string): Promise<void> {
+  return invoke("set_active_project", { projectId });
+}
+
+export async function getActiveProject(): Promise<UserProject | null> {
+  return invoke("get_active_project");
 }
 
 // ============================================================================
@@ -338,15 +378,130 @@ export async function listProvidersFromSidecar(): Promise<ProviderInfo[]> {
 }
 
 // ============================================================================
+// File Operation Undo
+// ============================================================================
+
+export interface JournalEntry {
+  id: string;
+  timestamp: string;
+  tool_name: string;
+  args: unknown;
+  status: "pending_approval" | "approved" | "denied" | "completed" | "rolled_back" | "failed";
+  before_state?: FileSnapshot;
+  after_state?: FileSnapshot;
+  user_approved: boolean;
+}
+
+export interface FileSnapshot {
+  path: string;
+  content?: string;
+  exists: boolean;
+  is_directory: boolean;
+}
+
+export interface UndoResult {
+  reverted_entry_id: string;
+  path: string;
+  operation: string;
+}
+
+export async function canUndoFileChange(): Promise<boolean> {
+  return invoke("can_undo_file_change");
+}
+
+export async function undoLastFileChange(): Promise<UndoResult | null> {
+  return invoke("undo_last_file_change");
+}
+
+export async function getRecentFileOperations(count: number): Promise<JournalEntry[]> {
+  return invoke("get_recent_file_operations", { count });
+}
+
+// ============================================================================
+// Conversation Rewind
+// ============================================================================
+
+export async function rewindToMessage(
+  sessionId: string,
+  messageId: string,
+  editedContent?: string
+): Promise<Session> {
+  return invoke("rewind_to_message", { sessionId, messageId, editedContent });
+}
+
+// ============================================================================
+// Message Undo/Redo (OpenCode native)
+// ============================================================================
+
+export async function undoMessage(sessionId: string, messageId: string): Promise<void> {
+  return invoke("undo_message", { sessionId, messageId });
+}
+
+export async function redoMessage(sessionId: string): Promise<void> {
+  return invoke("redo_message", { sessionId });
+}
+
+export async function undoViaCommand(sessionId: string): Promise<void> {
+  return invoke("undo_via_command", { sessionId });
+}
+
+// ============================================================================
+// Undo (Message + Files)
+// ============================================================================
+
+export async function undoMessageWithFiles(
+  sessionId: string,
+  messageId: string
+): Promise<string[]> {
+  return invoke("undo_message_with_files", { sessionId, messageId });
+}
+
+export async function snapshotFileForMessage(
+  filePath: string,
+  tool: string,
+  messageId: string
+): Promise<void> {
+  return invoke("snapshot_file_for_message", { filePath, tool, messageId });
+}
+
+// ============================================================================
 // Tool Approval
 // ============================================================================
 
-export async function approveTool(sessionId: string, toolCallId: string): Promise<void> {
-  return invoke("approve_tool", { sessionId, toolCallId });
+export async function approveTool(
+  sessionId: string,
+  toolCallId: string,
+  meta?: {
+    tool?: string;
+    args?: Record<string, unknown>;
+    messageId?: string;
+  }
+): Promise<void> {
+  return invoke("approve_tool", {
+    sessionId,
+    toolCallId,
+    tool: meta?.tool,
+    args: meta?.args,
+    messageId: meta?.messageId,
+  });
 }
 
-export async function denyTool(sessionId: string, toolCallId: string): Promise<void> {
-  return invoke("deny_tool", { sessionId, toolCallId });
+export async function denyTool(
+  sessionId: string,
+  toolCallId: string,
+  meta?: {
+    tool?: string;
+    args?: Record<string, unknown>;
+    messageId?: string;
+  }
+): Promise<void> {
+  return invoke("deny_tool", {
+    sessionId,
+    toolCallId,
+    tool: meta?.tool,
+    args: meta?.args,
+    messageId: meta?.messageId,
+  });
 }
 
 // ============================================================================

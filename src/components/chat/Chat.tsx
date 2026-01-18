@@ -18,6 +18,9 @@ import {
   approveTool,
   denyTool,
   getSessionMessages,
+  rewindToMessage,
+  undoViaCommand,
+  isGitRepo,
   type StreamEvent,
   type SidecarState,
   type FileAttachmentInput,
@@ -45,8 +48,10 @@ export function Chat({
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [activities, setActivities] = useState<ActivityItem[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [isGitRepository, setIsGitRepository] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const currentAssistantMessageRef = useRef<string>("");
+  const currentAssistantMessageIdRef = useRef<string | null>(null);
   const generationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastEventAtRef = useRef<number | null>(null);
 
@@ -95,7 +100,19 @@ export function Chat({
 
   // Sync internal session ID with prop
   useEffect(() => {
+    console.log("[Chat] Session ID changed from", currentSessionId, "to", propSessionId || null);
     setCurrentSessionId(propSessionId || null);
+
+    // Clear any ongoing generation state when session changes
+    setIsGenerating(false);
+    currentAssistantMessageRef.current = "";
+    currentAssistantMessageIdRef.current = null;
+
+    // Clear any generation timeouts
+    if (generationTimeoutRef.current) {
+      clearTimeout(generationTimeoutRef.current);
+      generationTimeoutRef.current = null;
+    }
   }, [propSessionId]);
 
   // Load session history when sessionId changes from props
@@ -114,15 +131,75 @@ export function Chat({
     }
   }, [propSessionId]);
 
+  // Check if workspace is a Git repository
+  useEffect(() => {
+    const checkGitRepo = async () => {
+      if (workspacePath) {
+        try {
+          const isGit = await isGitRepo(workspacePath);
+          setIsGitRepository(isGit);
+          console.log(
+            "[Chat] Workspace is Git repo:",
+            isGit,
+            "- Undo button will be",
+            isGit ? "visible" : "hidden"
+          );
+        } catch (e) {
+          console.error("[Chat] Failed to check Git status:", e);
+          setIsGitRepository(false);
+        }
+      } else {
+        setIsGitRepository(false);
+      }
+    };
+    checkGitRepo();
+  }, [workspacePath]);
+
   const loadSessionHistory = async (sessionId: string) => {
     setIsLoadingHistory(true);
     try {
+      // Check if sidecar is running before attempting to load
+      const status = await getSidecarStatus();
+      if (status !== "running") {
+        console.log("[LoadHistory] Sidecar not running, skipping history load");
+        setIsLoadingHistory(false);
+        return;
+      }
+
       const sessionMessages = await getSessionMessages(sessionId);
+
+      console.log("[LoadHistory] Received", sessionMessages.length, "messages from OpenCode");
+
+      // Log FULL message structure to see all available fields
+      if (sessionMessages.length > 0) {
+        console.log(
+          "[LoadHistory] FULL message structure sample:",
+          JSON.stringify(sessionMessages[0], null, 2)
+        );
+      }
+
+      console.log(
+        "[LoadHistory] Messages with flags:",
+        sessionMessages.map((m) => ({
+          id: m.info.id,
+          role: m.info.role,
+          reverted: m.info.reverted,
+          deleted: m.info.deleted,
+          hasRevertedFlag: "reverted" in m.info,
+          hasDeletedFlag: "deleted" in m.info,
+        }))
+      );
 
       // Convert session messages to our format
       const convertedMessages: MessageProps[] = [];
 
       for (const msg of sessionMessages) {
+        // Skip reverted or deleted messages
+        if (msg.info.reverted || msg.info.deleted) {
+          console.log(`[LoadHistory] Skipping reverted/deleted message: ${msg.info.id}`);
+          continue;
+        }
+
         const role = msg.info.role as "user" | "assistant" | "system";
 
         // Extract text content from parts
@@ -161,6 +238,7 @@ export function Chat({
         }
       }
 
+      console.log("[LoadHistory] Converted to", convertedMessages.length, "UI messages");
       setMessages(convertedMessages);
     } catch (e) {
       console.error("Failed to load session history:", e);
@@ -238,13 +316,15 @@ export function Chat({
       );
 
       // Filter events for the current session
+      // Use propSessionId or currentSessionId, whichever is truthy
+      const activeSessionId = propSessionId || currentSessionId;
       const eventSessionId = (event as { session_id?: string }).session_id;
-      if (eventSessionId && currentSessionId && eventSessionId !== currentSessionId) {
+      if (eventSessionId && activeSessionId && eventSessionId !== activeSessionId) {
         console.log(
           "[StreamEvent] Ignoring event for different session:",
           eventSessionId,
           "!==",
-          currentSessionId
+          activeSessionId
         );
         return;
       }
@@ -266,6 +346,13 @@ export function Chat({
           // Prefer full content when available to avoid duplicate appends
           const newContent = event.delta || event.content;
           console.log("[StreamEvent] Content update:", newContent?.slice(0, 100));
+
+          // Update the message ID ref if we have one from OpenCode
+          if (event.message_id && !currentAssistantMessageIdRef.current) {
+            currentAssistantMessageIdRef.current = event.message_id;
+            console.log("[StreamEvent] Set assistant message ID:", event.message_id);
+          }
+
           if (event.delta && event.content) {
             // OpenCode often sends full content alongside delta
             // Use full content to prevent repeated text loops
@@ -282,7 +369,11 @@ export function Chat({
             if (lastMessage && lastMessage.role === "assistant") {
               return [
                 ...prev.slice(0, -1),
-                { ...lastMessage, content: currentAssistantMessageRef.current },
+                {
+                  ...lastMessage,
+                  id: currentAssistantMessageIdRef.current || lastMessage.id,
+                  content: currentAssistantMessageRef.current,
+                },
               ];
             }
             return prev;
@@ -384,6 +475,9 @@ export function Chat({
                 event.tool === "bash"
                   ? "high"
                   : "medium",
+              tool: event.tool,
+              args,
+              messageId: event.message_id,
             };
             setPendingPermissions((prev) => [...prev, permissionRequest]);
           }
@@ -440,10 +534,14 @@ export function Chat({
               lastMessage.role === "assistant" &&
               currentAssistantMessageRef.current
             ) {
-              // Ensure the final content is applied
+              // Ensure the final content is applied with the correct ID
               return [
                 ...prev.slice(0, -1),
-                { ...lastMessage, content: currentAssistantMessageRef.current },
+                {
+                  ...lastMessage,
+                  id: currentAssistantMessageIdRef.current || lastMessage.id,
+                  content: currentAssistantMessageRef.current,
+                },
               ];
             }
             return prev;
@@ -455,6 +553,7 @@ export function Chat({
           );
           setIsGenerating(false);
           currentAssistantMessageRef.current = "";
+          currentAssistantMessageIdRef.current = null; // Reset the ID ref
           if (generationTimeoutRef.current) {
             clearTimeout(generationTimeoutRef.current);
             generationTimeoutRef.current = null;
@@ -473,6 +572,17 @@ export function Chat({
 
         case "permission_asked": {
           // Handle permission requests from OpenCode
+          // Use the current assistant message ID so we can associate file snapshots with this message
+          const currentMsgId = currentAssistantMessageIdRef.current;
+          console.log(
+            "[Permission] Asked for tool:",
+            event.tool,
+            "messageId:",
+            currentMsgId,
+            "args:",
+            event.args
+          );
+
           const permissionRequest: PermissionRequest = {
             id: event.request_id,
             type: (event.tool || "unknown") as PermissionRequest["type"],
@@ -480,6 +590,9 @@ export function Chat({
             command: event.args?.command as string | undefined,
             reasoning: "AI requests permission to perform this action",
             riskLevel: event.tool === "delete_file" || event.tool === "bash" ? "high" : "medium",
+            tool: event.tool || undefined,
+            args: (event.args as Record<string, unknown>) || undefined,
+            messageId: currentMsgId || undefined, // Associate with current message for undo
           };
           setPendingPermissions((prev) => [...prev, permissionRequest]);
           break;
@@ -488,6 +601,11 @@ export function Chat({
         case "raw": {
           // Try to extract useful activity info from raw events
           const data = event.data as Record<string, unknown>;
+
+          // NOTE: We intentionally DON'T handle message.removed events here
+          // because it causes issues with OpenCode auto-generating responses
+          // when the conversation ends on a user message. We handle message
+          // removal optimistically in handleUndo instead.
 
           // Handle message.updated events - these often contain tool info
           if (event.event_type === "message.updated") {
@@ -601,6 +719,7 @@ export function Chat({
     setMessages((prev) => [...prev, assistantMessage]);
     setIsGenerating(true);
     currentAssistantMessageRef.current = "";
+    currentAssistantMessageIdRef.current = null; // Reset the message ID ref
     lastEventAtRef.current = Date.now();
     if (generationTimeoutRef.current) {
       clearTimeout(generationTimeoutRef.current);
@@ -660,11 +779,119 @@ export function Chat({
     }
   };
 
+  const handleUndo = useCallback(
+    async (_messageId: string) => {
+      if (!currentSessionId) return;
+
+      try {
+        console.log("[Undo] Executing /undo command for session:", currentSessionId);
+
+        // Execute the /undo command which triggers Git-based file restoration
+        // Note: OpenCode's /undo operates on the entire session, not individual messages
+        await undoViaCommand(currentSessionId);
+
+        console.log("[Undo] Command executed successfully, reloading session history");
+
+        // Reload the session history to reflect the reverted state
+        await loadSessionHistory(currentSessionId);
+
+        console.log("[Undo] Session reloaded successfully");
+      } catch (e) {
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        setError(`Failed to undo: ${errorMessage}`);
+        console.error("[Undo] Error:", e);
+      }
+    },
+    [currentSessionId]
+  );
+
+  const handleEdit = useCallback(
+    async (messageId: string, newContent: string) => {
+      if (!currentSessionId) return;
+
+      try {
+        // Rewind to this message with edited content
+        const newSession = await rewindToMessage(currentSessionId, messageId, newContent);
+
+        // Switch to the new branched session
+        setCurrentSessionId(newSession.id);
+        onSessionCreated?.(newSession.id);
+
+        // Clear current messages and reload from new session
+        setMessages([]);
+        setIsLoadingHistory(true);
+
+        // The new message will be streamed via handleStreamEvent
+      } catch (e) {
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        setError(`Failed to edit message: ${errorMessage}`);
+      }
+    },
+    [currentSessionId, onSessionCreated]
+  );
+
+  const handleRewind = useCallback(
+    async (messageId: string) => {
+      if (!currentSessionId) return;
+
+      try {
+        // Create a branched session at this point
+        const newSession = await rewindToMessage(currentSessionId, messageId);
+
+        // Switch to the new branched session
+        setCurrentSessionId(newSession.id);
+        onSessionCreated?.(newSession.id);
+
+        // Clear and reload messages
+        setMessages([]);
+        setIsLoadingHistory(true);
+      } catch (e) {
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        setError(`Failed to rewind: ${errorMessage}`);
+      }
+    },
+    [currentSessionId, onSessionCreated]
+  );
+
+  const handleRegenerate = useCallback(
+    async (messageId: string) => {
+      // Find the user message before this assistant message
+      const msgIndex = messages.findIndex((m) => m.id === messageId);
+      if (msgIndex <= 0) return;
+
+      const prevMessage = messages[msgIndex - 1];
+      if (prevMessage.role !== "user") return;
+
+      // Remove the assistant response and regenerate
+      setMessages((prev) => prev.slice(0, msgIndex));
+
+      // Resend the user message (without attachments for now)
+      await handleSend(prevMessage.content);
+    },
+    [messages, handleSend]
+  );
+
+  const handleCopy = useCallback(async (content: string) => {
+    try {
+      if (typeof window !== "undefined" && window.navigator?.clipboard) {
+        await window.navigator.clipboard.writeText(content);
+      }
+    } catch (e) {
+      console.error("Failed to copy:", e);
+    }
+  }, []);
+
   const handleApprovePermission = async (id: string, _remember?: "once" | "session" | "always") => {
     if (!currentSessionId) return;
 
     try {
-      await approveTool(currentSessionId, id);
+      const req = pendingPermissions.find((p) => p.id === id);
+      console.log("[Approve] Tool:", req?.tool, "messageId:", req?.messageId, "args:", req?.args);
+      await approveTool(currentSessionId, id, {
+        tool: req?.tool,
+        args: req?.args,
+        messageId: req?.messageId,
+      });
 
       // Update tool call status
       setMessages((prev) => {
@@ -693,7 +920,12 @@ export function Chat({
     if (!currentSessionId) return;
 
     try {
-      await denyTool(currentSessionId, id);
+      const req = pendingPermissions.find((p) => p.id === id);
+      await denyTool(currentSessionId, id, {
+        tool: req?.tool,
+        args: req?.args,
+        messageId: req?.messageId,
+      });
 
       // Update tool call status
       setMessages((prev) => {
@@ -785,15 +1017,26 @@ export function Chat({
                 <p className="text-sm text-text-muted">Loading chat history...</p>
               </div>
             </motion.div>
-          ) : messages.length === 0 ? (
+          ) : messages.length === 0 && !isGenerating ? (
             <EmptyState
               needsConnection={needsConnection}
               isConnecting={isConnecting}
               onConnect={connectSidecar}
               workspacePath={workspacePath}
+              onSendMessage={handleSend}
             />
           ) : (
-            messages.map((message) => <Message key={message.id} {...message} />)
+            messages.map((message) => (
+              <Message
+                key={message.id}
+                {...message}
+                onEdit={handleEdit}
+                onRewind={handleRewind}
+                onRegenerate={handleRegenerate}
+                onCopy={handleCopy}
+                onUndo={isGitRepository ? handleUndo : undefined}
+              />
+            ))
           )}
         </AnimatePresence>
 
@@ -856,18 +1099,68 @@ interface EmptyStateProps {
   isConnecting: boolean;
   onConnect: () => void;
   workspacePath: string | null;
+  onSendMessage: (message: string) => void;
 }
 
-function EmptyState({ needsConnection, isConnecting, onConnect, workspacePath }: EmptyStateProps) {
+// Suggestion prompts - mix of developer and general user tasks
+const SUGGESTION_PROMPTS = [
+  {
+    title: "📁 Summarize this project",
+    description: "Give me an overview of what this project does",
+    prompt:
+      "Give me a comprehensive overview of this project. What does it do, what are the main components, and how is it organized?",
+  },
+  {
+    title: "🔍 Find and explain",
+    description: "Help me understand a specific file or folder",
+    prompt: "List the files in this project and help me understand what each one does.",
+  },
+  {
+    title: "📝 Analyze a document",
+    description: "Read and summarize any text file",
+    prompt:
+      "Find any text documents, markdown files, or READMEs in this project and summarize their contents.",
+  },
+  {
+    title: "✨ Suggest improvements",
+    description: "What could be better in this project?",
+    prompt: "Analyze this project and suggest improvements. What could be done better?",
+  },
+  {
+    title: "🐛 Find issues",
+    description: "Look for potential bugs or problems",
+    prompt: "Search this codebase for potential bugs, issues, or areas that might cause problems.",
+  },
+  {
+    title: "📖 Create documentation",
+    description: "Generate a README or docs",
+    prompt:
+      "Create comprehensive documentation for this project, including a README with setup instructions.",
+  },
+];
+
+function EmptyState({
+  needsConnection,
+  isConnecting,
+  onConnect,
+  workspacePath,
+  onSendMessage,
+}: EmptyStateProps) {
+  // Randomly select 4 suggestions to show variety
+  const [suggestions] = useState(() => {
+    const shuffled = [...SUGGESTION_PROMPTS].sort(() => Math.random() - 0.5);
+    return shuffled.slice(0, 4);
+  });
+
   return (
     <motion.div
-      className="flex h-full flex-col items-center justify-center p-8"
+      className="flex min-h-full flex-col items-center justify-center p-8 pt-16"
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
     >
-      <div className="max-w-md text-center">
-        <div className="mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-2xl bg-gradient-to-br from-primary/20 to-secondary/20">
-          <Sparkles className="h-10 w-10 text-primary" />
+      <div className="max-w-lg w-full text-center">
+        <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-primary/20 to-secondary/20">
+          <Sparkles className="h-8 w-8 text-primary" />
         </div>
 
         <h2 className="mb-3 text-2xl font-bold text-text">What can I help you with?</h2>
@@ -897,19 +1190,16 @@ function EmptyState({ needsConnection, isConnecting, onConnect, workspacePath }:
           </button>
         )}
 
-        <div className="grid gap-3 text-left">
-          <SuggestionCard
-            title="Explore your codebase"
-            description="Help me understand the structure of this project"
-          />
-          <SuggestionCard
-            title="Refactor code"
-            description="Improve the error handling in src/utils.ts"
-          />
-          <SuggestionCard
-            title="Write documentation"
-            description="Create a README for this project"
-          />
+        <div className="grid grid-cols-2 gap-3 text-left">
+          {suggestions.map((suggestion, index) => (
+            <SuggestionCard
+              key={index}
+              title={suggestion.title}
+              description={suggestion.description}
+              onClick={() => onSendMessage(suggestion.prompt)}
+              disabled={needsConnection || isConnecting}
+            />
+          ))}
         </div>
       </div>
     </motion.div>
@@ -919,13 +1209,19 @@ function EmptyState({ needsConnection, isConnecting, onConnect, workspacePath }:
 interface SuggestionCardProps {
   title: string;
   description: string;
+  onClick: () => void;
+  disabled?: boolean;
 }
 
-function SuggestionCard({ title, description }: SuggestionCardProps) {
+function SuggestionCard({ title, description, onClick, disabled }: SuggestionCardProps) {
   return (
-    <button className="rounded-lg border border-border bg-surface p-4 text-left transition-colors hover:border-primary/50 hover:bg-surface-elevated">
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className="rounded-lg border border-border bg-surface p-4 text-left transition-all hover:border-primary/50 hover:bg-surface-elevated hover:shadow-lg hover:shadow-primary/5 disabled:opacity-50 disabled:cursor-not-allowed"
+    >
       <p className="font-medium text-text">{title}</p>
-      <p className="text-sm text-text-muted">{description}</p>
+      <p className="text-sm text-text-muted line-clamp-2">{description}</p>
     </button>
   );
 }

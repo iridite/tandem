@@ -1,15 +1,27 @@
 import { useState, useEffect } from "react";
-import { motion } from "framer-motion";
-import { Settings as SettingsIcon, FolderOpen, Shield, Cpu } from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
+import {
+  Settings as SettingsIcon,
+  FolderOpen,
+  Shield,
+  Cpu,
+  Check,
+  Trash2,
+  Plus,
+} from "lucide-react";
 import { ProviderCard } from "./ProviderCard";
 import { Button } from "@/components/ui/Button";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import {
   getProvidersConfig,
   setProvidersConfig,
-  setWorkspacePath,
-  getWorkspacePath,
+  getUserProjects,
+  getActiveProject,
+  addProject,
+  removeProject,
+  setActiveProject,
   type ProvidersConfig,
+  type UserProject,
 } from "@/lib/tauri";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -19,23 +31,36 @@ interface SettingsProps {
 
 export function Settings({ onClose }: SettingsProps) {
   const [providers, setProviders] = useState<ProvidersConfig | null>(null);
-  const [workspacePath, setWorkspace] = useState<string | null>(null);
+  const [projects, setProjects] = useState<UserProject[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [projectLoading, setProjectLoading] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
 
   useEffect(() => {
-    async function loadSettings() {
-      try {
-        const [config, workspace] = await Promise.all([getProvidersConfig(), getWorkspacePath()]);
-        setProviders(config);
-        setWorkspace(workspace);
-      } catch (err) {
-        console.error("Failed to load settings:", err);
-      } finally {
-        setLoading(false);
-      }
-    }
     loadSettings();
   }, []);
+
+  const loadSettings = async () => {
+    try {
+      const [config, userProjects, activeProj] = await Promise.all([
+        getProvidersConfig(),
+        getUserProjects(),
+        getActiveProject(),
+      ]);
+      setProviders(config);
+      setProjects(userProjects);
+
+      // Set active project from backend
+      if (activeProj) {
+        setActiveProjectId(activeProj.id);
+      }
+    } catch (err) {
+      console.error("Failed to load settings:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleProviderChange = async (
     provider: keyof Omit<ProvidersConfig, "custom">,
@@ -85,15 +110,50 @@ export function Settings({ onClose }: SettingsProps) {
       const selected = await open({
         directory: true,
         multiple: false,
-        title: "Select Workspace Folder",
+        title: "Select Project Folder",
       });
 
       if (selected && typeof selected === "string") {
-        await setWorkspacePath(selected);
-        setWorkspace(selected);
+        setProjectLoading(true);
+        const project = await addProject(selected);
+        await loadSettings();
+        // Set as active
+        await setActiveProject(project.id);
+        setActiveProjectId(project.id);
       }
     } catch (err) {
-      console.error("Failed to select workspace:", err);
+      console.error("Failed to add project:", err);
+    } finally {
+      setProjectLoading(false);
+    }
+  };
+
+  const handleSetActiveProject = async (projectId: string) => {
+    try {
+      setProjectLoading(true);
+      await setActiveProject(projectId);
+      setActiveProjectId(projectId);
+      await loadSettings();
+    } catch (err) {
+      console.error("Failed to set active project:", err);
+    } finally {
+      setProjectLoading(false);
+    }
+  };
+
+  const handleRemoveProject = async (projectId: string) => {
+    try {
+      setProjectLoading(true);
+      await removeProject(projectId);
+      if (activeProjectId === projectId) {
+        setActiveProjectId(null);
+      }
+      await loadSettings();
+      setDeleteConfirm(null);
+    } catch (err) {
+      console.error("Failed to remove project:", err);
+    } finally {
+      setProjectLoading(false);
     }
   };
 
@@ -131,36 +191,114 @@ export function Settings({ onClose }: SettingsProps) {
           )}
         </div>
 
-        {/* Workspace Section */}
+        {/* Projects Section */}
         <Card>
           <CardHeader>
             <div className="flex items-center gap-3">
               <FolderOpen className="h-5 w-5 text-secondary" />
-              <div>
-                <CardTitle>Workspace</CardTitle>
+              <div className="flex-1">
+                <CardTitle>Projects</CardTitle>
                 <CardDescription>
-                  Select the folder where Tandem can read and write files
+                  Add and manage project folders. Each project is an independent workspace.
                 </CardDescription>
               </div>
             </div>
           </CardHeader>
           <CardContent>
-            <div className="flex items-center gap-4">
-              <div className="flex-1 rounded-lg bg-surface-elevated p-3">
-                {workspacePath ? (
-                  <p className="font-mono text-sm text-text">{workspacePath}</p>
-                ) : (
-                  <p className="text-sm text-text-subtle">No workspace selected</p>
-                )}
-              </div>
-              <Button onClick={handleSelectWorkspace}>
-                {workspacePath ? "Change" : "Select Folder"}
+            <div className="space-y-3">
+              {projects.length === 0 ? (
+                <div className="rounded-lg border border-border bg-surface-elevated p-6 text-center">
+                  <FolderOpen className="mx-auto mb-2 h-8 w-8 text-text-subtle" />
+                  <p className="text-sm text-text-muted">No projects added yet</p>
+                  <p className="text-xs text-text-subtle">Add a project folder to get started</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <AnimatePresence>
+                    {projects.map((project) => (
+                      <motion.div
+                        key={project.id}
+                        initial={{ opacity: 0, y: -10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, x: -20 }}
+                        className="flex items-center gap-3 rounded-lg border border-border bg-surface-elevated p-3"
+                      >
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <p className="font-medium text-text">{project.name}</p>
+                            {activeProjectId === project.id && (
+                              <span className="inline-flex items-center gap-1 rounded-full bg-primary/20 px-2 py-0.5 text-xs text-primary">
+                                <Check className="h-3 w-3" />
+                                Active
+                              </span>
+                            )}
+                          </div>
+                          <p
+                            className="truncate font-mono text-xs text-text-muted"
+                            title={project.path}
+                          >
+                            {project.path}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {activeProjectId !== project.id && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              onClick={() => handleSetActiveProject(project.id)}
+                              disabled={projectLoading}
+                            >
+                              Set Active
+                            </Button>
+                          )}
+                          {deleteConfirm === project.id ? (
+                            <>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => handleRemoveProject(project.id)}
+                                disabled={projectLoading}
+                                className="text-error hover:bg-error/10"
+                              >
+                                Confirm
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => setDeleteConfirm(null)}
+                                disabled={projectLoading}
+                              >
+                                Cancel
+                              </Button>
+                            </>
+                          ) : (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              onClick={() => setDeleteConfirm(project.id)}
+                              disabled={projectLoading}
+                              className="text-text-subtle hover:text-error"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          )}
+                        </div>
+                      </motion.div>
+                    ))}
+                  </AnimatePresence>
+                </div>
+              )}
+
+              <Button onClick={handleSelectWorkspace} disabled={projectLoading} className="w-full">
+                <Plus className="mr-2 h-4 w-4" />
+                Add Project
               </Button>
             </div>
+
             <p className="mt-3 text-xs text-text-subtle">
               <Shield className="mr-1 inline h-3 w-3" />
-              Tandem can only access files within this folder. Sensitive files (.env, .ssh, etc.)
-              are always blocked.
+              Tandem can only access files within project folders. Sensitive files (.env, .ssh,
+              etc.) are always blocked.
             </p>
           </CardContent>
         </Card>

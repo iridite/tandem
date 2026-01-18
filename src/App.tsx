@@ -13,9 +13,16 @@ import {
   listProjects,
   deleteSession,
   getVaultStatus,
+  getUserProjects,
+  getActiveProject,
+  setActiveProject,
+  addProject,
+  getSidecarStatus,
   type Session,
   type VaultStatus,
+  type UserProject,
 } from "@/lib/tauri";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   Settings as SettingsIcon,
   MessageSquare,
@@ -52,7 +59,7 @@ declare global {
 }
 
 function App() {
-  const { state, loading } = useAppState();
+  const { state, loading, refresh: refreshAppState } = useAppState();
   const [sidecarReady, setSidecarReady] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
@@ -60,6 +67,11 @@ function App() {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [vaultUnlocked, setVaultUnlocked] = useState(false);
+
+  // Project management state
+  const [userProjects, setUserProjects] = useState<UserProject[]>([]);
+  const [activeProject, setActiveProjectState] = useState<UserProject | null>(null);
+  const [projectSwitcherLoading, setProjectSwitcherLoading] = useState(false);
 
   // Start with sidecar setup, then onboarding if no workspace, otherwise chat
   const [view, setView] = useState<View>(() => "sidecar-setup");
@@ -151,6 +163,23 @@ function App() {
     loadHistory();
   }, [loadHistory]);
 
+  // Load user projects
+  const loadUserProjects = useCallback(async () => {
+    try {
+      const [projects, active] = await Promise.all([getUserProjects(), getActiveProject()]);
+      setUserProjects(projects);
+      setActiveProjectState(active);
+    } catch (e) {
+      console.error("Failed to load user projects:", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (vaultUnlocked) {
+      loadUserProjects();
+    }
+  }, [vaultUnlocked, loadUserProjects]);
+
   const handleSidecarReady = () => {
     setSidecarReady(true);
     // Navigate to appropriate view
@@ -159,6 +188,92 @@ function App() {
     } else {
       setView("onboarding");
     }
+  };
+
+  const handleSwitchProject = async (projectId: string) => {
+    setProjectSwitcherLoading(true);
+
+    // Clear current session FIRST to reset the chat view
+    setCurrentSessionId(null);
+
+    try {
+      await setActiveProject(projectId);
+
+      // Wait for sidecar to restart with polling
+      let attempts = 0;
+      const maxAttempts = 10;
+      while (attempts < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const sidecarStatus = await getSidecarStatus();
+        if (sidecarStatus === "running") {
+          console.log("[SwitchProject] Sidecar ready after", attempts + 1, "attempts");
+          break;
+        }
+        attempts++;
+      }
+
+      // Reload everything
+      await refreshAppState();
+      await loadUserProjects();
+      await loadHistory();
+    } catch (e) {
+      console.error("Failed to switch project:", e);
+    } finally {
+      setProjectSwitcherLoading(false);
+    }
+  };
+
+  const handleAddProject = async () => {
+    // Clear current session FIRST to reset the chat view
+    setCurrentSessionId(null);
+
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Select Project Folder",
+      });
+
+      if (selected && typeof selected === "string") {
+        setProjectSwitcherLoading(true);
+        const project = await addProject(selected);
+        await setActiveProject(project.id);
+
+        // Wait for sidecar to restart with polling
+        let attempts = 0;
+        const maxAttempts = 10;
+        while (attempts < maxAttempts) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          const sidecarStatus = await getSidecarStatus();
+          if (sidecarStatus === "running") {
+            console.log("[AddProject] Sidecar ready after", attempts + 1, "attempts");
+            break;
+          }
+          attempts++;
+        }
+
+        // Reload everything
+        await refreshAppState();
+        await loadUserProjects();
+        await loadHistory();
+      }
+    } catch (e) {
+      console.error("Failed to add project:", e);
+    } finally {
+      setProjectSwitcherLoading(false);
+    }
+  };
+
+  const handleManageProjects = () => {
+    setView("settings");
+  };
+
+  const handleSettingsClose = async () => {
+    setView("chat");
+    // Reload everything when settings closes (in case projects were modified)
+    await refreshAppState();
+    await loadUserProjects();
+    await loadHistory();
   };
 
   const handleSelectSession = (sessionId: string) => {
@@ -266,13 +381,33 @@ function App() {
         <SessionSidebar
           isOpen={sidebarOpen}
           onToggle={() => setSidebarOpen(!sidebarOpen)}
-          sessions={sessions}
+          sessions={sessions.filter((session) => {
+            // Only show sessions from the active project
+            if (!activeProject) return true;
+            if (!session.directory) return false;
+
+            // Normalize paths for comparison (handle both / and \ separators)
+            const normalizedSessionDir = session.directory.toLowerCase().replace(/\\/g, "/");
+            const normalizedProjectPath = activeProject.path.toLowerCase().replace(/\\/g, "/");
+
+            // Check if session directory starts with or contains the project path
+            return (
+              normalizedSessionDir.includes(normalizedProjectPath) ||
+              normalizedProjectPath.includes(normalizedSessionDir)
+            );
+          })}
           projects={projects}
           currentSessionId={currentSessionId}
           onSelectSession={handleSelectSession}
           onNewChat={handleNewChat}
           onDeleteSession={handleDeleteSession}
           isLoading={historyLoading}
+          userProjects={userProjects}
+          activeProject={activeProject}
+          onSwitchProject={handleSwitchProject}
+          onAddProject={handleAddProject}
+          onManageProjects={handleManageProjects}
+          projectSwitcherLoading={projectSwitcherLoading}
         />
       )}
 
@@ -293,7 +428,8 @@ function App() {
         ) : (
           <>
             <Chat
-              workspacePath={state?.workspace_path || null}
+              key={activeProject?.id || "no-project"}
+              workspacePath={activeProject?.path || state?.workspace_path || null}
               sessionId={currentSessionId}
               onSessionCreated={handleSessionCreated}
               onSidecarConnected={loadHistory}
@@ -307,7 +443,7 @@ function App() {
                   animate={{ opacity: 1 }}
                   exit={{ opacity: 0 }}
                 >
-                  <Settings onClose={() => setView("chat")} />
+                  <Settings onClose={handleSettingsClose} />
                 </motion.div>
               )}
               {effectiveView === "about" && (
@@ -366,7 +502,7 @@ function OnboardingView({ onComplete }: OnboardingViewProps) {
           animate={{ opacity: 1 }}
           transition={{ delay: 0.4 }}
         >
-          Your local-first AI workspace. Let's get started by selecting a workspace folder and
+          Your local-first AI workspace. Let's get started by adding a project folder and
           configuring your LLM provider.
         </motion.p>
 
@@ -380,9 +516,9 @@ function OnboardingView({ onComplete }: OnboardingViewProps) {
             <div className="flex items-start gap-3">
               <FolderOpen className="mt-0.5 h-5 w-5 text-primary" />
               <div>
-                <p className="font-medium text-text">Select a workspace</p>
+                <p className="font-medium text-text">Add a project</p>
                 <p className="text-sm text-text-muted">
-                  Choose a folder where Tandem can read and write files
+                  Add project folders to work with. Each project is an independent workspace.
                 </p>
               </div>
             </div>

@@ -1,10 +1,24 @@
-import { motion } from "framer-motion";
+import { motion, AnimatePresence } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { cn } from "@/lib/utils";
-import { User, FileText, Terminal, AlertTriangle, Image as ImageIcon } from "lucide-react";
+import {
+  User,
+  FileText,
+  Terminal,
+  AlertTriangle,
+  Image as ImageIcon,
+  Edit3,
+  RotateCcw,
+  RefreshCw,
+  Copy,
+  Undo2,
+  Check,
+  X,
+} from "lucide-react";
+import { useState } from "react";
 
 export interface MessageAttachment {
   name: string;
@@ -20,6 +34,12 @@ export interface MessageProps {
   toolCalls?: ToolCall[];
   isStreaming?: boolean;
   attachments?: MessageAttachment[];
+  // Handlers for message actions
+  onEdit?: (messageId: string, newContent: string) => void;
+  onRewind?: (messageId: string) => void;
+  onRegenerate?: (messageId: string) => void;
+  onCopy?: (content: string) => void;
+  onUndo?: (messageId: string) => void;
 }
 
 export interface ToolCall {
@@ -31,20 +51,48 @@ export interface ToolCall {
 }
 
 export function Message({
+  id,
   role,
   content,
   timestamp,
   toolCalls,
   isStreaming,
   attachments,
+  onEdit,
+  onRewind,
+  onRegenerate,
+  onCopy,
+  onUndo,
 }: MessageProps) {
   const isUser = role === "user";
   const isSystem = role === "system";
+  const [isHovered, setIsHovered] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editedContent, setEditedContent] = useState(content);
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = () => {
+    onCopy?.(content);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleSaveEdit = () => {
+    if (editedContent.trim() && editedContent !== content) {
+      onEdit?.(id, editedContent);
+    }
+    setIsEditing(false);
+  };
+
+  const handleCancelEdit = () => {
+    setEditedContent(content);
+    setIsEditing(false);
+  };
 
   return (
     <motion.div
       className={cn(
-        "flex gap-4 px-4 py-8",
+        "flex gap-4 px-4 py-8 relative group",
         isUser
           ? "bg-transparent border-l-2 border-primary/70"
           : "glass border-glass shadow-lg shadow-black/20 ring-1 ring-white/5"
@@ -52,6 +100,8 @@ export function Message({
       initial={{ opacity: 0, y: 10, filter: "blur(6px)" }}
       animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
       transition={{ duration: 0.25 }}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
     >
       {/* Avatar */}
       {isUser ? (
@@ -88,6 +138,69 @@ export function Message({
           )}
         </div>
 
+        {/* Hover Action Buttons */}
+        <AnimatePresence>
+          {isHovered && !isEditing && !isStreaming && (
+            <motion.div
+              className="absolute top-2 right-2 flex items-center gap-1 glass border-glass rounded-lg px-2 py-1 shadow-lg"
+              initial={{ opacity: 0, scale: 0.9, y: -5 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: -5 }}
+              transition={{ duration: 0.15 }}
+            >
+              {isUser && onEdit && (
+                <button
+                  onClick={() => setIsEditing(true)}
+                  className="p-1.5 hover:bg-primary/20 rounded transition-colors text-text-muted hover:text-primary"
+                  title="Edit message"
+                >
+                  <Edit3 className="h-4 w-4" />
+                </button>
+              )}
+              {isUser && onRewind && (
+                <button
+                  onClick={() => onRewind(id)}
+                  className="p-1.5 hover:bg-primary/20 rounded transition-colors text-text-muted hover:text-primary"
+                  title="Rewind to here"
+                >
+                  <RotateCcw className="h-4 w-4" />
+                </button>
+              )}
+              {!isUser && onRegenerate && (
+                <button
+                  onClick={() => onRegenerate(id)}
+                  className="p-1.5 hover:bg-primary/20 rounded transition-colors text-text-muted hover:text-primary"
+                  title="Regenerate response"
+                >
+                  <RefreshCw className="h-4 w-4" />
+                </button>
+              )}
+              {!isUser && onCopy && (
+                <button
+                  onClick={handleCopy}
+                  className="p-1.5 hover:bg-primary/20 rounded transition-colors text-text-muted hover:text-primary"
+                  title="Copy to clipboard"
+                >
+                  {copied ? (
+                    <Check className="h-4 w-4 text-success" />
+                  ) : (
+                    <Copy className="h-4 w-4" />
+                  )}
+                </button>
+              )}
+              {!isUser && onUndo && (
+                <button
+                  onClick={() => onUndo(id)}
+                  className="p-1.5 hover:bg-warning/20 rounded transition-colors text-text-muted hover:text-warning"
+                  title="Undo this message and its file changes"
+                >
+                  <Undo2 className="h-4 w-4" />
+                </button>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Attachments */}
         {attachments && attachments.length > 0 && (
           <div className="flex flex-wrap gap-2 mb-2">
@@ -116,45 +229,72 @@ export function Message({
         )}
 
         {/* Message content */}
-        <div className="prose-custom">
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-            components={{
-              code({ className, children, ...props }) {
-                const match = /language-(\w+)/.exec(className || "");
-                if (match) {
-                  return (
-                    <div className="overflow-hidden rounded-lg border border-white/10 bg-surface/60">
-                      <div className="flex items-center gap-2 border-b border-white/10 bg-surface-elevated/70 px-3 py-2">
-                        <span className="h-2 w-2 rounded-full bg-error/80" />
-                        <span className="h-2 w-2 rounded-full bg-warning/80" />
-                        <span className="h-2 w-2 rounded-full bg-success/80" />
-                        <span className="ml-2 text-[0.65rem] uppercase tracking-widest text-text-subtle terminal-text">
-                          code
-                        </span>
+        {isEditing ? (
+          <div className="space-y-2">
+            <textarea
+              value={editedContent}
+              onChange={(e) => setEditedContent(e.target.value)}
+              className="w-full min-h-[100px] p-3 rounded-lg bg-surface border border-glass text-text font-sans resize-y focus:outline-none focus:ring-2 focus:ring-primary/50"
+              autoFocus
+            />
+            <div className="flex gap-2">
+              <button
+                onClick={handleSaveEdit}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-primary/20 hover:bg-primary/30 text-primary transition-colors"
+              >
+                <Check className="h-4 w-4" />
+                Save & Resend
+              </button>
+              <button
+                onClick={handleCancelEdit}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-surface hover:bg-surface-elevated text-text-muted transition-colors"
+              >
+                <X className="h-4 w-4" />
+                Cancel
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="prose-custom">
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                code({ className, children, ...props }) {
+                  const match = /language-(\w+)/.exec(className || "");
+                  if (match) {
+                    return (
+                      <div className="overflow-hidden rounded-lg border border-white/10 bg-surface/60">
+                        <div className="flex items-center gap-2 border-b border-white/10 bg-surface-elevated/70 px-3 py-2">
+                          <span className="h-2 w-2 rounded-full bg-error/80" />
+                          <span className="h-2 w-2 rounded-full bg-warning/80" />
+                          <span className="h-2 w-2 rounded-full bg-success/80" />
+                          <span className="ml-2 text-[0.65rem] uppercase tracking-widest text-text-subtle terminal-text">
+                            code
+                          </span>
+                        </div>
+                        <SyntaxHighlighter
+                          style={oneDark}
+                          language={match[1]}
+                          PreTag="div"
+                          customStyle={{ margin: 0, background: "transparent", padding: "1rem" }}
+                        >
+                          {String(children).replace(/\n$/, "")}
+                        </SyntaxHighlighter>
                       </div>
-                      <SyntaxHighlighter
-                        style={oneDark}
-                        language={match[1]}
-                        PreTag="div"
-                        customStyle={{ margin: 0, background: "transparent", padding: "1rem" }}
-                      >
-                        {String(children).replace(/\n$/, "")}
-                      </SyntaxHighlighter>
-                    </div>
+                    );
+                  }
+                  return (
+                    <code className={className} {...props}>
+                      {children}
+                    </code>
                   );
-                }
-                return (
-                  <code className={className} {...props}>
-                    {children}
-                  </code>
-                );
-              },
-            }}
-          >
-            {content}
-          </ReactMarkdown>
-        </div>
+                },
+              }}
+            >
+              {content}
+            </ReactMarkdown>
+          </div>
+        )}
 
         {/* Tool calls */}
         {toolCalls && toolCalls.length > 0 && (

@@ -1,5 +1,6 @@
 // Tandem Application State
 use crate::sidecar::{SidecarConfig, SidecarManager};
+use crate::tool_proxy::OperationJournal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -79,6 +80,56 @@ impl Default for ProvidersConfig {
     }
 }
 
+/// User-managed project (workspace folder)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserProject {
+    pub id: String,
+    pub name: String,
+    pub path: String, // Store as string for serialization
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_accessed: chrono::DateTime<chrono::Utc>,
+}
+
+impl UserProject {
+    pub fn new(path: PathBuf, name: Option<String>) -> Self {
+        let default_name = if let Some(provided_name) = name.as_ref() {
+            provided_name.clone()
+        } else {
+            // Try to get the last component of the path
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .or_else(|| {
+                    // If that fails, try getting the last non-empty component
+                    path.components()
+                        .filter_map(|c| {
+                            if let std::path::Component::Normal(name) = c {
+                                name.to_str()
+                            } else {
+                                None
+                            }
+                        })
+                        .last()
+                })
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "Unnamed Project".to_string())
+        };
+        
+        let now = chrono::Utc::now();
+        
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: default_name,
+            path: path.to_string_lossy().to_string(),
+            created_at: now,
+            last_accessed: now,
+        }
+    }
+    
+    pub fn path_buf(&self) -> PathBuf {
+        PathBuf::from(&self.path)
+    }
+}
+
 /// Permission rule for file/folder access
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionRule {
@@ -109,8 +160,12 @@ pub enum PermissionDecision {
 
 /// Main application state managed by Tauri
 pub struct AppState {
-    /// Currently selected workspace path
+    /// Currently selected workspace path (legacy, kept for backwards compat)
     pub workspace_path: RwLock<Option<PathBuf>>,
+    /// User-managed projects
+    pub user_projects: RwLock<Vec<UserProject>>,
+    /// Currently active project ID
+    pub active_project_id: RwLock<Option<String>>,
     /// Paths that are allowed for access
     pub allowed_paths: RwLock<HashSet<PathBuf>>,
     /// Paths/patterns that are always denied
@@ -125,6 +180,8 @@ pub struct AppState {
     pub sidecar: Arc<SidecarManager>,
     /// Current chat session ID
     pub current_session_id: RwLock<Option<String>>,
+    /// Operation journal for file undo
+    pub operation_journal: Arc<OperationJournal>,
 }
 
 impl AppState {
@@ -142,6 +199,8 @@ impl AppState {
 
         Self {
             workspace_path: RwLock::new(None),
+            user_projects: RwLock::new(Vec::new()),
+            active_project_id: RwLock::new(None),
             allowed_paths: RwLock::new(HashSet::new()),
             denied_patterns: RwLock::new(denied_patterns),
             session_approvals: RwLock::new(HashSet::new()),
@@ -149,6 +208,7 @@ impl AppState {
             providers_config: RwLock::new(ProvidersConfig::default()),
             sidecar: Arc::new(SidecarManager::new(SidecarConfig::default())),
             current_session_id: RwLock::new(None),
+            operation_journal: Arc::new(OperationJournal::new(100)),
         }
     }
 
@@ -208,6 +268,8 @@ impl Default for AppState {
 pub struct AppStateInfo {
     pub workspace_path: Option<String>,
     pub has_workspace: bool,
+    pub user_projects: Vec<UserProject>,
+    pub active_project_id: Option<String>,
     pub providers_config: ProvidersConfig,
 }
 
@@ -215,10 +277,14 @@ impl From<&AppState> for AppStateInfo {
     fn from(state: &AppState) -> Self {
         let workspace = state.workspace_path.read().unwrap();
         let providers = state.providers_config.read().unwrap();
+        let user_projects = state.user_projects.read().unwrap();
+        let active_project_id = state.active_project_id.read().unwrap();
 
         Self {
             workspace_path: workspace.as_ref().map(|p| p.to_string_lossy().to_string()),
             has_workspace: workspace.is_some(),
+            user_projects: user_projects.clone(),
+            active_project_id: active_project_id.clone(),
             providers_config: providers.clone(),
         }
     }

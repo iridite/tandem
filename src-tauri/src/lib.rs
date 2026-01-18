@@ -198,6 +198,72 @@ pub fn run() {
                 }
             }
 
+            // Load user projects
+            if let Some(projects_value) = store.get("user_projects") {
+                if let Ok(projects) =
+                    serde_json::from_value::<Vec<state::UserProject>>(projects_value.clone())
+                {
+                    tracing::info!("Loaded {} user projects", projects.len());
+                    *app_state.user_projects.write().unwrap() = projects;
+                }
+            }
+
+            // Load active project ID
+            if let Some(active_id) = store.get("active_project_id") {
+                if let Some(id_str) = active_id.as_str() {
+                    tracing::info!("Loaded active project ID: {}", id_str);
+                    *app_state.active_project_id.write().unwrap() = Some(id_str.to_string());
+
+                    // Set the active project's path as workspace
+                    let projects = app_state.user_projects.read().unwrap();
+                    if let Some(project) = projects.iter().find(|p| p.id == id_str) {
+                        let path_buf = project.path_buf();
+                        if path_buf.exists() {
+                            app_state.set_workspace(path_buf);
+                        }
+                    }
+                }
+            }
+
+            // Migration: If workspace_path exists but no user_projects, migrate it
+            let needs_migration = {
+                let projects = app_state.user_projects.read().unwrap();
+                let workspace = app_state.workspace_path.read().unwrap();
+                projects.is_empty() && workspace.is_some()
+            };
+
+            if needs_migration {
+                tracing::info!("Migrating single workspace to user projects system");
+                let workspace = app_state.workspace_path.read().unwrap();
+                if let Some(path_buf) = workspace.as_ref() {
+                    let project = state::UserProject::new(path_buf.clone(), None);
+                    let project_id = project.id.clone();
+                    let project_name = project.name.clone();
+
+                    // Add to state
+                    {
+                        let mut projects = app_state.user_projects.write().unwrap();
+                        projects.push(project.clone());
+                    }
+
+                    // Set as active
+                    {
+                        let mut active = app_state.active_project_id.write().unwrap();
+                        *active = Some(project_id.clone());
+                    }
+
+                    // Save migration
+                    let _ = store.set(
+                        "user_projects",
+                        serde_json::to_value(&vec![project]).unwrap(),
+                    );
+                    let _ = store.set("active_project_id", serde_json::json!(project_id));
+                    let _ = store.save();
+
+                    tracing::info!("Migration complete: created project '{}'", project_name);
+                }
+            }
+
             app.manage(app_state);
 
             // Note: Stronghold is NOT initialized here - it will be initialized
@@ -217,6 +283,13 @@ pub fn run() {
             commands::get_app_state,
             commands::set_workspace_path,
             commands::get_workspace_path,
+            // Project management
+            commands::is_git_repo,
+            commands::add_project,
+            commands::remove_project,
+            commands::get_user_projects,
+            commands::set_active_project,
+            commands::get_active_project,
             // API key management
             commands::store_api_key,
             commands::has_api_key,
@@ -245,6 +318,19 @@ pub fn run() {
             // Model & provider info
             commands::list_models,
             commands::list_providers_from_sidecar,
+            // File operation undo
+            commands::can_undo_file_change,
+            commands::undo_last_file_change,
+            commands::get_recent_file_operations,
+            // Conversation rewind
+            commands::rewind_to_message,
+            // Message undo/redo (OpenCode native)
+            commands::undo_message,
+            commands::undo_message_with_files,
+            commands::redo_message,
+            commands::undo_via_command,
+            // File snapshot for undo
+            commands::snapshot_file_for_message,
             // Tool approval
             commands::approve_tool,
             commands::deny_tool,

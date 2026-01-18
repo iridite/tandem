@@ -4,13 +4,11 @@
 
 use crate::error::{Result, TandemError};
 use crate::state::AppState;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use uuid::Uuid;
 
 /// Journal entry for tracking operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +49,7 @@ pub struct FileSnapshot {
 pub struct UndoAction {
     pub journal_entry_id: String,
     pub snapshot: FileSnapshot,
+    pub message_id: Option<String>,
 }
 
 impl UndoAction {
@@ -116,6 +115,51 @@ impl OperationJournal {
         } else {
             Ok(None)
         }
+    }
+
+    /// Undo all recorded file changes for a specific OpenCode message ID.
+    /// Returns the list of file paths that were reverted.
+    pub fn undo_for_message(&self, message_id: &str) -> Result<Vec<String>> {
+        let mut reverted_paths: Vec<String> = Vec::new();
+        let mut undo_stack = self.undo_stack.write().unwrap();
+
+        tracing::info!(
+            "[undo_for_message] Looking for message_id='{}' in {} undo actions",
+            message_id,
+            undo_stack.len()
+        );
+        
+        // Log all undo actions for debugging
+        for (i, action) in undo_stack.iter().enumerate() {
+            tracing::info!(
+                "[undo_for_message] Stack[{}]: message_id={:?}, path={}",
+                i,
+                action.message_id,
+                action.snapshot.path
+            );
+        }
+
+        // Walk from the end so we undo in reverse chronological order.
+        let mut idx: isize = (undo_stack.len() as isize) - 1;
+        while idx >= 0 {
+            let i = idx as usize;
+            let matches = undo_stack
+                .get(i)
+                .and_then(|a| a.message_id.as_deref())
+                .map(|mid| mid == message_id)
+                .unwrap_or(false);
+
+            if matches {
+                let action = undo_stack.remove(i);
+                tracing::info!("[undo_for_message] Reverting file: {}", action.snapshot.path);
+                action.revert()?;
+                reverted_paths.push(action.snapshot.path.clone());
+            }
+
+            idx -= 1;
+        }
+
+        Ok(reverted_paths)
     }
 
     pub fn get_recent_entries(&self, count: usize) -> Vec<JournalEntry> {

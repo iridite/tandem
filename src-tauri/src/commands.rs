@@ -10,12 +10,15 @@ use crate::sidecar::{
 use crate::sidecar_manager::{self, SidecarStatus};
 use crate::state::{AppState, AppStateInfo, ProvidersConfig};
 use crate::stronghold::{validate_api_key, validate_key_type, ApiKeyType};
+use crate::tool_proxy::{FileSnapshot, JournalEntry, OperationStatus, UndoAction};
 use crate::vault::{self, EncryptedVaultKey, VaultStatus};
 use crate::VaultState;
 use futures::StreamExt;
 use std::path::PathBuf;
+use std::fs;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_store::StoreExt;
+use uuid::Uuid;
 
 // ============================================================================
 // Vault Commands (PIN-based encryption)
@@ -248,6 +251,222 @@ pub fn set_workspace_path(app: AppHandle, path: String, state: State<'_, AppStat
 pub fn get_workspace_path(state: State<'_, AppState>) -> Option<String> {
     let workspace = state.workspace_path.read().unwrap();
     workspace.as_ref().map(|p| p.to_string_lossy().to_string())
+}
+
+// ============================================================================
+// Project Management (Multi-Workspace Support)
+// ============================================================================
+
+/// Check if a directory is a Git repository
+#[tauri::command]
+pub fn is_git_repo(path: String) -> bool {
+    let git_dir = PathBuf::from(&path).join(".git");
+    git_dir.exists() && git_dir.is_dir()
+}
+
+/// Add a new project folder
+#[tauri::command]
+pub fn add_project(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    name: Option<String>,
+) -> Result<crate::state::UserProject> {
+    use crate::state::UserProject;
+    
+    let path_buf = PathBuf::from(&path);
+    
+    // Verify the path exists and is a directory
+    if !path_buf.exists() {
+        return Err(TandemError::NotFound(format!(
+            "Path does not exist: {}",
+            path
+        )));
+    }
+    
+    if !path_buf.is_dir() {
+        return Err(TandemError::InvalidConfig(format!(
+            "Path is not a directory: {}",
+            path
+        )));
+    }
+    
+    // Create new project
+    let project = UserProject::new(path_buf, name);
+    
+    // Add to state
+    {
+        let mut projects = state.user_projects.write().unwrap();
+        projects.push(project.clone());
+    }
+    
+    // Save to store
+    if let Ok(store) = app.store("settings.json") {
+        let projects = state.user_projects.read().unwrap();
+        let _ = store.set("user_projects", serde_json::to_value(&*projects).unwrap());
+        let _ = store.save();
+    }
+    
+    tracing::info!("Added project: {} at {}", project.name, project.path);
+    
+    Ok(project)
+}
+
+/// Remove a project
+#[tauri::command]
+pub fn remove_project(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<()> {
+    // Remove from state
+    {
+        let mut projects = state.user_projects.write().unwrap();
+        projects.retain(|p| p.id != project_id);
+    }
+    
+    // If this was the active project, clear it
+    {
+        let active_id = state.active_project_id.read().unwrap();
+        if active_id.as_ref() == Some(&project_id) {
+            drop(active_id);
+            let mut active = state.active_project_id.write().unwrap();
+            *active = None;
+            
+            // Also clear workspace path
+            let mut workspace = state.workspace_path.write().unwrap();
+            *workspace = None;
+        }
+    }
+    
+    // Save to store
+    if let Ok(store) = app.store("settings.json") {
+        let projects = state.user_projects.read().unwrap();
+        let _ = store.set("user_projects", serde_json::to_value(&*projects).unwrap());
+        
+        let active_id = state.active_project_id.read().unwrap();
+        if active_id.is_none() {
+            let _ = store.delete("active_project_id");
+        }
+        
+        let _ = store.save();
+    }
+    
+    tracing::info!("Removed project: {}", project_id);
+    
+    Ok(())
+}
+
+/// Get all user projects
+#[tauri::command]
+pub fn get_user_projects(state: State<'_, AppState>) -> Vec<crate::state::UserProject> {
+    let projects = state.user_projects.read().unwrap();
+    projects.clone()
+}
+
+/// Set the active project (and update workspace)
+#[tauri::command]
+pub async fn set_active_project(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<()> {
+    use crate::state::UserProject;
+    
+    // Find the project
+    let project: UserProject = {
+        let projects = state.user_projects.read().unwrap();
+        projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .cloned()
+            .ok_or_else(|| TandemError::NotFound(format!("Project not found: {}", project_id)))?
+    };
+    
+    // Set as active
+    {
+        let mut active = state.active_project_id.write().unwrap();
+        *active = Some(project_id.clone());
+    }
+    
+    // Update last accessed time
+    {
+        let mut projects = state.user_projects.write().unwrap();
+        if let Some(p) = projects.iter_mut().find(|p| p.id == project_id) {
+            p.last_accessed = chrono::Utc::now();
+        }
+    }
+    
+    // Set workspace path
+    let path_buf = project.path_buf();
+    state.set_workspace(path_buf.clone());
+    
+    // Update sidecar workspace - this sets it for when sidecar restarts
+    state.sidecar.set_workspace(path_buf.clone()).await;
+    
+    // Restart the sidecar if it's running so it picks up the new workspace
+    let sidecar_state = state.sidecar.state().await;
+    if sidecar_state == crate::sidecar::SidecarState::Running {
+        tracing::info!("Restarting sidecar with new workspace: {}", project.path);
+        
+        // Stop the sidecar
+        let _ = state.sidecar.stop().await;
+        
+        // Wait a moment for cleanup
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        
+        // Get the sidecar path
+        let sidecar_path = get_sidecar_path(&app)?;
+        
+        // Restart with new workspace
+        state.sidecar.start(sidecar_path.to_string_lossy().as_ref()).await?;
+        
+        // Re-set API keys
+        let providers = {
+            let config = state.providers_config.read().unwrap();
+            config.clone()
+        };
+        
+        if providers.openrouter.enabled {
+            if let Ok(Some(key)) = get_api_key(&app, "openrouter").await {
+                state.sidecar.set_env("OPENROUTER_API_KEY", &key).await;
+            }
+        }
+        if providers.anthropic.enabled {
+            if let Ok(Some(key)) = get_api_key(&app, "anthropic").await {
+                state.sidecar.set_env("ANTHROPIC_API_KEY", &key).await;
+            }
+        }
+        if providers.openai.enabled {
+            if let Ok(Some(key)) = get_api_key(&app, "openai").await {
+                state.sidecar.set_env("OPENAI_API_KEY", &key).await;
+            }
+        }
+        
+        tracing::info!("Sidecar restarted successfully");
+    }
+    
+    // Save to store
+    if let Ok(store) = app.store("settings.json") {
+        let _ = store.set("active_project_id", serde_json::json!(project_id));
+        let projects = state.user_projects.read().unwrap();
+        let _ = store.set("user_projects", serde_json::to_value(&*projects).unwrap());
+        let _ = store.save();
+    }
+    
+    tracing::info!("Set active project: {} ({})", project.name, project.path);
+    
+    Ok(())
+}
+
+/// Get the active project
+#[tauri::command]
+pub fn get_active_project(state: State<'_, AppState>) -> Option<crate::state::UserProject> {
+    let active_id = state.active_project_id.read().unwrap();
+    let project_id = active_id.as_ref()?;
+    
+    let projects = state.user_projects.read().unwrap();
+    projects.iter().find(|p| &p.id == project_id).cloned()
 }
 
 // ============================================================================
@@ -692,6 +911,9 @@ pub async fn send_message_streaming(
                         StreamEvent::PermissionAsked { session_id, .. } => {
                             session_id == &target_session_id
                         }
+                        StreamEvent::FileEdited { session_id, .. } => {
+                            session_id == &target_session_id
+                        }
                         StreamEvent::Raw { .. } => true, // Include raw events for debugging
                     };
 
@@ -749,6 +971,279 @@ pub async fn list_providers_from_sidecar(state: State<'_, AppState>) -> Result<V
 }
 
 // ============================================================================
+// File Operation Undo
+// ============================================================================
+
+/// Result of an undo operation
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UndoResult {
+    pub reverted_entry_id: String,
+    pub path: String,
+    pub operation: String,
+}
+
+/// Check if undo is available
+#[tauri::command]
+pub fn can_undo_file_change(state: State<'_, AppState>) -> bool {
+    state.operation_journal.can_undo()
+}
+
+/// Undo the last file operation
+#[tauri::command]
+pub fn undo_last_file_change(state: State<'_, AppState>) -> Result<Option<UndoResult>> {
+    match state.operation_journal.undo_last()? {
+        Some(entry_id) => {
+            // Get the journal entry to return details
+            let entries = state.operation_journal.get_recent_entries(100);
+            if let Some(entry) = entries.iter().find(|e| e.id == entry_id) {
+                Ok(Some(UndoResult {
+                    reverted_entry_id: entry_id,
+                    path: entry
+                        .before_state
+                        .as_ref()
+                        .map(|s| s.path.clone())
+                        .unwrap_or_default(),
+                    operation: entry.tool_name.clone(),
+                }))
+            } else {
+                Ok(Some(UndoResult {
+                    reverted_entry_id: entry_id,
+                    path: String::new(),
+                    operation: "unknown".to_string(),
+                }))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+/// Get recent file operations
+#[tauri::command]
+pub fn get_recent_file_operations(
+    state: State<'_, AppState>,
+    count: usize,
+) -> Vec<JournalEntry> {
+    state.operation_journal.get_recent_entries(count)
+}
+
+// ============================================================================
+// Conversation Rewind
+// ============================================================================
+
+/// Rewind to a specific message by creating a new branched session
+#[tauri::command]
+pub async fn rewind_to_message(
+    state: State<'_, AppState>,
+    session_id: String,
+    message_id: String,
+    edited_content: Option<String>,
+) -> Result<Session> {
+    tracing::info!(
+        "Rewinding session {} to message {}",
+        session_id,
+        message_id
+    );
+
+    // 1. Get all messages from the current session
+    let messages = state.sidecar.get_session_messages(&session_id).await?;
+
+    // 2. Find the index of the target message
+    let mut target_index = None;
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.info.id == message_id {
+            target_index = Some(i);
+            break;
+        }
+    }
+
+    let target_index = target_index.ok_or_else(|| {
+        TandemError::Sidecar(format!("Message {} not found in session", message_id))
+    })?;
+
+    // 3. Create a new session
+    let (default_provider, default_model) = {
+        let config = state.providers_config.read().unwrap();
+        resolve_default_provider_and_model(&config)
+    };
+
+    let new_session = state
+        .sidecar
+        .create_session(CreateSessionRequest {
+            title: Some(format!("Rewind from {}", session_id)),
+            model: default_model,
+            provider: default_provider,
+        })
+        .await?;
+
+    tracing::info!("Created new branched session: {}", new_session.id);
+
+    // 4. Replay messages up to (but not including) the target message
+    // OpenCode doesn't have a direct API to copy messages, so we'll just return the new session
+    // The frontend will handle displaying the branched conversation
+    
+    // TODO: In a future enhancement, we could replay messages by sending them to the new session
+    // For now, we'll just create an empty session for the user to continue from
+
+    // If edited content is provided, send it as the first message
+    if let Some(content) = edited_content {
+        tracing::info!("Sending edited message to new session");
+        let request = SendMessageRequest::text(content);
+        state.sidecar.send_message(&new_session.id, request).await?;
+    }
+
+    // Update current session
+    {
+        let mut current = state.current_session_id.write().unwrap();
+        *current = Some(new_session.id.clone());
+    }
+
+    Ok(new_session)
+}
+
+// ============================================================================
+// Message Undo/Redo (OpenCode native revert/unrevert)
+// ============================================================================
+
+/// Undo a message (revert)
+/// Reverts the specified message and any file changes it made
+#[tauri::command]
+pub async fn undo_message(
+    state: State<'_, AppState>,
+    session_id: String,
+    message_id: String,
+) -> Result<()> {
+    tracing::info!("Undoing message {} in session {}", message_id, session_id);
+    state.sidecar.revert_message(&session_id, &message_id).await
+}
+
+/// Undo a message and also revert any file changes we recorded for that message.
+/// This uses Tandem's local operation journal (captured at tool-approval time) to restore files.
+#[tauri::command]
+pub async fn undo_message_with_files(
+    state: State<'_, AppState>,
+    session_id: String,
+    message_id: String,
+) -> Result<Vec<String>> {
+    tracing::info!(
+        "[undo_message_with_files] Undoing message {} in session {}",
+        message_id,
+        session_id
+    );
+
+    // 1) Revert the OpenCode message (conversation state)
+    if let Err(e) = state.sidecar.revert_message(&session_id, &message_id).await {
+        tracing::warn!("[undo_message_with_files] OpenCode revert failed (continuing with file restore): {}", e);
+    }
+
+    // 2) Restore any files we journaled for this message
+    tracing::info!("[undo_message_with_files] Looking for snapshots with message_id={}", message_id);
+    let reverted_paths = state.operation_journal.undo_for_message(&message_id)?;
+    tracing::info!("[undo_message_with_files] Restored {} files: {:?}", reverted_paths.len(), reverted_paths);
+
+    Ok(reverted_paths)
+}
+
+/// Redo messages (unrevert)
+/// Restores previously reverted messages
+#[tauri::command]
+pub async fn redo_message(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<()> {
+    tracing::info!("Redoing messages in session {}", session_id);
+    state.sidecar.unrevert_message(&session_id).await
+}
+
+/// Execute undo via OpenCode's slash command API
+/// This properly triggers Git-based file restoration
+#[tauri::command]
+pub async fn undo_via_command(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<()> {
+    tracing::info!("Executing /undo command in session {}", session_id);
+    state.sidecar.execute_command(&session_id, "undo").await
+}
+
+// ============================================================================
+// File Snapshot (for undo)
+// ============================================================================
+
+/// Capture a snapshot of a file BEFORE it's about to be modified.
+/// This is called at tool_start time (not approval time) since OpenCode may execute tools without permission.
+#[tauri::command]
+pub fn snapshot_file_for_message(
+    state: State<'_, AppState>,
+    file_path: String,
+    tool: String,
+    message_id: String,
+) -> Result<()> {
+    tracing::info!(
+        "[snapshot_file_for_message] Capturing snapshot for path='{}', tool='{}', message_id='{}'",
+        file_path,
+        tool,
+        message_id
+    );
+
+    let path_buf = PathBuf::from(&file_path);
+
+    // Validate path against allowed workspace scope
+    if !state.is_path_allowed(&path_buf) {
+        tracing::warn!(
+            "[snapshot_file_for_message] Skipping snapshot for disallowed path '{}'",
+            file_path
+        );
+        return Ok(());
+    }
+
+    let (exists, is_directory) = match fs::metadata(&path_buf) {
+        Ok(meta) => (true, meta.is_dir()),
+        Err(_) => (false, false),
+    };
+
+    let content = if exists && !is_directory {
+        fs::read_to_string(&path_buf).ok()
+    } else {
+        None
+    };
+
+    let snapshot = FileSnapshot {
+        path: file_path.clone(),
+        content,
+        exists,
+        is_directory,
+    };
+
+    let entry = JournalEntry {
+        id: Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now(),
+        tool_name: tool.clone(),
+        args: serde_json::json!({"filePath": file_path}),
+        status: OperationStatus::Completed,
+        before_state: Some(snapshot.clone()),
+        after_state: None,
+        user_approved: true, // Auto-approved since OpenCode already decided to execute
+    };
+
+    let undo_action = UndoAction {
+        journal_entry_id: entry.id.clone(),
+        snapshot,
+        message_id: Some(message_id.clone()),
+    };
+
+    tracing::info!(
+        "[snapshot_file_for_message] Recorded snapshot for path='{}', exists={}, message_id='{}'",
+        file_path,
+        exists,
+        message_id
+    );
+
+    state.operation_journal.record(entry, Some(undo_action));
+
+    Ok(())
+}
+
+// ============================================================================
 // Tool Approval
 // ============================================================================
 
@@ -758,7 +1253,102 @@ pub async fn approve_tool(
     state: State<'_, AppState>,
     session_id: String,
     tool_call_id: String,
+    tool: Option<String>,
+    args: Option<serde_json::Value>,
+    message_id: Option<String>,
 ) -> Result<()> {
+    tracing::info!(
+        "[approve_tool] tool={:?}, message_id={:?}, args={:?}",
+        tool,
+        message_id,
+        args
+    );
+    
+    // Capture a snapshot BEFORE allowing the tool to run, so we can undo file changes later.
+    // We only snapshot direct file tools (write/delete). Shell commands and reads are too broad.
+    // Note: OpenCode's tool names are "write", "delete", "read", "bash", "list", "search", etc.
+    if let (Some(tool_name), Some(args_val)) = (tool.clone(), args.clone()) {
+        let is_file_tool = matches!(
+            tool_name.as_str(),
+            "write" | "delete"
+        );
+
+        if is_file_tool {
+            tracing::info!("[approve_tool] File tool detected: {}", tool_name);
+            
+            // Try to extract a file path from args
+            // OpenCode uses "filePath" for write operations
+            let path_str = args_val
+                .get("filePath")
+                .and_then(|v| v.as_str())
+                .or_else(|| args_val.get("absolute_path").and_then(|v| v.as_str()))
+                .or_else(|| args_val.get("path").and_then(|v| v.as_str()))
+                .or_else(|| args_val.get("file").and_then(|v| v.as_str()))
+                .map(|s| s.to_string());
+
+            tracing::info!("[approve_tool] Extracted path: {:?}", path_str);
+
+            if let Some(path) = path_str {
+                let path_buf = PathBuf::from(&path);
+
+                // Validate path against allowed workspace scope
+                if state.is_path_allowed(&path_buf) {
+                    let (exists, is_directory) = match fs::metadata(&path_buf) {
+                        Ok(meta) => (true, meta.is_dir()),
+                        Err(_) => (false, false),
+                    };
+
+                    let content = if exists && !is_directory {
+                        fs::read_to_string(&path_buf).ok()
+                    } else {
+                        None
+                    };
+
+                    let snapshot = FileSnapshot {
+                        path: path.clone(),
+                        content,
+                        exists,
+                        is_directory,
+                    };
+
+                    let entry = JournalEntry {
+                        id: Uuid::new_v4().to_string(),
+                        timestamp: chrono::Utc::now(),
+                        tool_name: tool_name.clone(),
+                        args: args_val.clone(),
+                        status: OperationStatus::Approved,
+                        before_state: Some(snapshot.clone()),
+                        after_state: None,
+                        user_approved: true,
+                    };
+
+                    let undo_action = UndoAction {
+                        journal_entry_id: entry.id.clone(),
+                        snapshot,
+                        message_id: message_id.clone(),
+                    };
+
+                    tracing::info!(
+                        "[approve_tool] Recorded snapshot for path '{}' with message_id {:?}, exists={}",
+                        path,
+                        message_id,
+                        exists
+                    );
+                    state.operation_journal.record(entry, Some(undo_action));
+                } else {
+                    tracing::warn!(
+                        "Skipping snapshot for disallowed path '{}' on approve_tool",
+                        path
+                    );
+                }
+            } else {
+                tracing::warn!("[approve_tool] Could not extract path from args: {:?}", args_val);
+            }
+        }
+    } else {
+        tracing::info!("[approve_tool] No tool/args provided, skipping snapshot");
+    }
+
     state.sidecar.approve_tool(&session_id, &tool_call_id).await
 }
 
@@ -768,7 +1358,25 @@ pub async fn deny_tool(
     state: State<'_, AppState>,
     session_id: String,
     tool_call_id: String,
+    tool: Option<String>,
+    args: Option<serde_json::Value>,
+    message_id: Option<String>,
 ) -> Result<()> {
+    // Record denied operations for visibility/debugging (no undo action).
+    if let (Some(tool_name), Some(args_val)) = (tool.clone(), args.clone()) {
+        let entry = JournalEntry {
+            id: Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now(),
+            tool_name,
+            args: args_val,
+            status: OperationStatus::Denied,
+            before_state: None,
+            after_state: None,
+            user_approved: false,
+        };
+        state.operation_journal.record(entry, None);
+    }
+
     state.sidecar.deny_tool(&session_id, &tool_call_id).await
 }
 

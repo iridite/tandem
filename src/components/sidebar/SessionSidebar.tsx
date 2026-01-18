@@ -12,6 +12,8 @@ import {
   FileText,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { ProjectSwitcher } from "./ProjectSwitcher";
+import type { UserProject } from "@/lib/tauri";
 
 export interface Project {
   id: string;
@@ -53,6 +55,13 @@ interface SessionSidebarProps {
   onNewChat: () => void;
   onDeleteSession: (sessionId: string) => void;
   isLoading?: boolean;
+  // Project switcher props
+  userProjects?: UserProject[];
+  activeProject?: UserProject | null;
+  onSwitchProject?: (projectId: string) => void;
+  onAddProject?: () => void;
+  onManageProjects?: () => void;
+  projectSwitcherLoading?: boolean;
 }
 
 export function SessionSidebar({
@@ -65,6 +74,12 @@ export function SessionSidebar({
   onNewChat,
   onDeleteSession,
   isLoading,
+  userProjects = [],
+  activeProject,
+  onSwitchProject,
+  onAddProject,
+  onManageProjects,
+  projectSwitcherLoading = false,
 }: SessionSidebarProps) {
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
@@ -128,25 +143,66 @@ export function SessionSidebar({
   };
 
   const getProjectName = (projectId: string) => {
-    const project = projects.find((p) => p.id === projectId);
-    if (project) {
-      // Get the last part of the path
-      const parts = project.worktree.split(/[/\\]/);
-      return parts[parts.length - 1] || project.worktree;
-    }
-    // Fallback: try to get from session directory
+    // First, try to match with our userProjects by checking if the session directory matches
     const session = sessions.find((s) => s.projectID === projectId);
-    if (session) {
-      const parts = session.directory.split(/[/\\]/);
-      return parts[parts.length - 1] || session.directory;
+    if (session?.directory) {
+      // Normalize paths for comparison
+      const normalizedSessionDir = session.directory.toLowerCase().replace(/\\/g, "/");
+
+      // Find a userProject that matches this session's directory
+      const matchingUserProject = userProjects.find((up) => {
+        const normalizedProjectPath = up.path.toLowerCase().replace(/\\/g, "/");
+        return (
+          normalizedSessionDir.includes(normalizedProjectPath) ||
+          normalizedProjectPath.includes(normalizedSessionDir)
+        );
+      });
+      if (matchingUserProject) {
+        return matchingUserProject.name;
+      }
     }
+
+    // Try from OpenCode projects
+    const project = projects.find((p) => p.id === projectId);
+    if (project && project.worktree && project.worktree !== "/") {
+      // Get the last non-empty part of the path
+      const parts = project.worktree.split(/[/\\]/).filter((p) => p.length > 0);
+      if (parts.length > 0) {
+        return parts[parts.length - 1];
+      }
+    }
+
+    // Fallback: try to get from session directory
+    if (session?.directory) {
+      const parts = session.directory.split(/[/\\]/).filter((p) => p.length > 0);
+      if (parts.length > 0) {
+        return parts[parts.length - 1];
+      }
+    }
+
     return "Unknown Project";
   };
 
   const getProjectPath = (projectId: string) => {
+    // First check if we have a matching userProject
+    const session = sessions.find((s) => s.projectID === projectId);
+    if (session?.directory) {
+      const normalizedSessionDir = session.directory.toLowerCase().replace(/\\/g, "/");
+
+      const matchingUserProject = userProjects.find((up) => {
+        const normalizedProjectPath = up.path.toLowerCase().replace(/\\/g, "/");
+        return (
+          normalizedSessionDir.includes(normalizedProjectPath) ||
+          normalizedProjectPath.includes(normalizedSessionDir)
+        );
+      });
+      if (matchingUserProject) {
+        return matchingUserProject.path;
+      }
+    }
+
     const project = projects.find((p) => p.id === projectId);
     if (project) return project.worktree;
-    const session = sessions.find((s) => s.projectID === projectId);
     return session?.directory || "";
   };
 
@@ -187,6 +243,20 @@ export function SessionSidebar({
                 <ChevronLeft className="h-4 w-4 text-text-muted" />
               </button>
             </div>
+
+            {/* Project Switcher */}
+            {onSwitchProject && onAddProject && onManageProjects && (
+              <div className="p-3 border-b border-white/10">
+                <ProjectSwitcher
+                  projects={userProjects}
+                  activeProject={activeProject || null}
+                  onSwitchProject={onSwitchProject}
+                  onAddProject={onAddProject}
+                  onManageProjects={onManageProjects}
+                  isLoading={projectSwitcherLoading}
+                />
+              </div>
+            )}
 
             {/* New Chat Button */}
             <div className="p-3 border-b border-white/10">

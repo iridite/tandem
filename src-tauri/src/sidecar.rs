@@ -313,6 +313,10 @@ pub struct MessageInfo {
     pub agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reverted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,6 +448,11 @@ pub enum StreamEvent {
         request_id: String,
         tool: Option<String>,
         args: Option<serde_json::Value>,
+    },
+    /// File edited (from file.edited event)
+    FileEdited {
+        session_id: String,
+        file_path: String,
     },
     /// Raw event (for debugging or unhandled types)
     Raw {
@@ -956,6 +965,119 @@ impl SidecarManager {
         }
     }
 
+    /// Revert a message (undo)
+    /// OpenCode API: POST /session/{id}/revert
+    /// Reverts the specified message and any file changes it made
+    pub async fn revert_message(&self, session_id: &str, message_id: &str) -> Result<()> {
+        self.check_circuit_breaker().await?;
+
+        let url = format!(
+            "{}/session/{}/revert",
+            self.base_url().await?,
+            session_id
+        );
+        tracing::info!("Reverting message {} in session {}", message_id, session_id);
+
+        let body = serde_json::json!({
+            "messageID": message_id
+        });
+
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to revert message: {}", e)))?;
+
+        if response.status().is_success() {
+            self.record_success().await;
+            tracing::info!("Successfully reverted message {}", message_id);
+            Ok(())
+        } else {
+            self.record_failure().await;
+            let body = response.text().await.unwrap_or_default();
+            Err(TandemError::Sidecar(format!(
+                "Failed to revert message: {}",
+                body
+            )))
+        }
+    }
+
+    /// Unrevert messages (redo)
+    /// OpenCode API: POST /session/{id}/unrevert
+    /// Restores previously reverted messages
+    pub async fn unrevert_message(&self, session_id: &str) -> Result<()> {
+        self.check_circuit_breaker().await?;
+
+        let url = format!(
+            "{}/session/{}/unrevert",
+            self.base_url().await?,
+            session_id
+        );
+        tracing::info!("Unreverting messages in session {}", session_id);
+
+        let response = self
+            .http_client
+            .post(&url)
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to unrevert message: {}", e)))?;
+
+        if response.status().is_success() {
+            self.record_success().await;
+            tracing::info!("Successfully unreverted messages");
+            Ok(())
+        } else {
+            self.record_failure().await;
+            let body = response.text().await.unwrap_or_default();
+            Err(TandemError::Sidecar(format!(
+                "Failed to unrevert message: {}",
+                body
+            )))
+        }
+    }
+
+    /// Execute a slash command in a session
+    /// OpenCode API: POST /session/{id}/command
+    /// This is used for commands like /undo which triggers Git-based file restoration
+    pub async fn execute_command(&self, session_id: &str, command: &str) -> Result<()> {
+        self.check_circuit_breaker().await?;
+
+        let url = format!(
+            "{}/session/{}/command",
+            self.base_url().await?,
+            session_id
+        );
+        tracing::info!("Executing command '{}' in session {}", command, session_id);
+
+        let body = serde_json::json!({
+            "command": command,
+            "arguments": ""
+        });
+
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to execute command: {}", e)))?;
+
+        if response.status().is_success() {
+            self.record_success().await;
+            tracing::info!("Successfully executed command '{}'", command);
+            Ok(())
+        } else {
+            self.record_failure().await;
+            let body = response.text().await.unwrap_or_default();
+            Err(TandemError::Sidecar(format!(
+                "Failed to execute command '{}': {}",
+                command, body
+            )))
+        }
+    }
+
     /// Subscribe to the event stream
     /// OpenCode API: GET /event (SSE)
     /// Returns a stream of events for all sessions
@@ -1438,6 +1560,13 @@ fn convert_opencode_event(event: OpenCodeEvent) -> Option<StreamEvent> {
             let session_id = props.get("sessionID").and_then(|s| s.as_str())?.to_string();
             let error = props.get("error").and_then(|s| s.as_str())?.to_string();
             Some(StreamEvent::SessionError { session_id, error })
+        }
+        "file.edited" => {
+            let file_path = props.get("file").and_then(|s| s.as_str())?.to_string();
+            Some(StreamEvent::FileEdited {
+                session_id: props.get("sessionID").and_then(|s| s.as_str())?.to_string(),
+                file_path,
+            })
         }
         "permission.asked" => {
             let session_id = props.get("sessionID").and_then(|s| s.as_str())?.to_string();
