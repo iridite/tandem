@@ -971,11 +971,7 @@ impl SidecarManager {
     pub async fn revert_message(&self, session_id: &str, message_id: &str) -> Result<()> {
         self.check_circuit_breaker().await?;
 
-        let url = format!(
-            "{}/session/{}/revert",
-            self.base_url().await?,
-            session_id
-        );
+        let url = format!("{}/session/{}/revert", self.base_url().await?, session_id);
         tracing::info!("Reverting message {} in session {}", message_id, session_id);
 
         let body = serde_json::json!({
@@ -1010,11 +1006,7 @@ impl SidecarManager {
     pub async fn unrevert_message(&self, session_id: &str) -> Result<()> {
         self.check_circuit_breaker().await?;
 
-        let url = format!(
-            "{}/session/{}/unrevert",
-            self.base_url().await?,
-            session_id
-        );
+        let url = format!("{}/session/{}/unrevert", self.base_url().await?, session_id);
         tracing::info!("Unreverting messages in session {}", session_id);
 
         let response = self

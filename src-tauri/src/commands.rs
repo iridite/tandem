@@ -14,8 +14,8 @@ use crate::tool_proxy::{FileSnapshot, JournalEntry, OperationStatus, UndoAction}
 use crate::vault::{self, EncryptedVaultKey, VaultStatus};
 use crate::VaultState;
 use futures::StreamExt;
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_store::StoreExt;
 use uuid::Uuid;
@@ -273,9 +273,9 @@ pub fn add_project(
     name: Option<String>,
 ) -> Result<crate::state::UserProject> {
     use crate::state::UserProject;
-    
+
     let path_buf = PathBuf::from(&path);
-    
+
     // Verify the path exists and is a directory
     if !path_buf.exists() {
         return Err(TandemError::NotFound(format!(
@@ -283,32 +283,32 @@ pub fn add_project(
             path
         )));
     }
-    
+
     if !path_buf.is_dir() {
         return Err(TandemError::InvalidConfig(format!(
             "Path is not a directory: {}",
             path
         )));
     }
-    
+
     // Create new project
     let project = UserProject::new(path_buf, name);
-    
+
     // Add to state
     {
         let mut projects = state.user_projects.write().unwrap();
         projects.push(project.clone());
     }
-    
+
     // Save to store
     if let Ok(store) = app.store("settings.json") {
         let projects = state.user_projects.read().unwrap();
         let _ = store.set("user_projects", serde_json::to_value(&*projects).unwrap());
         let _ = store.save();
     }
-    
+
     tracing::info!("Added project: {} at {}", project.name, project.path);
-    
+
     Ok(project)
 }
 
@@ -324,7 +324,7 @@ pub fn remove_project(
         let mut projects = state.user_projects.write().unwrap();
         projects.retain(|p| p.id != project_id);
     }
-    
+
     // If this was the active project, clear it
     {
         let active_id = state.active_project_id.read().unwrap();
@@ -332,28 +332,28 @@ pub fn remove_project(
             drop(active_id);
             let mut active = state.active_project_id.write().unwrap();
             *active = None;
-            
+
             // Also clear workspace path
             let mut workspace = state.workspace_path.write().unwrap();
             *workspace = None;
         }
     }
-    
+
     // Save to store
     if let Ok(store) = app.store("settings.json") {
         let projects = state.user_projects.read().unwrap();
         let _ = store.set("user_projects", serde_json::to_value(&*projects).unwrap());
-        
+
         let active_id = state.active_project_id.read().unwrap();
         if active_id.is_none() {
             let _ = store.delete("active_project_id");
         }
-        
+
         let _ = store.save();
     }
-    
+
     tracing::info!("Removed project: {}", project_id);
-    
+
     Ok(())
 }
 
@@ -372,7 +372,7 @@ pub async fn set_active_project(
     project_id: String,
 ) -> Result<()> {
     use crate::state::UserProject;
-    
+
     // Find the project
     let project: UserProject = {
         let projects = state.user_projects.read().unwrap();
@@ -382,13 +382,13 @@ pub async fn set_active_project(
             .cloned()
             .ok_or_else(|| TandemError::NotFound(format!("Project not found: {}", project_id)))?
     };
-    
+
     // Set as active
     {
         let mut active = state.active_project_id.write().unwrap();
         *active = Some(project_id.clone());
     }
-    
+
     // Update last accessed time
     {
         let mut projects = state.user_projects.write().unwrap();
@@ -396,37 +396,40 @@ pub async fn set_active_project(
             p.last_accessed = chrono::Utc::now();
         }
     }
-    
+
     // Set workspace path
     let path_buf = project.path_buf();
     state.set_workspace(path_buf.clone());
-    
+
     // Update sidecar workspace - this sets it for when sidecar restarts
     state.sidecar.set_workspace(path_buf.clone()).await;
-    
+
     // Restart the sidecar if it's running so it picks up the new workspace
     let sidecar_state = state.sidecar.state().await;
     if sidecar_state == crate::sidecar::SidecarState::Running {
         tracing::info!("Restarting sidecar with new workspace: {}", project.path);
-        
+
         // Stop the sidecar
         let _ = state.sidecar.stop().await;
-        
+
         // Wait a moment for cleanup
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        
+
         // Get the sidecar path
         let sidecar_path = get_sidecar_path(&app)?;
-        
+
         // Restart with new workspace
-        state.sidecar.start(sidecar_path.to_string_lossy().as_ref()).await?;
-        
+        state
+            .sidecar
+            .start(sidecar_path.to_string_lossy().as_ref())
+            .await?;
+
         // Re-set API keys
         let providers = {
             let config = state.providers_config.read().unwrap();
             config.clone()
         };
-        
+
         if providers.openrouter.enabled {
             if let Ok(Some(key)) = get_api_key(&app, "openrouter").await {
                 state.sidecar.set_env("OPENROUTER_API_KEY", &key).await;
@@ -442,10 +445,10 @@ pub async fn set_active_project(
                 state.sidecar.set_env("OPENAI_API_KEY", &key).await;
             }
         }
-        
+
         tracing::info!("Sidecar restarted successfully");
     }
-    
+
     // Save to store
     if let Ok(store) = app.store("settings.json") {
         let _ = store.set("active_project_id", serde_json::json!(project_id));
@@ -453,9 +456,9 @@ pub async fn set_active_project(
         let _ = store.set("user_projects", serde_json::to_value(&*projects).unwrap());
         let _ = store.save();
     }
-    
+
     tracing::info!("Set active project: {} ({})", project.name, project.path);
-    
+
     Ok(())
 }
 
@@ -464,7 +467,7 @@ pub async fn set_active_project(
 pub fn get_active_project(state: State<'_, AppState>) -> Option<crate::state::UserProject> {
     let active_id = state.active_project_id.read().unwrap();
     let project_id = active_id.as_ref()?;
-    
+
     let projects = state.user_projects.read().unwrap();
     projects.iter().find(|p| &p.id == project_id).cloned()
 }
@@ -1019,10 +1022,7 @@ pub fn undo_last_file_change(state: State<'_, AppState>) -> Result<Option<UndoRe
 
 /// Get recent file operations
 #[tauri::command]
-pub fn get_recent_file_operations(
-    state: State<'_, AppState>,
-    count: usize,
-) -> Vec<JournalEntry> {
+pub fn get_recent_file_operations(state: State<'_, AppState>, count: usize) -> Vec<JournalEntry> {
     state.operation_journal.get_recent_entries(count)
 }
 
@@ -1038,11 +1038,7 @@ pub async fn rewind_to_message(
     message_id: String,
     edited_content: Option<String>,
 ) -> Result<Session> {
-    tracing::info!(
-        "Rewinding session {} to message {}",
-        session_id,
-        message_id
-    );
+    tracing::info!("Rewinding session {} to message {}", session_id, message_id);
 
     // 1. Get all messages from the current session
     let messages = state.sidecar.get_session_messages(&session_id).await?;
@@ -1080,7 +1076,7 @@ pub async fn rewind_to_message(
     // 4. Replay messages up to (but not including) the target message
     // OpenCode doesn't have a direct API to copy messages, so we'll just return the new session
     // The frontend will handle displaying the branched conversation
-    
+
     // TODO: In a future enhancement, we could replay messages by sending them to the new session
     // For now, we'll just create an empty session for the user to continue from
 
@@ -1132,13 +1128,23 @@ pub async fn undo_message_with_files(
 
     // 1) Revert the OpenCode message (conversation state)
     if let Err(e) = state.sidecar.revert_message(&session_id, &message_id).await {
-        tracing::warn!("[undo_message_with_files] OpenCode revert failed (continuing with file restore): {}", e);
+        tracing::warn!(
+            "[undo_message_with_files] OpenCode revert failed (continuing with file restore): {}",
+            e
+        );
     }
 
     // 2) Restore any files we journaled for this message
-    tracing::info!("[undo_message_with_files] Looking for snapshots with message_id={}", message_id);
+    tracing::info!(
+        "[undo_message_with_files] Looking for snapshots with message_id={}",
+        message_id
+    );
     let reverted_paths = state.operation_journal.undo_for_message(&message_id)?;
-    tracing::info!("[undo_message_with_files] Restored {} files: {:?}", reverted_paths.len(), reverted_paths);
+    tracing::info!(
+        "[undo_message_with_files] Restored {} files: {:?}",
+        reverted_paths.len(),
+        reverted_paths
+    );
 
     Ok(reverted_paths)
 }
@@ -1146,10 +1152,7 @@ pub async fn undo_message_with_files(
 /// Redo messages (unrevert)
 /// Restores previously reverted messages
 #[tauri::command]
-pub async fn redo_message(
-    state: State<'_, AppState>,
-    session_id: String,
-) -> Result<()> {
+pub async fn redo_message(state: State<'_, AppState>, session_id: String) -> Result<()> {
     tracing::info!("Redoing messages in session {}", session_id);
     state.sidecar.unrevert_message(&session_id).await
 }
@@ -1157,12 +1160,9 @@ pub async fn redo_message(
 /// Execute undo via OpenCode's slash command API
 /// This properly triggers Git-based file restoration
 #[tauri::command]
-pub async fn undo_via_command(
-    state: State<'_, AppState>,
-    session_id: String,
-) -> Result<()> {
+pub async fn undo_via_command(state: State<'_, AppState>, session_id: String) -> Result<()> {
     tracing::info!("Executing /undo via prompt in session {}", session_id);
-    
+
     // Send "/undo" as a regular prompt - same as typing it in the TUI
     // OpenCode intercepts slash commands and handles them specially
     let request = crate::sidecar::SendMessageRequest::text("/undo".to_string());
@@ -1267,19 +1267,16 @@ pub async fn approve_tool(
         message_id,
         args
     );
-    
+
     // Capture a snapshot BEFORE allowing the tool to run, so we can undo file changes later.
     // We only snapshot direct file tools (write/delete). Shell commands and reads are too broad.
     // Note: OpenCode's tool names are "write", "delete", "read", "bash", "list", "search", etc.
     if let (Some(tool_name), Some(args_val)) = (tool.clone(), args.clone()) {
-        let is_file_tool = matches!(
-            tool_name.as_str(),
-            "write" | "delete"
-        );
+        let is_file_tool = matches!(tool_name.as_str(), "write" | "delete");
 
         if is_file_tool {
             tracing::info!("[approve_tool] File tool detected: {}", tool_name);
-            
+
             // Try to extract a file path from args
             // OpenCode uses "filePath" for write operations
             let path_str = args_val
@@ -1346,7 +1343,10 @@ pub async fn approve_tool(
                     );
                 }
             } else {
-                tracing::warn!("[approve_tool] Could not extract path from args: {:?}", args_val);
+                tracing::warn!(
+                    "[approve_tool] Could not extract path from args: {:?}",
+                    args_val
+                );
             }
         }
     } else {
