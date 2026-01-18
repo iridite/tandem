@@ -1038,49 +1038,6 @@ impl SidecarManager {
         }
     }
 
-    /// Execute a slash command in a session
-    /// OpenCode API: POST /session/{id}/command
-    /// This is used for commands like /undo which triggers Git-based file restoration
-    pub async fn execute_command(&self, session_id: &str, command: &str) -> Result<()> {
-        self.check_circuit_breaker().await?;
-
-        let url = format!(
-            "{}/session/{}/command",
-            self.base_url().await?,
-            session_id
-        );
-        tracing::info!("Executing command '{}' in session {}", command, session_id);
-
-        // OpenCode expects: { command: "undo", arguments: "", agent: "build" }
-        // NOT wrapped in parts
-        let body = serde_json::json!({
-            "command": command.trim_start_matches('/'), // Remove leading slash
-            "arguments": "",
-            "agent": "build"
-        });
-
-        let response = self
-            .http_client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| TandemError::Sidecar(format!("Failed to execute command: {}", e)))?;
-
-        if response.status().is_success() {
-            self.record_success().await;
-            tracing::info!("Successfully executed command '{}'", command);
-            Ok(())
-        } else {
-            self.record_failure().await;
-            let body = response.text().await.unwrap_or_default();
-            Err(TandemError::Sidecar(format!(
-                "Failed to execute command '{}': {}",
-                command, body
-            )))
-        }
-    }
-
     /// Subscribe to the event stream
     /// OpenCode API: GET /event (SSE)
     /// Returns a stream of events for all sessions

@@ -128,7 +128,7 @@ impl OperationJournal {
             message_id,
             undo_stack.len()
         );
-        
+
         // Log all undo actions for debugging
         for (i, action) in undo_stack.iter().enumerate() {
             tracing::info!(
@@ -151,7 +151,10 @@ impl OperationJournal {
 
             if matches {
                 let action = undo_stack.remove(i);
-                tracing::info!("[undo_for_message] Reverting file: {}", action.snapshot.path);
+                tracing::info!(
+                    "[undo_for_message] Reverting file: {}",
+                    action.snapshot.path
+                );
                 action.revert()?;
                 reverted_paths.push(action.snapshot.path.clone());
             }
@@ -174,70 +177,21 @@ impl OperationJournal {
 
 /// Tool proxy for validating and journaling operations
 pub struct ToolProxy {
-    app_state: Arc<AppState>,
+    _app_state: Arc<AppState>,
     journal: Arc<OperationJournal>,
 }
 
 impl ToolProxy {
     pub fn new(app_state: Arc<AppState>) -> Self {
         Self {
-            app_state,
+            _app_state: app_state,
             journal: Arc::new(OperationJournal::new(100)),
         }
-    }
-
-    /// Validate that a path is within the allowed workspace
-    pub fn validate_path(&self, path: &str) -> Result<PathBuf> {
-        let path_buf = PathBuf::from(path);
-
-        // Resolve to absolute path
-        let absolute_path = if path_buf.is_absolute() {
-            path_buf
-        } else {
-            let workspace = self.app_state.workspace_path.read().unwrap();
-            if let Some(workspace_path) = workspace.as_ref() {
-                workspace_path.join(&path_buf)
-            } else {
-                return Err(TandemError::PathNotAllowed(
-                    "No workspace configured".to_string(),
-                ));
-            }
-        };
-
-        // Canonicalize to resolve any .. or symlinks
-        let canonical = absolute_path
-            .canonicalize()
-            .unwrap_or(absolute_path.clone());
-
-        // Check if path is allowed
-        if !self.app_state.is_path_allowed(&canonical) {
-            return Err(TandemError::PathNotAllowed(format!(
-                "Access to path '{}' is not allowed.",
-                path
-            )));
-        }
-
-        Ok(canonical)
     }
 
     /// Get the operation journal
     pub fn journal(&self) -> &Arc<OperationJournal> {
         &self.journal
-    }
-
-    /// Check if undo is available
-    pub fn can_undo(&self) -> bool {
-        self.journal.can_undo()
-    }
-
-    /// Undo the last operation
-    pub fn undo_last(&self) -> Result<Option<String>> {
-        self.journal.undo_last()
-    }
-
-    /// Get recent operations
-    pub fn get_recent_operations(&self, count: usize) -> Vec<JournalEntry> {
-        self.journal.get_recent_entries(count)
     }
 }
 

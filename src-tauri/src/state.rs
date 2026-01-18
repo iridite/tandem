@@ -113,9 +113,9 @@ impl UserProject {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "Unnamed Project".to_string())
         };
-        
+
         let now = chrono::Utc::now();
-        
+
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             name: default_name,
@@ -124,7 +124,7 @@ impl UserProject {
             last_accessed: now,
         }
     }
-    
+
     pub fn path_buf(&self) -> PathBuf {
         PathBuf::from(&self.path)
     }
