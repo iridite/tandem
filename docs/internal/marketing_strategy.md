@@ -27,6 +27,11 @@ Shift from technical terminology to user-centric benefits.
 - **Target:** Users tired of $20/month subscriptions.
 - **Narrative:** "Stop paying for AI you aren't using. Connect to OpenRouter and pay only for the questions you ask—often just pennies a month."
 
+### D. Self-Authoring Visual Intelligence
+
+- **Use Case:** Market researchers and strategists needing instant visualizations.
+- **Narrative:** "Don't just read the data—see it. Tandem doesn't just summarize; it builds interactive dashboards, charts, and reports that you can present immediately."
+
 ## 3. Targeted User Personas
 
 | Persona                 | Use Case                                     | "Job to be Done"                                                       |
@@ -35,6 +40,7 @@ Shift from technical terminology to user-centric benefits.
 | **Creative Writer**     | World-building and manuscript consistency.   | A partner that remembers every detail of your 500-page book.           |
 | **Privacy Advocate**    | Working with sensitive legal/financial data. | Use AI power on documents that are too sensitive for the cloud.        |
 | **Administrative Pro**  | Summarizing meeting notes and invoices.      | Turn a messy folder of documents into a searchable, structured report. |
+| **Market Strategist**   | Visualizing competitive landscapes.          | Create boardroom-ready charts from raw data in seconds.                |
 
 ## 4. Feature Translation Table
 
@@ -44,6 +50,8 @@ Shift from technical terminology to user-centric benefits.
 | **Visual Permissions**       | "The AI asks you before it touches anything."             |
 | **Operation Journal**        | "Total Undo: Change your mind at any time."               |
 | **BYOK (OpenRouter/Ollama)** | "Choose your AI provider; stay in control of your costs." |
+| **Interactive Artifacts**    | "Reports that look like you hired a design agency."       |
+
 
 ## 5. Implementation Recommendations
 
