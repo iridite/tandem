@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde_json::{json, Value};
+use tandem_document;
 use tandem_skills::SkillService;
 use tokio::fs;
 use tokio::process::Command;
@@ -206,6 +207,17 @@ fn is_path_allowed(path: &str) -> bool {
         .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
+fn is_document_file(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        matches!(
+            ext.to_lowercase().as_str(),
+            "pdf" | "docx" | "pptx" | "xlsx" | "xls" | "ods" | "xlsb" | "rtf"
+        )
+    } else {
+        false
+    }
+}
+
 struct BashTool;
 #[async_trait]
 impl Tool for BashTool {
@@ -273,8 +285,25 @@ impl Tool for ReadTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "read".to_string(),
-            description: "Read file contents".to_string(),
-            input_schema: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            description: "Read file contents. Supports text files and documents (PDF, DOCX, PPTX, XLSX, RTF).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to file"
+                    },
+                    "max_size": {
+                        "type": "integer",
+                        "description": "Max file size in bytes (default: 25MB)"
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Max output characters (default: 200,000)"
+                    }
+                },
+                "required": ["path"]
+            }),
         }
     }
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
@@ -285,10 +314,51 @@ impl Tool for ReadTool {
                 metadata: json!({"path": path}),
             });
         }
+
+        let path_buf = PathBuf::from(path);
+
+        // Check if it's a document format
+        if is_document_file(&path_buf) {
+            // Use document extraction
+            let mut limits = tandem_document::ExtractLimits::default();
+
+            if let Some(max_size) = args["max_size"].as_u64() {
+                limits.max_file_bytes = max_size;
+            }
+            if let Some(max_chars) = args["max_chars"].as_u64() {
+                limits.max_output_chars = max_chars as usize;
+            }
+
+            match tandem_document::extract_file_text(&path_buf, limits) {
+                Ok(text) => {
+                    let ext = path_buf
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("unknown")
+                        .to_lowercase();
+                    return Ok(ToolResult {
+                        output: text,
+                        metadata: json!({
+                            "path": path,
+                            "type": "document",
+                            "format": ext
+                        }),
+                    });
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        output: format!("Failed to extract document text: {}", e),
+                        metadata: json!({"path": path, "error": true}),
+                    });
+                }
+            }
+        }
+
+        // Fallback to text reading
         let data = fs::read_to_string(path).await.unwrap_or_default();
         Ok(ToolResult {
             output: data,
-            metadata: json!({}),
+            metadata: json!({"path": path, "type": "text"}),
         })
     }
 }

@@ -1093,9 +1093,7 @@ fn extract_websearch_query(args: Option<&serde_json::Value>) -> Option<String> {
 }
 
 fn is_embeddings_disabled_error(message: &str) -> bool {
-    message
-        .to_ascii_lowercase()
-        .contains("embeddings disabled")
+    message.to_ascii_lowercase().contains("embeddings disabled")
 }
 
 async fn persist_assistant_message_memory(
