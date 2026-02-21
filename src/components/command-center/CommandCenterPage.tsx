@@ -21,6 +21,7 @@ import {
   type Task,
 } from "@/components/orchestrate/types";
 import { CheckCircle2, Loader2, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 type QualityPreset = "speed" | "balanced" | "quality";
 type SwarmStage = "idle" | "planning" | "awaiting_review" | "executing" | "completed" | "failed";
@@ -53,6 +54,7 @@ export function CommandCenterPage({
   onManageProjects,
   projectSwitcherLoading = false,
 }: CommandCenterPageProps) {
+  const { t } = useTranslation("commandCenter");
   const [tab, setTab] = useState<TabId>("task-to-swarm");
   const [objective, setObjective] = useState("");
   const [preset, setPreset] = useState<QualityPreset>("balanced");
@@ -247,10 +249,8 @@ export function CommandCenterPage({
         <div className="rounded-lg border border-border bg-surface p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="space-y-2">
-              <h2 className="text-lg font-semibold text-text">Command Center</h2>
-              <p className="text-sm text-text-muted">
-                Launch swarms from one objective, then drill into advanced operator controls.
-              </p>
+              <h2 className="text-lg font-semibold text-text">{t("title")}</h2>
+              <p className="text-sm text-text-muted">{t("description")}</p>
               <div className="w-full max-w-xl">
                 <ProjectSwitcher
                   projects={userProjects}
@@ -262,8 +262,8 @@ export function CommandCenterPage({
                 />
               </div>
               <p className="text-xs text-text-subtle">
-                Workspace:{" "}
-                <span className="font-mono">{workspacePath ?? "No active project selected"}</span>
+                {t("workspace")}{" "}
+                <span className="font-mono">{workspacePath ?? t("noActiveProject")}</span>
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -281,14 +281,14 @@ export function CommandCenterPage({
                 size="sm"
                 onClick={() => setTab("task-to-swarm")}
               >
-                Task to Swarm
+                {t("tabs.taskToSwarm")}
               </Button>
               <Button
                 variant={tab === "advanced" ? "primary" : "secondary"}
                 size="sm"
                 onClick={() => setTab("advanced")}
               >
-                Advanced Controls
+                {t("tabs.advanced")}
               </Button>
             </div>
           </div>
@@ -298,7 +298,9 @@ export function CommandCenterPage({
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-4">
             <div className="rounded-lg border border-border bg-surface p-4 space-y-3">
               <div className="flex items-center justify-between">
-                <div className="text-xs uppercase tracking-wide text-text-subtle">Runs</div>
+                <div className="text-xs uppercase tracking-wide text-text-subtle">
+                  {t("runs.title")}
+                </div>
                 <Button
                   variant="secondary"
                   size="sm"
@@ -306,7 +308,7 @@ export function CommandCenterPage({
                   disabled={runsLoading}
                 >
                   <RefreshCw className={`mr-1 h-3.5 w-3.5 ${runsLoading ? "animate-spin" : ""}`} />
-                  Refresh
+                  {t("runs.refresh")}
                 </Button>
               </div>
               <button
@@ -317,10 +319,10 @@ export function CommandCenterPage({
                 }`}
                 onClick={() => setRunId(null)}
               >
-                New run
+                {t("runs.newRun")}
               </button>
               {runs.length === 0 ? (
-                <div className="text-xs text-text-muted">No runs yet for this project.</div>
+                <div className="text-xs text-text-muted">{t("runs.noRuns")}</div>
               ) : (
                 <div className="max-h-96 space-y-2 overflow-y-auto">
                   {runs.map((run) => (
@@ -339,7 +341,8 @@ export function CommandCenterPage({
                       >
                         <div className="truncate text-xs text-text">{run.objective}</div>
                         <div className="mt-1 text-[11px] text-text-muted">
-                          {run.status.replace("_", " ")} • {new Date(run.updated_at).toLocaleString()}
+                          {run.status.replace("_", " ")} •{" "}
+                          {new Date(run.updated_at).toLocaleString()}
                         </div>
                       </button>
                       <button
@@ -347,7 +350,7 @@ export function CommandCenterPage({
                         onClick={() => void handleDeleteRun(run.run_id)}
                       >
                         <Trash2 className="mr-1 h-3 w-3" />
-                        Delete
+                        {t("runs.delete")}
                       </button>
                     </div>
                   ))}
@@ -356,11 +359,13 @@ export function CommandCenterPage({
             </div>
 
             <div className="xl:col-span-2 rounded-lg border border-border bg-surface p-4 space-y-3">
-              <div className="text-xs uppercase tracking-wide text-text-subtle">Objective</div>
+              <div className="text-xs uppercase tracking-wide text-text-subtle">
+                {t("objective.title")}
+              </div>
               <textarea
                 value={objective}
                 onChange={(e) => setObjective(e.target.value)}
-                placeholder="Describe the task. The orchestrator will plan, delegate workers/reviewers/testers, then execute after your single approval."
+                placeholder={t("objective.placeholder")}
                 className="min-h-[120px] w-full rounded-lg border border-border bg-surface-elevated p-3 text-sm text-text placeholder:text-text-muted focus:border-primary focus:outline-none"
               />
               <div className="flex flex-wrap gap-2">
@@ -374,7 +379,7 @@ export function CommandCenterPage({
                     }`}
                     onClick={() => setPreset(nextPreset)}
                   >
-                    {nextPreset}
+                    {t(`quality.${nextPreset}`)}
                   </button>
                 ))}
               </div>
@@ -388,7 +393,7 @@ export function CommandCenterPage({
                   ) : (
                     <Sparkles className="mr-1 h-4 w-4" />
                   )}
-                  Launch Swarm
+                  {t("actions.launchSwarm")}
                 </Button>
               </div>
               {error ? (
@@ -399,30 +404,36 @@ export function CommandCenterPage({
             </div>
 
             <div className="rounded-lg border border-border bg-surface p-4 space-y-3">
-              <div className="text-xs uppercase tracking-wide text-text-subtle">Live Status</div>
-              <div className="text-sm text-text">Stage: {stage.replace("_", " ")}</div>
-              <div className="text-xs text-text-muted">Run: {runId || "none"}</div>
-              <div className="text-xs text-text-muted">Tasks: {tasks.length}</div>
-              <div className="text-xs text-text-muted">Pending: {pendingTasks}</div>
+              <div className="text-xs uppercase tracking-wide text-text-subtle">
+                {t("status.title")}
+              </div>
+              <div className="text-sm text-text">
+                {t("status.stage")} {t(`stages.${stage}`)}
+              </div>
+              <div className="text-xs text-text-muted">
+                {t("status.run")} {runId || t("status.none")}
+              </div>
+              <div className="text-xs text-text-muted">
+                {t("status.tasks")} {tasks.length}
+              </div>
+              <div className="text-xs text-text-muted">
+                {t("status.pending")} {pendingTasks}
+              </div>
               {stage === "awaiting_review" ? (
                 <Button size="sm" onClick={() => void approvePlan()} disabled={isLoading}>
                   <CheckCircle2 className="mr-1 h-4 w-4" />
-                  Approve & Execute
+                  {t("actions.approveExecute")}
                 </Button>
               ) : null}
-              <div className="text-[11px] text-text-muted">
-                Default safety: plan preview first, then one-click approval to execute.
-              </div>
+              <div className="text-[11px] text-text-muted">{t("status.safetyNote")}</div>
             </div>
 
             <div className="xl:col-span-3 rounded-lg border border-border bg-surface p-4">
               <div className="text-xs uppercase tracking-wide text-text-subtle mb-2">
-                Activity Strip
+                {t("activity.title")}
               </div>
               {eventFeed.length === 0 ? (
-                <div className="text-xs text-text-muted">
-                  Waiting for orchestrator/agent-team events...
-                </div>
+                <div className="text-xs text-text-muted">{t("activity.waiting")}</div>
               ) : (
                 <div className="space-y-1 max-h-56 overflow-y-auto">
                   {eventFeed.map((line, idx) => (
@@ -441,11 +452,10 @@ export function CommandCenterPage({
           <div className="space-y-3">
             <AgentModelRoutingPanel routing={modelRouting} onChange={setModelRouting} />
             <div className="rounded-lg border border-border bg-surface-elevated/40 p-3 text-xs text-text-muted">
-              Agent model routing is applied to newly launched swarm runs from this page.
+              {t("advanced.routingNote")}
             </div>
             <div className="rounded-lg border border-border bg-surface p-3 text-xs text-text-muted">
-              Advanced Controls are for operator workflows: manual spawn, approval triage,
-              mission/instance cancellation, and forensic exports.
+              {t("advanced.controlsNote")}
             </div>
             <AgentCommandCenter />
           </div>
