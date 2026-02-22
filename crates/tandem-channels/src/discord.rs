@@ -271,9 +271,7 @@ impl Channel for DiscordChannel {
                 }
             }
         });
-        write
-            .send(Message::Text(identify.to_string()))
-            .await?;
+        write.send(Message::Text(identify.to_string())).await?;
         info!("Discord: identified, heartbeat every {heartbeat_interval}ms");
 
         // Heartbeat timer — sends ticks into the select! loop
