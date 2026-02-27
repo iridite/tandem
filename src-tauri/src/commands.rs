@@ -15,8 +15,8 @@ use crate::orchestrator::{
     policy::{PolicyConfig, PolicyEngine},
     store::OrchestratorStore,
     types::{
-        AgentModelRouting, Budget, ModelSelection, OrchestratorConfig, Run, RunSnapshot, RunSource,
-        RunStatus, RunSummary, Task, TaskState,
+        AgentModelRouting, Blackboard, BlackboardPatchRecord, Budget, ModelSelection,
+        OrchestratorConfig, Run, RunSnapshot, RunSource, RunStatus, RunSummary, Task, TaskState,
     },
 };
 use crate::python_env;
@@ -24,9 +24,13 @@ use crate::sidecar::{
     ActiveRunStatusResponse, AgentTeamApprovals, AgentTeamCancelRequest, AgentTeamDecisionResult,
     AgentTeamInstance, AgentTeamInstancesQuery, AgentTeamMissionSummary, AgentTeamSpawnRequest,
     AgentTeamSpawnResult, AgentTeamTemplate, ChannelsConfigResponse, ChannelsStatusResponse,
-    CreateSessionRequest, FilePartInput, MissionApplyEventResult, MissionCreateRequest,
+    ContextBlackboardState, ContextCheckpointRecord, ContextReplayResponse,
+    ContextRunCreateRequest, ContextRunEventAppendRequest, ContextRunEventRecord, ContextRunState,
+    ContextRunStatus, ContextStepStatus, CreateSessionRequest, FilePartInput, McpActionResponse,
+    McpAddRequest, McpRemoteTool, McpServerRecord, MissionApplyEventResult, MissionCreateRequest,
     MissionState, ModelInfo, ModelSpec, Project, ProviderInfo, RoutineCreateRequest,
-    RoutineHistoryEvent, RoutinePatchRequest, RoutineRunNowRequest, RoutineRunNowResponse,
+    RoutineHistoryEvent, RoutinePatchRequest, RoutineRunArtifact, RoutineRunArtifactAddRequest,
+    RoutineRunDecisionRequest, RoutineRunNowRequest, RoutineRunNowResponse, RoutineRunRecord,
     RoutineSpec, SendMessageRequest, Session, SessionMessage, SidecarState, StreamEvent, TodoItem,
 };
 use crate::sidecar_manager::{self, SidecarStatus};
@@ -38,8 +42,10 @@ use crate::tool_proxy::{FileSnapshot, JournalEntry, OperationStatus, UndoAction}
 use crate::vault::{self, EncryptedVaultKey, VaultStatus};
 use crate::VaultState;
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -535,6 +541,8 @@ fn resolve_default_provider_and_model(
         ("ollama", &config.ollama),
         ("poe", &config.poe),
     ];
+    let custom_default = config.custom.iter().find(|c| c.enabled && c.default);
+    let custom_enabled = config.custom.iter().find(|c| c.enabled);
 
     if let Some((provider_id, provider)) = candidates
         .iter()
@@ -544,10 +552,18 @@ fn resolve_default_provider_and_model(
         return (Some(provider_id.to_string()), provider.model.clone());
     }
 
+    if let Some(provider) = custom_default {
+        return (Some("custom".to_string()), provider.model.clone());
+    }
+
     for (provider_id, provider) in candidates {
         if provider.enabled {
             return (Some(provider_id.to_string()), provider.model.clone());
         }
+    }
+
+    if let Some(provider) = custom_enabled {
+        return (Some("custom".to_string()), provider.model.clone());
     }
 
     (None, None)
@@ -567,6 +583,7 @@ fn selected_provider_slot(config: &ProvidersConfig) -> Option<&'static str> {
         "poe" => Some("poe"),
         "opencode" | "opencode_zen" | "zen" => Some("opencode_zen"),
         "ollama" => Some("ollama"),
+        "custom" => Some("custom"),
         _ => None,
     }
 }
@@ -581,6 +598,7 @@ fn provider_slot_active(config: &ProvidersConfig, slot: &str) -> bool {
         "openai" => config.openai.enabled || selected_active,
         "poe" => config.poe.enabled || selected_active,
         "ollama" => config.ollama.enabled || selected_active,
+        "custom" => config.custom.iter().any(|provider| provider.enabled) || selected_active,
         _ => selected_active,
     }
 }
@@ -696,6 +714,10 @@ async fn validate_model_provider_in_sidecar_catalog(
 
     let model = model.unwrap();
     let provider = provider.unwrap().to_lowercase();
+    if provider == "custom" {
+        return Ok(());
+    }
+
     let models = state.sidecar.list_models().await.map_err(|e| {
         TandemError::Sidecar(format!(
             "Failed to validate selected model/provider against sidecar catalog: {}",
@@ -1003,6 +1025,12 @@ pub fn set_workspace_path(app: AppHandle, path: String, state: State<'_, AppStat
 
     migrate_workspace_legacy_namespace_if_needed(&path_buf)?;
     state.set_workspace(path_buf);
+    // Keep sidecar workspace scoping in sync with the selected workspace path.
+    let sidecar = state.sidecar.clone();
+    let sidecar_workspace = PathBuf::from(&path);
+    tauri::async_runtime::spawn(async move {
+        sidecar.set_workspace(sidecar_workspace).await;
+    });
     tracing::info!("Workspace set to: {}", path);
 
     // Save to store for persistence
@@ -1252,6 +1280,28 @@ pub async fn set_active_project(
     let path_buf = project.path_buf();
     migrate_workspace_legacy_namespace_if_needed(&path_buf)?;
     state.set_workspace(path_buf.clone());
+    let normalized_workspace = normalize_workspace_path(&path_buf.to_string_lossy())
+        .unwrap_or_else(|| path_buf.to_string_lossy().to_string());
+
+    // Invalidate orchestrator engines bound to other workspaces so new runs always use
+    // the active project context.
+    {
+        let mut engines = state.orchestrator_engines.write().unwrap();
+        let before = engines.len();
+        engines.retain(|_, engine| {
+            normalize_workspace_path(&engine.workspace_path_string())
+                .map(|root| root == normalized_workspace)
+                .unwrap_or(false)
+        });
+        let removed = before.saturating_sub(engines.len());
+        if removed > 0 {
+            tracing::info!(
+                "Workspace switch invalidated {} orchestrator engine(s); active workspace={}",
+                removed,
+                normalized_workspace
+            );
+        }
+    }
 
     // Update sidecar workspace - this sets it for when sidecar restarts
     state.sidecar.set_workspace(path_buf.clone()).await;
@@ -1281,6 +1331,7 @@ pub async fn set_active_project(
                 let config = state.providers_config.read().unwrap();
                 config.clone()
             };
+            let _ = sync_custom_provider_config_file(&providers);
             sync_ollama_env(&state, &providers).await;
             sync_provider_keys_env(&app, &state, &providers).await;
             sync_channel_tokens_env(&app, &state).await;
@@ -1941,6 +1992,92 @@ async fn get_channel_connections_inner(
     ))
 }
 
+fn selected_custom_model_signature(config: &ProvidersConfig) -> Option<String> {
+    let selected = config.selected_model.as_ref()?;
+    if selected.provider_id.trim().eq_ignore_ascii_case("custom") {
+        let model = selected.model_id.trim();
+        if !model.is_empty() {
+            return Some(model.to_string());
+        }
+    }
+    None
+}
+
+fn sync_custom_provider_config_file(config: &ProvidersConfig) -> Result<()> {
+    let custom_provider = config
+        .custom
+        .iter()
+        .find(|c| c.enabled && !c.endpoint.trim().is_empty());
+
+    let config_path = crate::tandem_config::global_config_path()?;
+    crate::tandem_config::update_config_at(&config_path, |cfg| {
+        let root = if let Some(root) = cfg.as_object_mut() {
+            root
+        } else {
+            *cfg = serde_json::Value::Object(serde_json::Map::new());
+            cfg.as_object_mut().expect("config must be object")
+        };
+
+        let providers_value = root
+            .entry("providers".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let providers = if let Some(obj) = providers_value.as_object_mut() {
+            obj
+        } else {
+            *providers_value = serde_json::Value::Object(serde_json::Map::new());
+            providers_value
+                .as_object_mut()
+                .expect("providers must be object")
+        };
+
+        match custom_provider {
+            Some(custom) => {
+                let endpoint = custom.endpoint.trim();
+                let default_model = custom
+                    .model
+                    .as_ref()
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty());
+
+                let mut custom_cfg = serde_json::Map::new();
+                custom_cfg.insert(
+                    "url".to_string(),
+                    serde_json::Value::String(endpoint.to_string()),
+                );
+                if let Some(model) = default_model {
+                    custom_cfg.insert(
+                        "default_model".to_string(),
+                        serde_json::Value::String(model),
+                    );
+                }
+                providers.insert("custom".to_string(), serde_json::Value::Object(custom_cfg));
+
+                let selected_custom = selected_custom_model_signature(config).is_some();
+                if custom.default || selected_custom {
+                    root.insert(
+                        "default_provider".to_string(),
+                        serde_json::Value::String("custom".to_string()),
+                    );
+                }
+            }
+            None => {
+                providers.remove("custom");
+                let should_clear_default = root
+                    .get("default_provider")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.eq_ignore_ascii_case("custom"))
+                    .unwrap_or(false);
+                if should_clear_default {
+                    root.remove("default_provider");
+                }
+            }
+        }
+
+        Ok(())
+    })?;
+    Ok(())
+}
+
 async fn sync_ollama_env(state: &AppState, config: &ProvidersConfig) {
     if config.ollama.enabled {
         let endpoint = config.ollama.endpoint.trim();
@@ -2101,6 +2238,11 @@ async fn sync_provider_keys_runtime_auth(
             let _ = state.sidecar.set_provider_auth("poe", &key).await;
         }
     }
+    if provider_slot_active(config, "custom") {
+        if let Ok(Some(key)) = get_api_key(app, "custom_provider").await {
+            let _ = state.sidecar.set_provider_auth("custom", &key).await;
+        }
+    }
 }
 
 /// Set the providers configuration
@@ -2131,8 +2273,14 @@ pub async fn set_providers_config(
         let _ = store.save();
     }
 
+    sync_custom_provider_config_file(&config)?;
+
     let ollama_changed = previous_config.ollama.enabled != config.ollama.enabled
         || previous_config.ollama.endpoint != config.ollama.endpoint;
+    let custom_changed = serde_json::to_value(&previous_config.custom).ok()
+        != serde_json::to_value(&config.custom).ok()
+        || selected_custom_model_signature(&previous_config)
+            != selected_custom_model_signature(&config);
 
     let key_providers_changed = previous_config.openrouter.enabled != config.openrouter.enabled
         || previous_config.opencode_zen.enabled != config.opencode_zen.enabled
@@ -2141,7 +2289,7 @@ pub async fn set_providers_config(
         || previous_config.poe.enabled != config.poe.enabled
         || selected_provider_slot(&previous_config) != selected_provider_slot(&config);
 
-    if ollama_changed || key_providers_changed {
+    if ollama_changed || key_providers_changed || custom_changed {
         sync_ollama_env(&state, &config).await;
         sync_provider_keys_env(&app, &state, &config).await;
 
@@ -2341,6 +2489,8 @@ pub async fn start_sidecar(app: AppHandle, state: State<'_, AppState>) -> Result
         let config = state.providers_config.read().unwrap();
         config.clone()
     };
+
+    sync_custom_provider_config_file(&providers)?;
 
     // Configure Ollama endpoint env (local models)
     sync_ollama_env(&state, &providers).await;
@@ -3116,7 +3266,7 @@ async fn prepare_prompt_with_memory_context(
         let meta = default_memory_retrieval_meta();
         tracing::info!(
             target: "tandem.memory",
-            "🧠 memory_retrieval status=skipped used={} chunks_total={} session_chunks={} history_chunks={} project_fact_chunks={} latency_ms={} query_hash={} score_min={:?} score_max={:?}",
+            "ðŸ§  memory_retrieval status=skipped used={} chunks_total={} session_chunks={} history_chunks={} project_fact_chunks={} latency_ms={} query_hash={} score_min={:?} score_max={:?}",
             meta.used,
             meta.chunks_total,
             meta.session_chunks,
@@ -3145,7 +3295,7 @@ async fn prepare_prompt_with_memory_context(
         let meta = default_memory_retrieval_meta();
         tracing::info!(
             target: "tandem.memory",
-            "🧠 memory_retrieval status=unavailable used={} chunks_total={} session_chunks={} history_chunks={} project_fact_chunks={} latency_ms={} query_hash={} score_min={:?} score_max={:?}",
+            "ðŸ§  memory_retrieval status=unavailable used={} chunks_total={} session_chunks={} history_chunks={} project_fact_chunks={} latency_ms={} query_hash={} score_min={:?} score_max={:?}",
             meta.used,
             meta.chunks_total,
             meta.session_chunks,
@@ -3207,7 +3357,7 @@ async fn prepare_prompt_with_memory_context(
             };
             tracing::warn!(
                 target: "tandem.memory",
-                "🧠 memory_retrieval status=error session_id={} error={}",
+                "ðŸ§  memory_retrieval status=error session_id={} error={}",
                 session_id,
                 e
             );
@@ -3222,7 +3372,7 @@ async fn prepare_prompt_with_memory_context(
 
     tracing::info!(
         target: "tandem.memory",
-        "🧠 memory_retrieval status=ok used={} chunks_total={} session_chunks={} history_chunks={} project_fact_chunks={} latency_ms={} query_hash={} score_min={:?} score_max={:?}",
+        "ðŸ§  memory_retrieval status=ok used={} chunks_total={} session_chunks={} history_chunks={} project_fact_chunks={} latency_ms={} query_hash={} score_min={:?} score_max={:?}",
         meta.used,
         meta.chunks_total,
         meta.session_chunks,
@@ -4615,7 +4765,12 @@ pub async fn rewind_to_message(
                     action: "allow".to_string(),
                 },
                 crate::sidecar::PermissionRule {
-                    permission: "webfetch_document".to_string(),
+                    permission: "webfetch".to_string(),
+                    pattern: "*".to_string(),
+                    action: "allow".to_string(),
+                },
+                crate::sidecar::PermissionRule {
+                    permission: "webfetch_html".to_string(),
                     pattern: "*".to_string(),
                     action: "allow".to_string(),
                 },
@@ -4903,6 +5058,57 @@ fn websearch_query_present(args: Option<&serde_json::Value>) -> bool {
     args.and_then(extract_websearch_query).is_some()
 }
 
+fn extract_file_tool_path(args: &serde_json::Value) -> Option<String> {
+    for key in ["filePath", "absolute_path", "path", "file"] {
+        if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_write_tool_content(args: &serde_json::Value) -> Option<String> {
+    for key in ["content", "body", "text"] {
+        if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn missing_file_tool_arg_reason(
+    normalized_tool: &str,
+    args: Option<&serde_json::Value>,
+) -> Option<&'static str> {
+    let Some(args) = args else {
+        return Some("FILE_PATH_MISSING_APPROVAL");
+    };
+
+    let path_missing = extract_file_tool_path(args).is_none();
+    match normalized_tool {
+        "write" | "write_file" | "create_file" => {
+            if path_missing {
+                return Some("FILE_PATH_MISSING_APPROVAL");
+            }
+            if extract_write_tool_content(args).is_none() {
+                return Some("WRITE_CONTENT_MISSING_APPROVAL");
+            }
+            None
+        }
+        "read" | "edit" | "delete" | "delete_file" => {
+            if path_missing {
+                Some("FILE_PATH_MISSING_APPROVAL")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn set_websearch_query(
     args: Option<serde_json::Value>,
     query: &str,
@@ -5103,6 +5309,59 @@ pub async fn approve_tool(
         ));
     }
 
+    let is_file_tool = matches!(
+        normalized_tool.as_deref(),
+        Some("write" | "write_file" | "create_file" | "read" | "edit" | "delete" | "delete_file")
+    );
+    if is_file_tool {
+        if missing_file_tool_arg_reason(
+            normalized_tool.as_deref().unwrap_or_default(),
+            effective_args.as_ref(),
+        )
+        .is_some()
+        {
+            if let Some(cached_args) = state
+                .permission_args_cache
+                .lock()
+                .await
+                .get(&tool_call_id)
+                .cloned()
+            {
+                if missing_file_tool_arg_reason(
+                    normalized_tool.as_deref().unwrap_or_default(),
+                    Some(&cached_args),
+                )
+                .is_none()
+                {
+                    tracing::warn!(
+                        "[approve_tool] recovered file tool args from request cache request_id={}",
+                        tool_call_id
+                    );
+                    effective_args = Some(cached_args);
+                }
+            }
+        }
+
+        if let Some(reason) = missing_file_tool_arg_reason(
+            normalized_tool.as_deref().unwrap_or_default(),
+            effective_args.as_ref(),
+        ) {
+            tracing::warn!(
+                "[approve_tool] denying file tool due to missing args reason={} request_id={} args={:?}",
+                reason,
+                tool_call_id,
+                effective_args
+            );
+            state
+                .permission_args_cache
+                .lock()
+                .await
+                .remove(&tool_call_id);
+            let _ = state.sidecar.deny_tool(&session_id, &tool_call_id).await;
+            return Err(TandemError::PermissionDenied(reason.to_string()));
+        }
+    }
+
     // Keep session-level intent fresh once query is present.
     if normalized_tool.as_deref() == Some("websearch") {
         if let Some(args_val) = effective_args.as_ref() {
@@ -5162,7 +5421,7 @@ pub async fn approve_tool(
     // Note: OpenCode's tool names are "write", "delete", "read", "bash", "list", "search", etc.
     if let (Some(tool_name), Some(args_val)) = (effective_tool.clone(), effective_args.clone()) {
         let is_file_tool = matches!(
-            tool_name.as_str(),
+            normalize_tool_name_for_approval(tool_name.as_str()).as_str(),
             "write" | "write_file" | "create_file" | "delete" | "delete_file"
         );
 
@@ -5171,13 +5430,7 @@ pub async fn approve_tool(
 
             // Try to extract a file path from args
             // OpenCode uses "filePath" for write operations
-            let path_str = args_val
-                .get("filePath")
-                .and_then(|v| v.as_str())
-                .or_else(|| args_val.get("absolute_path").and_then(|v| v.as_str()))
-                .or_else(|| args_val.get("path").and_then(|v| v.as_str()))
-                .or_else(|| args_val.get("file").and_then(|v| v.as_str()))
-                .map(|s| s.to_string());
+            let path_str = extract_file_tool_path(&args_val);
 
             tracing::info!("[approve_tool] Extracted path: {:?}", path_str);
 
@@ -5340,6 +5593,57 @@ pub async fn reject_question(state: State<'_, AppState>, request_id: String) -> 
 }
 
 // ============================================================================
+// MCP Runtime
+// ============================================================================
+
+#[tauri::command]
+pub async fn mcp_list_servers(state: State<'_, AppState>) -> Result<Vec<McpServerRecord>> {
+    state.sidecar.mcp_list_servers().await
+}
+
+#[tauri::command]
+pub async fn mcp_add_server(
+    state: State<'_, AppState>,
+    request: McpAddRequest,
+) -> Result<McpActionResponse> {
+    state.sidecar.mcp_add_server(request).await
+}
+
+#[tauri::command]
+pub async fn mcp_set_enabled(
+    state: State<'_, AppState>,
+    name: String,
+    enabled: bool,
+) -> Result<McpActionResponse> {
+    state.sidecar.mcp_set_enabled(&name, enabled).await
+}
+
+#[tauri::command]
+pub async fn mcp_connect(state: State<'_, AppState>, name: String) -> Result<McpActionResponse> {
+    state.sidecar.mcp_connect(&name).await
+}
+
+#[tauri::command]
+pub async fn mcp_disconnect(state: State<'_, AppState>, name: String) -> Result<McpActionResponse> {
+    state.sidecar.mcp_disconnect(&name).await
+}
+
+#[tauri::command]
+pub async fn mcp_refresh(state: State<'_, AppState>, name: String) -> Result<McpActionResponse> {
+    state.sidecar.mcp_refresh(&name).await
+}
+
+#[tauri::command]
+pub async fn mcp_list_tools(state: State<'_, AppState>) -> Result<Vec<McpRemoteTool>> {
+    state.sidecar.mcp_list_tools().await
+}
+
+#[tauri::command]
+pub async fn tool_ids(state: State<'_, AppState>) -> Result<Vec<String>> {
+    state.sidecar.tool_ids().await
+}
+
+// ============================================================================
 // Routines
 // ============================================================================
 
@@ -5389,6 +5693,103 @@ pub async fn routines_history(
     limit: Option<usize>,
 ) -> Result<Vec<RoutineHistoryEvent>> {
     state.sidecar.routines_history(&routine_id, limit).await
+}
+
+#[tauri::command]
+pub async fn routines_runs(
+    state: State<'_, AppState>,
+    routine_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<RoutineRunRecord>> {
+    state.sidecar.routines_runs(&routine_id, limit).await
+}
+
+#[tauri::command]
+pub async fn routines_runs_all(
+    state: State<'_, AppState>,
+    routine_id: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<RoutineRunRecord>> {
+    state
+        .sidecar
+        .routines_runs_all(routine_id.as_deref(), limit)
+        .await
+}
+
+#[tauri::command]
+pub async fn routines_run_get(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<RoutineRunRecord> {
+    state.sidecar.routines_run_get(&run_id).await
+}
+
+#[tauri::command]
+pub async fn routines_run_approve(
+    state: State<'_, AppState>,
+    run_id: String,
+    request: Option<RoutineRunDecisionRequest>,
+) -> Result<RoutineRunRecord> {
+    state
+        .sidecar
+        .routines_run_approve(&run_id, request.unwrap_or_default())
+        .await
+}
+
+#[tauri::command]
+pub async fn routines_run_deny(
+    state: State<'_, AppState>,
+    run_id: String,
+    request: Option<RoutineRunDecisionRequest>,
+) -> Result<RoutineRunRecord> {
+    state
+        .sidecar
+        .routines_run_deny(&run_id, request.unwrap_or_default())
+        .await
+}
+
+#[tauri::command]
+pub async fn routines_run_pause(
+    state: State<'_, AppState>,
+    run_id: String,
+    request: Option<RoutineRunDecisionRequest>,
+) -> Result<RoutineRunRecord> {
+    state
+        .sidecar
+        .routines_run_pause(&run_id, request.unwrap_or_default())
+        .await
+}
+
+#[tauri::command]
+pub async fn routines_run_resume(
+    state: State<'_, AppState>,
+    run_id: String,
+    request: Option<RoutineRunDecisionRequest>,
+) -> Result<RoutineRunRecord> {
+    state
+        .sidecar
+        .routines_run_resume(&run_id, request.unwrap_or_default())
+        .await
+}
+
+#[tauri::command]
+pub async fn routines_run_artifacts(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<Vec<RoutineRunArtifact>> {
+    state.sidecar.routines_run_artifacts(&run_id).await
+}
+
+#[tauri::command]
+pub async fn routines_run_add_artifact(
+    state: State<'_, AppState>,
+    run_id: String,
+    request: RoutineRunArtifactAddRequest,
+) -> Result<RoutineRunRecord> {
+    state
+        .sidecar
+        .routines_run_add_artifact(&run_id, request)
+        .await
 }
 
 #[tauri::command]
@@ -6091,19 +6492,21 @@ Use this capability for finding information, verifying facts, or gathering data 
 
 ## Best Practices:
 1. **Search First:** Always start with `websearch` to find valid, up-to-date URLs.
-2. **Avoid Dead Links:** Do not `webfetch_document` URLs that likely don't exist or are deep links without verifying them first.
+2. **Avoid Dead Links:** Do not `webfetch` URLs that likely don't exist or are deep links without verifying them first.
 3. **Handle Blocking:** Many sites (e.g., Statista, Airbnb, LinkedIn) block bots.
-   - If `webfetch_document` returns 403/404/Timeout:
+   - If `webfetch` returns 403/404/Timeout:
      - Do NOT retry the exact same URL immediately.
      - Try searching for the specific information on a different site.
      - Try fetching the root domain or a generic page if appropriate.
-4. **Prefer Text:** `webfetch_document` works best on content-heavy pages (docs, blogs, articles). It may fail on heavy SPAs.
+4. **Prefer Text:** `webfetch` works best on content-heavy pages (docs, blogs, articles). It may fail on heavy SPAs.
+5. **Use HTML Only When Needed:** Use `webfetch_html` only when raw DOM/HTML is explicitly required.
 
 ## Workflow:
 1. **Search:** `websearch` query: "latest real estate trends asia 2025"
 2. **Select:** Pick 1-2 promising URLs from the search results.
-3. **Fetch:** `webfetch_document` url: "..."
+3. **Fetch:** `webfetch` url: "..."
 4. **Fallback:** If fetch fails, go back to step 1 with a refined query or try the next URL.
+5. **Raw HTML (optional):** `webfetch_html` url: "..."
 "#.to_string(),
                     json_schema: serde_json::json!({
                         "strategy": "Search -> Select -> Fetch -> Fallback",
@@ -6437,7 +6840,7 @@ pub async fn export_presentation(json_path: String, output_path: String) -> Resu
                             r#"          <a:p>
             <a:pPr lvl="0">
               <a:buFont typeface="Arial"/>
-              <a:buChar char="•"/>
+              <a:buChar char="â€¢"/>
             </a:pPr>
             <a:r>
               <a:rPr lang="en-US" sz="1800">
@@ -8123,7 +8526,8 @@ fn orchestrator_permission_rules() -> Vec<crate::sidecar::PermissionRule> {
         "todo_write".to_string(),
         "update_todo_list".to_string(),
         "websearch".to_string(),
-        "webfetch_document".to_string(),
+        "webfetch".to_string(),
+        "webfetch_html".to_string(),
         "task".to_string(),
     ];
 
@@ -8141,7 +8545,8 @@ fn orchestrator_permission_rules() -> Vec<crate::sidecar::PermissionRule> {
         "todo_write",
         "update_todo_list",
         "websearch",
-        "webfetch_document",
+        "webfetch",
+        "webfetch_html",
         "task",
     ] {
         rules.push(crate::sidecar::PermissionRule {
@@ -8192,10 +8597,10 @@ fn build_sidecar_session_model(
     }
 }
 
-fn existing_workspace_dir_for_session(state: &AppState) -> Option<String> {
+fn canonical_workspace_dir_for_session(state: &AppState) -> Option<String> {
     state.get_workspace_path().and_then(|p| {
         if p.is_dir() {
-            Some(p.to_string_lossy().to_string())
+            normalize_workspace_path(&p.to_string_lossy())
         } else {
             tracing::warn!(
                 "Workspace path no longer exists or is not a directory: {}. Falling back to sidecar default cwd.",
@@ -8220,6 +8625,442 @@ fn is_legacy_low_wall_time_for_command_center(source: RunSource, wall_time_secs:
     matches!(source, RunSource::CommandCenter) && wall_time_secs <= 60 * 60
 }
 
+fn context_status_to_run_status(status: ContextRunStatus) -> RunStatus {
+    match status {
+        ContextRunStatus::Queued => RunStatus::Queued,
+        ContextRunStatus::Planning => RunStatus::Planning,
+        ContextRunStatus::Running => RunStatus::Running,
+        ContextRunStatus::AwaitingApproval => RunStatus::AwaitingApproval,
+        ContextRunStatus::Paused => RunStatus::Paused,
+        ContextRunStatus::Blocked => RunStatus::Blocked,
+        ContextRunStatus::Failed => RunStatus::Failed,
+        ContextRunStatus::Completed => RunStatus::Completed,
+        ContextRunStatus::Cancelled => RunStatus::Cancelled,
+    }
+}
+
+fn context_step_status_to_task_state(status: ContextStepStatus) -> TaskState {
+    match status {
+        ContextStepStatus::Pending => TaskState::Pending,
+        ContextStepStatus::Runnable => TaskState::Runnable,
+        ContextStepStatus::InProgress => TaskState::InProgress,
+        ContextStepStatus::Blocked => TaskState::Blocked,
+        ContextStepStatus::Done => TaskState::Done,
+        ContextStepStatus::Failed => TaskState::Failed,
+    }
+}
+
+fn ms_to_datetime(ms: u64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp_millis(ms as i64).unwrap_or_else(chrono::Utc::now)
+}
+
+fn context_run_to_snapshot(run: &ContextRunState) -> RunSnapshot {
+    let tasks_completed = run
+        .steps
+        .iter()
+        .filter(|step| step.status == ContextStepStatus::Done)
+        .count();
+    let tasks_failed = run
+        .steps
+        .iter()
+        .filter(|step| step.status == ContextStepStatus::Failed)
+        .count();
+    let current_task_id = run
+        .steps
+        .iter()
+        .find(|step| step.status == ContextStepStatus::InProgress)
+        .map(|step| step.step_id.clone());
+    RunSnapshot {
+        run_id: run.run_id.clone(),
+        status: context_status_to_run_status(run.status.clone()),
+        objective: run.objective.clone(),
+        task_count: run.steps.len(),
+        tasks_completed,
+        tasks_failed,
+        budget: Budget::from_config(&OrchestratorConfig::default()),
+        current_task_id,
+        error_message: None,
+        created_at: ms_to_datetime(run.created_at_ms),
+        updated_at: ms_to_datetime(run.updated_at_ms),
+    }
+}
+
+fn context_run_to_tasks(run: &ContextRunState) -> Vec<Task> {
+    run.steps
+        .iter()
+        .map(|step| {
+            let mut task = Task::new(
+                step.step_id.clone(),
+                step.title.clone(),
+                format!("Engine context step {}", step.step_id),
+            );
+            task.state = context_step_status_to_task_state(step.status.clone());
+            task
+        })
+        .collect()
+}
+
+fn context_run_to_run(run: &ContextRunState) -> Run {
+    let mut out = Run::new(
+        run.run_id.clone(),
+        format!("context-{}", run.run_id),
+        run.objective.clone(),
+        OrchestratorConfig::default(),
+    );
+    out.status = context_status_to_run_status(run.status.clone());
+    out.tasks = context_run_to_tasks(run);
+    out.started_at = ms_to_datetime(run.created_at_ms);
+    out.ended_at = Some(ms_to_datetime(run.updated_at_ms));
+    out.why_next_step = run.why_next_step.clone();
+    out.workspace_lease.workspace_id = run.workspace.workspace_id.clone();
+    out.workspace_lease.canonical_path = run.workspace.canonical_path.clone();
+    out.workspace_lease.lease_epoch = run.workspace.lease_epoch;
+    out
+}
+
+fn context_run_source(run_type: &str) -> RunSource {
+    if run_type.eq_ignore_ascii_case("scheduled") || run_type.eq_ignore_ascii_case("cron") {
+        RunSource::CommandCenter
+    } else {
+        RunSource::Orchestrator
+    }
+}
+
+fn context_event_to_run_event(
+    event: ContextRunEventRecord,
+) -> crate::orchestrator::types::RunEventRecord {
+    crate::orchestrator::types::RunEventRecord {
+        event_id: event.event_id,
+        run_id: event.run_id,
+        seq: event.seq,
+        ts_ms: event.ts_ms,
+        event_type: event.event_type,
+        status: context_status_to_run_status(event.status),
+        step_id: event.step_id,
+        payload: event.payload,
+    }
+}
+
+fn context_blackboard_to_orch(blackboard: ContextBlackboardState) -> Blackboard {
+    let facts = blackboard
+        .facts
+        .into_iter()
+        .map(|row| crate::orchestrator::types::BlackboardItem {
+            id: row.id,
+            ts_ms: row.ts_ms,
+            text: row.text,
+            step_id: row.step_id,
+            source_event_id: row.source_event_id,
+        })
+        .collect::<Vec<_>>();
+    let decisions = blackboard
+        .decisions
+        .into_iter()
+        .map(|row| crate::orchestrator::types::BlackboardItem {
+            id: row.id,
+            ts_ms: row.ts_ms,
+            text: row.text,
+            step_id: row.step_id,
+            source_event_id: row.source_event_id,
+        })
+        .collect::<Vec<_>>();
+    let open_questions = blackboard
+        .open_questions
+        .into_iter()
+        .map(|row| crate::orchestrator::types::BlackboardItem {
+            id: row.id,
+            ts_ms: row.ts_ms,
+            text: row.text,
+            step_id: row.step_id,
+            source_event_id: row.source_event_id,
+        })
+        .collect::<Vec<_>>();
+    let artifacts = blackboard
+        .artifacts
+        .into_iter()
+        .map(|row| crate::orchestrator::types::BlackboardArtifactRef {
+            id: row.id,
+            ts_ms: row.ts_ms,
+            path: row.path,
+            artifact_type: match row.artifact_type.as_str() {
+                "patch" => crate::orchestrator::types::ArtifactType::Patch,
+                "notes" => crate::orchestrator::types::ArtifactType::Notes,
+                "sources" => crate::orchestrator::types::ArtifactType::Sources,
+                "fact_cards" => crate::orchestrator::types::ArtifactType::FactCards,
+                _ => crate::orchestrator::types::ArtifactType::File,
+            },
+            step_id: row.step_id,
+            source_event_id: row.source_event_id,
+        })
+        .collect::<Vec<_>>();
+    Blackboard {
+        facts,
+        decisions,
+        open_questions,
+        artifacts,
+        summaries: crate::orchestrator::types::BlackboardSummaries {
+            rolling: blackboard.summaries.rolling,
+            latest_context_pack: blackboard.summaries.latest_context_pack,
+        },
+        revision: blackboard.revision,
+    }
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_create_run(
+    state: State<'_, AppState>,
+    objective: String,
+    source: Option<RunSource>,
+) -> Result<String> {
+    let workspace_dir = canonical_workspace_dir_for_session(state.inner())
+        .ok_or_else(|| TandemError::InvalidConfig("No workspace selected".to_string()))?;
+    let canonical_workspace = std::fs::canonicalize(PathBuf::from(&workspace_dir))
+        .unwrap_or_else(|_| PathBuf::from(&workspace_dir))
+        .to_string_lossy()
+        .to_string();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical_workspace.hash(&mut hasher);
+    let run = state
+        .sidecar
+        .context_run_create(ContextRunCreateRequest {
+            run_id: None,
+            objective,
+            run_type: Some(match source.unwrap_or(RunSource::Orchestrator) {
+                RunSource::Orchestrator => "interactive".to_string(),
+                RunSource::CommandCenter => "scheduled".to_string(),
+            }),
+            workspace: Some(crate::sidecar::ContextWorkspaceLease {
+                workspace_id: format!("ws-{:x}", hasher.finish()),
+                canonical_path: canonical_workspace,
+                lease_epoch: 1,
+            }),
+        })
+        .await?;
+    Ok(run.run_id)
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_start(state: State<'_, AppState>, run_id: String) -> Result<()> {
+    let _ = state
+        .sidecar
+        .context_run_append_event(
+            &run_id,
+            ContextRunEventAppendRequest {
+                event_type: "planning_started".to_string(),
+                status: ContextRunStatus::Planning,
+                step_id: None,
+                payload: json!({}),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_get_run(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<RunSnapshot> {
+    let run = state.sidecar.context_run_get(&run_id).await?;
+    Ok(context_run_to_snapshot(&run))
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_list_tasks(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<Vec<Task>> {
+    let run = state.sidecar.context_run_get(&run_id).await?;
+    Ok(context_run_to_tasks(&run))
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_get_events(
+    state: State<'_, AppState>,
+    run_id: String,
+    since_seq: Option<u64>,
+    tail: Option<usize>,
+) -> Result<Vec<crate::orchestrator::types::RunEventRecord>> {
+    let events = state
+        .sidecar
+        .context_run_events(&run_id, since_seq, tail)
+        .await?;
+    Ok(events
+        .into_iter()
+        .map(context_event_to_run_event)
+        .collect::<Vec<_>>())
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_get_blackboard(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<Blackboard> {
+    let blackboard = state.sidecar.context_run_blackboard(&run_id).await?;
+    Ok(context_blackboard_to_orch(blackboard))
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_get_latest_checkpoint(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<Option<ContextCheckpointRecord>> {
+    state.sidecar.context_run_checkpoint_latest(&run_id).await
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_get_replay(
+    state: State<'_, AppState>,
+    run_id: String,
+    upto_seq: Option<u64>,
+    from_checkpoint: Option<bool>,
+) -> Result<ContextReplayResponse> {
+    state
+        .sidecar
+        .context_run_replay(&run_id, upto_seq, from_checkpoint)
+        .await
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_list_runs(state: State<'_, AppState>) -> Result<Vec<RunSummary>> {
+    let rows = state.sidecar.context_run_list().await?;
+    Ok(rows
+        .into_iter()
+        .map(|run| RunSummary {
+            run_id: run.run_id.clone(),
+            session_id: format!("context-{}", run.run_id),
+            workspace_root: Some(run.workspace.canonical_path),
+            source: context_run_source(&run.run_type),
+            objective: run.objective,
+            status: context_status_to_run_status(run.status),
+            created_at: ms_to_datetime(run.created_at_ms),
+            updated_at: ms_to_datetime(run.updated_at_ms),
+            started_at: ms_to_datetime(run.created_at_ms),
+            ended_at: None,
+            last_error: None,
+        })
+        .collect::<Vec<_>>())
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_load_run(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<Run> {
+    let run = state.sidecar.context_run_get(&run_id).await?;
+    Ok(context_run_to_run(&run))
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_pause(state: State<'_, AppState>, run_id: String) -> Result<()> {
+    let _ = state
+        .sidecar
+        .context_run_append_event(
+            &run_id,
+            ContextRunEventAppendRequest {
+                event_type: "run_paused".to_string(),
+                status: ContextRunStatus::Paused,
+                step_id: None,
+                payload: json!({}),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_resume(state: State<'_, AppState>, run_id: String) -> Result<()> {
+    let _ = state
+        .sidecar
+        .context_run_append_event(
+            &run_id,
+            ContextRunEventAppendRequest {
+                event_type: "run_resumed".to_string(),
+                status: ContextRunStatus::Running,
+                step_id: None,
+                payload: json!({}),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_cancel(state: State<'_, AppState>, run_id: String) -> Result<()> {
+    let _ = state
+        .sidecar
+        .context_run_append_event(
+            &run_id,
+            ContextRunEventAppendRequest {
+                event_type: "run_cancelled".to_string(),
+                status: ContextRunStatus::Cancelled,
+                step_id: None,
+                payload: json!({}),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_approve(state: State<'_, AppState>, run_id: String) -> Result<()> {
+    let _ = state
+        .sidecar
+        .context_run_append_event(
+            &run_id,
+            ContextRunEventAppendRequest {
+                event_type: "plan_approved".to_string(),
+                status: ContextRunStatus::Running,
+                step_id: None,
+                payload: json!({}),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_request_revision(
+    state: State<'_, AppState>,
+    run_id: String,
+    feedback: String,
+) -> Result<()> {
+    let _ = state
+        .sidecar
+        .context_run_append_event(
+            &run_id,
+            ContextRunEventAppendRequest {
+                event_type: "revision_requested".to_string(),
+                status: ContextRunStatus::Blocked,
+                step_id: None,
+                payload: json!({ "feedback": feedback }),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn orchestrator_engine_retry_task(
+    state: State<'_, AppState>,
+    run_id: String,
+    task_id: String,
+) -> Result<()> {
+    let _ = state
+        .sidecar
+        .context_run_append_event(
+            &run_id,
+            ContextRunEventAppendRequest {
+                event_type: "task_retry_requested".to_string(),
+                status: ContextRunStatus::Running,
+                step_id: Some(task_id),
+                payload: json!({}),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 /// Create a new orchestration run
 #[tauri::command]
 pub async fn orchestrator_create_run(
@@ -8235,6 +9076,16 @@ pub async fn orchestrator_create_run(
     use crate::sidecar::CreateSessionRequest;
 
     let run_id = Uuid::new_v4().to_string();
+    let workspace_dir = canonical_workspace_dir_for_session(state.inner())
+        .ok_or_else(|| TandemError::InvalidConfig("No workspace selected".to_string()))?;
+    let workspace_path = PathBuf::from(&workspace_dir);
+    if !workspace_path.is_dir() {
+        return Err(TandemError::InvalidConfig(format!(
+            "Selected workspace does not exist or is not a directory: {}",
+            workspace_path.display()
+        )));
+    }
+
     let config_snapshot = { state.providers_config.read().unwrap().clone() };
     let resolved_model_spec = resolve_required_model_spec(
         &config_snapshot,
@@ -8259,8 +9110,7 @@ pub async fn orchestrator_create_run(
     )
     .await?;
 
-    // Create a NEW session specifically for the orchestrator
-    let workspace_dir = existing_workspace_dir_for_session(state.inner());
+    // Create a NEW session specifically for the orchestrator.
     let session_request = CreateSessionRequest {
         parent_id: None,
         title: Some(format!(
@@ -8271,8 +9121,8 @@ pub async fn orchestrator_create_run(
         model: build_sidecar_session_model(final_model.clone(), final_provider.clone()),
         provider: final_provider.clone(),
         permission: Some(orchestrator_permission_rules()),
-        directory: workspace_dir.clone(),
-        workspace_root: workspace_dir,
+        directory: Some(workspace_dir.clone()),
+        workspace_root: Some(workspace_dir.clone()),
     };
 
     let session = state
@@ -8285,10 +9135,13 @@ pub async fn orchestrator_create_run(
 
     let session_id = session.id;
     tracing::info!(
-        "Created orchestrator session: {} with model: {:?}, provider: {:?}",
+        "Created orchestrator session: {} run_id={} workspace_root={} directory={} model={:?} provider={:?}",
         session_id,
+        run_id,
+        workspace_dir,
+        session.directory.clone().unwrap_or_else(|| ".".to_string()),
         session.model,
-        session.provider
+        session.provider,
     );
     if let (Some(expected_provider), Some(expected_model)) = (&final_provider, &final_model) {
         if let (Some(actual_provider), Some(actual_model)) = (&session.provider, &session.model) {
@@ -8333,6 +9186,16 @@ pub async fn orchestrator_create_run(
 
     // Create the run object
     let mut run = Run::new(run_id.clone(), session_id, objective, config);
+    run.workspace_root = Some(workspace_dir.clone());
+    let canonical_workspace = std::fs::canonicalize(&workspace_path)
+        .unwrap_or_else(|_| workspace_path.clone())
+        .to_string_lossy()
+        .to_string();
+    let mut lease_hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical_workspace.hash(&mut lease_hasher);
+    run.workspace_lease.workspace_id = format!("ws-{:x}", lease_hasher.finish());
+    run.workspace_lease.canonical_path = canonical_workspace;
+    run.workspace_lease.lease_epoch = 1;
     run.source = run_source;
     // Persist model/provider selection into the run so the orchestrator can always send explicit
     // model specs even if the sidecar session object doesn't echo them back.
@@ -8340,17 +9203,7 @@ pub async fn orchestrator_create_run(
     run.provider = final_provider.clone();
     run.agent_model_routing = normalize_orchestrator_model_routing(agent_model_routing);
 
-    // Initialize dependencies
-    let workspace_path = state
-        .get_workspace_path()
-        .ok_or_else(|| TandemError::InvalidConfig("No workspace selected".to_string()))?;
-    if !workspace_path.is_dir() {
-        return Err(TandemError::InvalidConfig(format!(
-            "Selected workspace does not exist or is not a directory: {}",
-            workspace_path.display()
-        )));
-    }
-
+    // Initialize dependencies.
     let policy_config = PolicyConfig::new(workspace_path.clone());
     let policy = PolicyEngine::new(policy_config);
     let store = OrchestratorStore::new(&workspace_path)?;
@@ -8389,7 +9242,12 @@ pub async fn orchestrator_create_run(
         tracing::info!("Orchestrator event loop ended for run {}", run_id_clone);
     });
 
-    tracing::info!("Created orchestrator run: {}", run_id);
+    tracing::info!(
+        "Created orchestrator run: run_id={} session_id={} workspace_root={}",
+        run_id,
+        engine.get_base_session_id().await,
+        workspace_dir
+    );
     Ok(run_id)
 }
 
@@ -8429,6 +9287,49 @@ pub async fn orchestrator_get_run(
     };
 
     Ok(engine.get_snapshot().await)
+}
+
+/// Get sequenced run events (tail + since-seq).
+#[tauri::command]
+pub async fn orchestrator_get_events(
+    state: State<'_, AppState>,
+    run_id: String,
+    since_seq: Option<u64>,
+    tail: Option<usize>,
+) -> Result<Vec<crate::orchestrator::types::RunEventRecord>> {
+    let workspace_path = state
+        .get_workspace_path()
+        .ok_or_else(|| TandemError::NotFound("No workspace configured".to_string()))?;
+    let store = OrchestratorStore::new(&workspace_path)?;
+    store.load_run_events(&run_id, since_seq, tail)
+}
+
+/// Get materialized blackboard for a run (engine-owned, read-only).
+#[tauri::command]
+pub async fn orchestrator_get_blackboard(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<Blackboard> {
+    let workspace_path = state
+        .get_workspace_path()
+        .ok_or_else(|| TandemError::NotFound("No workspace configured".to_string()))?;
+    let store = OrchestratorStore::new(&workspace_path)?;
+    store.load_blackboard(&run_id)
+}
+
+/// Get append-only blackboard patches for a run.
+#[tauri::command]
+pub async fn orchestrator_get_blackboard_patches(
+    state: State<'_, AppState>,
+    run_id: String,
+    since_seq: Option<u64>,
+    tail: Option<usize>,
+) -> Result<Vec<BlackboardPatchRecord>> {
+    let workspace_path = state
+        .get_workspace_path()
+        .ok_or_else(|| TandemError::NotFound("No workspace configured".to_string()))?;
+    let store = OrchestratorStore::new(&workspace_path)?;
+    store.load_blackboard_patches(&run_id, since_seq, tail)
 }
 
 /// Get the current budget status
@@ -8809,14 +9710,28 @@ pub async fn orchestrator_list_runs(state: State<'_, AppState>) -> Result<Vec<Ru
 
             // Try to load run from disk
             if let Ok(run) = store.load_run(&run_id) {
+                let ended_at = run.ended_at;
+                let updated_at = ended_at.unwrap_or_else(chrono::Utc::now);
+                let last_error = run.error_message.as_ref().and_then(|msg| {
+                    let trimmed = msg.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.chars().take(220).collect::<String>())
+                    }
+                });
                 summaries.push(RunSummary {
                     run_id: run.run_id,
                     session_id: run.session_id,
+                    workspace_root: run.workspace_root,
                     source: run.source,
                     objective: run.objective,
                     status: run.status,
                     created_at: run.started_at,
-                    updated_at: run.ended_at.unwrap_or_else(chrono::Utc::now),
+                    updated_at,
+                    started_at: run.started_at,
+                    ended_at,
+                    last_error,
                 });
             }
         }
@@ -8840,7 +9755,13 @@ pub async fn orchestrator_load_run(
         .ok_or_else(|| TandemError::NotFound("No workspace configured".to_string()))?;
 
     let store = OrchestratorStore::new(&workspace_path)?;
-    let run = store.load_run(&run_id)?;
+    let mut run = store.load_run(&run_id)?;
+    let mut checkpoint_task_sessions: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    if let Ok(Some(checkpoint)) = store.load_latest_checkpoint(&run_id) {
+        checkpoint_task_sessions = checkpoint.task_sessions;
+        run = checkpoint.run;
+    }
 
     // Check if engine already exists in memory
     {
@@ -8850,8 +9771,16 @@ pub async fn orchestrator_load_run(
         }
     }
 
+    let run_workspace_path = run
+        .workspace_root
+        .as_deref()
+        .and_then(normalize_workspace_path)
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| workspace_path.clone());
+
     // Re-hydrate engine
-    let policy_config = PolicyConfig::new(workspace_path.clone());
+    let policy_config = PolicyConfig::new(run_workspace_path.clone());
     let policy = PolicyEngine::new(policy_config);
 
     // Channel for events
@@ -8863,6 +9792,7 @@ pub async fn orchestrator_load_run(
     // However, the `Run` struct loaded from disk has the OLD config.
     // We should patch the config here before creating the engine.
     let mut run_to_load = run.clone();
+    run_to_load.workspace_root = Some(run_workspace_path.to_string_lossy().to_string());
     run_to_load.agent_model_routing = run_to_load.agent_model_routing.canonicalized();
     for task in run_to_load.tasks.iter_mut() {
         let normalized = crate::orchestrator::types::normalize_role_key(&task.assigned_role);
@@ -8870,6 +9800,16 @@ pub async fn orchestrator_load_run(
             task.assigned_role = crate::orchestrator::types::ROLE_WORKER.to_string();
         } else {
             task.assigned_role = normalized;
+        }
+        let missing_task_session = task
+            .session_id
+            .as_deref()
+            .map(|sid| sid.trim().is_empty())
+            .unwrap_or(true);
+        if missing_task_session {
+            if let Some(restored) = checkpoint_task_sessions.get(&task.id) {
+                task.session_id = Some(restored.clone());
+            }
         }
     }
 
@@ -8935,7 +9875,7 @@ pub async fn orchestrator_load_run(
         store,
         state.sidecar.clone(),
         state.stream_hub.clone(),
-        workspace_path,
+        run_workspace_path,
         event_tx,
     ));
 
@@ -8956,7 +9896,7 @@ pub async fn orchestrator_load_run(
     // If so, force it to Paused so the user can explicitly Resume.
     {
         let current_status = engine.get_snapshot().await.status;
-        if current_status == RunStatus::Executing || current_status == RunStatus::Planning {
+        if current_status == RunStatus::Running || current_status == RunStatus::Planning {
             tracing::info!(
                 "Run {} loaded in state {:?}, forcing to Paused",
                 run_id,

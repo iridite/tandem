@@ -9,9 +9,18 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::RwLock;
+use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 
 use tandem_types::{ModelInfo, ProviderInfo, ToolSchema};
+
+fn provider_max_tokens() -> u32 {
+    std::env::var("TANDEM_PROVIDER_MAX_TOKENS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|value| *value >= 64)
+        .unwrap_or(2048)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderConfig {
@@ -25,6 +34,21 @@ pub struct AppConfig {
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
     pub default_provider: Option<String>,
+}
+
+/// Configuration for background memory consolidation via a cheap/free LLM.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MemoryConsolidationConfig {
+    /// Set to `true` to enable automatic session memory consolidation when a session ends.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Override the provider to use for consolidation.
+    /// Defaults to cheapest available: ollama → groq → openrouter → mistral → openai → default.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Override the model to use for consolidation.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +158,71 @@ impl ProviderRegistry {
         provider.complete(prompt, model_id).await
     }
 
+    /// Complete a prompt using the cheapest available configured provider.
+    ///
+    /// Tries providers in this cost order (first configured one wins):
+    /// `ollama` (free/local) → `groq` (free tier) → `openrouter` (free models) →
+    /// `mistral` ($0.10/1M) → `openai` ($0.15/1M) → `anthropic` → default provider.
+    ///
+    /// Optionally accepts an explicit `provider_override` and `model_override` from
+    /// `MemoryConsolidationConfig` to let users pin a specific provider/model.
+    pub async fn complete_cheapest(
+        &self,
+        prompt: &str,
+        provider_override: Option<&str>,
+        model_override: Option<&str>,
+    ) -> anyhow::Result<String> {
+        // If the user has explicitly pinned a provider, use it directly.
+        if let Some(pid) = provider_override {
+            return self
+                .complete_for_provider(Some(pid), prompt, model_override)
+                .await;
+        }
+
+        let best_provider = self.select_cheapest_provider_id().await;
+        let openrouter_free_model = "meta-llama/llama-3.3-70b-instruct:free";
+
+        match best_provider {
+            Some(pid @ "openrouter") if model_override.is_none() => {
+                self.complete_for_provider(Some(pid), prompt, Some(openrouter_free_model))
+                    .await
+            }
+            Some(pid) => {
+                self.complete_for_provider(Some(pid), prompt, model_override)
+                    .await
+            }
+            None => {
+                // No known cheap provider configured — fall back to default.
+                self.complete_for_provider(None, prompt, model_override)
+                    .await
+            }
+        }
+    }
+
+    /// Returns the string ID of the cheapest available configured provider.
+    pub async fn select_cheapest_provider_id(&self) -> Option<&'static str> {
+        let providers = self.providers.read().await;
+        let configured_ids: Vec<String> = providers.iter().map(|p| p.info().id).collect();
+        drop(providers);
+
+        // Cost-ordered priority: local/free first, paid last.
+        let priority_order = [
+            "ollama",
+            "groq",
+            "openrouter",
+            "together",
+            "mistral",
+            "openai",
+            "anthropic",
+            "cohere",
+        ];
+
+        priority_order
+            .iter()
+            .find(|id| configured_ids.iter().any(|c| c == **id))
+            .copied()
+    }
+
     pub async fn default_stream(
         &self,
         messages: Vec<ChatMessage>,
@@ -206,7 +295,7 @@ fn build_providers(config: &AppConfig) -> Vec<Arc<dyn Provider>> {
         "openai",
         "OpenAI",
         "https://api.openai.com/v1",
-        "gpt-4o-mini",
+        "gpt-5.2",
         true,
     );
     add_openai_provider(
@@ -297,7 +386,7 @@ fn build_providers(config: &AppConfig) -> Vec<Arc<dyn Provider>> {
             default_model: anthropic
                 .default_model
                 .clone()
-                .unwrap_or_else(|| "claude-3-5-sonnet-latest".to_string()),
+                .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
             client: Client::new(),
         }));
     }
@@ -320,6 +409,34 @@ fn build_providers(config: &AppConfig) -> Vec<Arc<dyn Provider>> {
                 .default_model
                 .clone()
                 .unwrap_or_else(|| "command-r-plus".to_string()),
+            client: Client::new(),
+        }));
+    }
+
+    for (id, entry) in &config.providers {
+        if is_known_provider_id(id) {
+            continue;
+        }
+
+        let provider_id = id.trim();
+        if provider_id.is_empty() {
+            continue;
+        }
+
+        providers.push(Arc::new(OpenAICompatibleProvider {
+            id: provider_id.to_string(),
+            name: humanize_provider_name(provider_id),
+            base_url: normalize_base(entry.url.as_deref().unwrap_or("https://api.openai.com/v1")),
+            api_key: entry
+                .api_key
+                .as_deref()
+                .filter(|key| !is_placeholder_api_key(key))
+                .map(|key| key.to_string())
+                .or_else(|| env_api_key_for_provider(provider_id)),
+            default_model: entry
+                .default_model
+                .clone()
+                .unwrap_or_else(|| "gpt-4o-mini".to_string()),
             client: Client::new(),
         }));
     }
@@ -372,8 +489,47 @@ fn is_placeholder_api_key(value: &str) -> bool {
         || trimmed.eq_ignore_ascii_case("placeholder")
 }
 
+fn is_known_provider_id(id: &str) -> bool {
+    matches!(
+        id.trim().to_ascii_lowercase().as_str(),
+        "ollama"
+            | "openai"
+            | "openrouter"
+            | "groq"
+            | "mistral"
+            | "together"
+            | "azure"
+            | "bedrock"
+            | "vertex"
+            | "copilot"
+            | "anthropic"
+            | "cohere"
+    )
+}
+
+fn humanize_provider_name(id: &str) -> String {
+    let mut words = Vec::new();
+    for segment in id.split(['_', '-']) {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let mut chars = segment.chars();
+        if let Some(first) = chars.next() {
+            let mut word = first.to_uppercase().collect::<String>();
+            word.push_str(chars.as_str());
+            words.push(word);
+        }
+    }
+    if words.is_empty() {
+        "Custom Provider".to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
 fn env_api_key_for_provider(id: &str) -> Option<String> {
-    let env_name = match id {
+    let explicit = match id {
         "openai" => Some("OPENAI_API_KEY"),
         "openrouter" => Some("OPENROUTER_API_KEY"),
         "groq" => Some("GROQ_API_KEY"),
@@ -381,7 +537,27 @@ fn env_api_key_for_provider(id: &str) -> Option<String> {
         "together" => Some("TOGETHER_API_KEY"),
         "copilot" => Some("GITHUB_TOKEN"),
         _ => None,
-    }?;
+    };
+    if let Some(name) = explicit {
+        if let Some(value) = std::env::var(name).ok().filter(|v| !v.trim().is_empty()) {
+            return Some(value);
+        }
+    }
+
+    let normalized = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if normalized.is_empty() {
+        return None;
+    }
+    let env_name = format!("{}_API_KEY", normalized);
     std::env::var(env_name)
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -456,20 +632,62 @@ impl Provider for OpenAICompatibleProvider {
             .filter(|m| !m.is_empty())
             .unwrap_or(self.default_model.as_str());
         let url = format!("{}/chat/completions", self.base_url);
-        let mut req = self.client.post(url).json(&json!({
-            "model": model,
-            "messages": [{"role":"user","content": prompt}],
-            "stream": false,
-        }));
-        if self.id == "openrouter" {
-            req = req
-                .header("HTTP-Referer", "https://tandem.frumu.ai")
-                .header("X-Title", "Tandem");
+        let mut response_opt = None;
+        let mut last_send_err: Option<reqwest::Error> = None;
+        let max_tokens = provider_max_tokens();
+        for attempt in 0..3 {
+            let mut req = self.client.post(url.clone()).json(&json!({
+                "model": model,
+                "messages": [{"role":"user","content": prompt}],
+                "stream": false,
+                "max_tokens": max_tokens,
+            }));
+            if self.id == "openrouter" {
+                req = req
+                    .header("HTTP-Referer", "https://tandem.frumu.ai")
+                    .header("X-Title", "Tandem");
+            }
+            if let Some(api_key) = &self.api_key {
+                req = req.bearer_auth(api_key);
+            }
+
+            match req.send().await {
+                Ok(resp) => {
+                    response_opt = Some(resp);
+                    break;
+                }
+                Err(err) => {
+                    let retryable = err.is_connect() || err.is_timeout();
+                    if retryable && attempt < 2 {
+                        sleep(Duration::from_millis(300 * (attempt + 1) as u64)).await;
+                        last_send_err = Some(err);
+                        continue;
+                    }
+                    last_send_err = Some(err);
+                    break;
+                }
+            }
         }
-        if let Some(api_key) = &self.api_key {
-            req = req.bearer_auth(api_key);
-        }
-        let response = req.send().await?;
+
+        let response = if let Some(resp) = response_opt {
+            resp
+        } else {
+            let err = last_send_err.expect("send error should be captured");
+            let category = if err.is_connect() {
+                "connection error"
+            } else if err.is_timeout() {
+                "timeout"
+            } else {
+                "request error"
+            };
+            anyhow::bail!(
+                "failed to reach provider `{}` at {} ({}): {}. Verify endpoint is reachable and OpenAI-compatible.",
+                self.id,
+                self.base_url,
+                category,
+                err
+            );
+        };
         let status = response.status();
         let value: serde_json::Value = response.json().await?;
 
@@ -531,23 +749,63 @@ impl Provider for OpenAICompatibleProvider {
             "model": model,
             "messages": wire_messages,
             "stream": true,
+            "max_tokens": provider_max_tokens(),
         });
         if !wire_tools.is_empty() {
             body["tools"] = serde_json::Value::Array(wire_tools);
             body["tool_choice"] = json!("auto");
         }
 
-        let mut req = self.client.post(url).json(&body);
-        if self.id == "openrouter" {
-            req = req
-                .header("HTTP-Referer", "https://tandem.frumu.ai")
-                .header("X-Title", "Tandem");
-        }
-        if let Some(api_key) = &self.api_key {
-            req = req.bearer_auth(api_key);
+        let mut resp_opt = None;
+        let mut last_send_err: Option<reqwest::Error> = None;
+        for attempt in 0..3 {
+            let mut req = self.client.post(url.clone()).json(&body);
+            if self.id == "openrouter" {
+                req = req
+                    .header("HTTP-Referer", "https://tandem.frumu.ai")
+                    .header("X-Title", "Tandem");
+            }
+            if let Some(api_key) = &self.api_key {
+                req = req.bearer_auth(api_key);
+            }
+
+            match req.send().await {
+                Ok(resp) => {
+                    resp_opt = Some(resp);
+                    break;
+                }
+                Err(err) => {
+                    let retryable = err.is_connect() || err.is_timeout();
+                    if retryable && attempt < 2 {
+                        sleep(Duration::from_millis(300 * (attempt + 1) as u64)).await;
+                        last_send_err = Some(err);
+                        continue;
+                    }
+                    last_send_err = Some(err);
+                    break;
+                }
+            }
         }
 
-        let resp = req.send().await?;
+        let resp = if let Some(resp) = resp_opt {
+            resp
+        } else {
+            let err = last_send_err.expect("send error should be captured");
+            let category = if err.is_connect() {
+                "connection error"
+            } else if err.is_timeout() {
+                "timeout"
+            } else {
+                "request error"
+            };
+            anyhow::bail!(
+                "failed to reach provider `{}` at {} ({}): {}. Verify endpoint is reachable and OpenAI-compatible.",
+                self.id,
+                self.base_url,
+                category,
+                err
+            );
+        };
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -613,16 +871,41 @@ impl Provider for OpenAICompatibleProvider {
                             .unwrap_or_default();
                         for choice in choices {
                             let delta = choice.get("delta").cloned().unwrap_or_default();
+                            let message = choice.get("message").cloned().unwrap_or_default();
 
+                            let mut emitted_text = false;
                             if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                                 if !text.is_empty() {
+                                    emitted_text = true;
                                     yield StreamChunk::TextDelta(text.to_string());
                                 }
                             }
+                            if !emitted_text {
+                                if let Some(text) = message.get("content").and_then(|v| v.as_str()) {
+                                    if !text.is_empty() {
+                                        yield StreamChunk::TextDelta(text.to_string());
+                                    }
+                                } else if let Some(parts) =
+                                    message.get("content").and_then(|v| v.as_array())
+                                {
+                                    for part in parts {
+                                        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                            if !text.is_empty() {
+                                                yield StreamChunk::TextDelta(text.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
 
-                            if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                                for call in tool_calls {
-                                    let id = call
+                            let tool_calls = delta
+                                .get("tool_calls")
+                                .and_then(|v| v.as_array())
+                                .or_else(|| message.get("tool_calls").and_then(|v| v.as_array()));
+
+                            if let Some(tool_calls) = tool_calls {
+                                for (idx, call) in tool_calls.iter().enumerate() {
+                                    let mut id = call
                                         .get("id")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or_default()
@@ -636,8 +919,17 @@ impl Provider for OpenAICompatibleProvider {
                                     let args_delta = function
                                         .get("arguments")
                                         .and_then(|v| v.as_str())
-                                        .unwrap_or_default()
-                                        .to_string();
+                                        .map(ToString::to_string)
+                                        .or_else(|| {
+                                            function
+                                                .get("arguments")
+                                                .and_then(|v| (!v.is_null()).then(|| v.to_string()))
+                                        })
+                                        .unwrap_or_default();
+
+                                    if id.is_empty() && !name.is_empty() {
+                                        id = format!("tool_call_{}_{}", idx, name);
+                                    }
 
                                     if !id.is_empty() && !name.is_empty() {
                                         yield StreamChunk::ToolCallStart {
@@ -856,10 +1148,29 @@ impl Provider for CohereProvider {
 }
 
 fn normalize_base(input: &str) -> String {
-    if input.ends_with("/v1") {
-        input.trim_end_matches('/').to_string()
+    // Accept base URLs with common OpenAI-compatible suffixes and normalize to `.../v1`.
+    // This prevents accidental double suffixes like `/v1/v1`.
+    let mut base = input.trim().trim_end_matches('/').to_string();
+    for suffix in ["/chat/completions", "/completions", "/models"] {
+        if let Some(stripped) = base.strip_suffix(suffix) {
+            base = stripped.trim_end_matches('/').to_string();
+            break;
+        }
+    }
+
+    // Self-heal legacy malformed values that accidentally ended up with repeated `/v1`.
+    while let Some(prefix) = base.strip_suffix("/v1") {
+        if prefix.ends_with("/v1") {
+            base = prefix.to_string();
+            continue;
+        }
+        break;
+    }
+
+    if base.ends_with("/v1") {
+        base
     } else {
-        format!("{}/v1", input.trim_end_matches('/'))
+        format!("{}/v1", base.trim_end_matches('/'))
     }
 }
 
@@ -1046,5 +1357,59 @@ mod tests {
         assert!(err
             .to_string()
             .contains("provider `openruter` is not configured"));
+    }
+
+    #[tokio::test]
+    async fn custom_provider_id_is_supported_from_config() {
+        let registry = ProviderRegistry::new(cfg(&["custom"], Some("custom"), false));
+        let provider = registry
+            .select_provider(Some("custom"))
+            .await
+            .expect("provider");
+        assert_eq!(provider.info().id, "custom");
+    }
+
+    #[test]
+    fn normalize_base_handles_common_openai_compatible_inputs() {
+        assert_eq!(
+            normalize_base("http://localhost:8080"),
+            "http://localhost:8080/v1"
+        );
+        assert_eq!(
+            normalize_base("http://localhost:8080/v1"),
+            "http://localhost:8080/v1"
+        );
+        assert_eq!(
+            normalize_base("http://localhost:8080/v1/"),
+            "http://localhost:8080/v1"
+        );
+        assert_eq!(
+            normalize_base("http://localhost:8080/v1/chat/completions"),
+            "http://localhost:8080/v1"
+        );
+        assert_eq!(
+            normalize_base("http://localhost:8080/v1/models"),
+            "http://localhost:8080/v1"
+        );
+        assert_eq!(
+            normalize_base("http://localhost:8080/v1/v1"),
+            "http://localhost:8080/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_cheapest_picks_ollama_first() {
+        // Test priority parsing logic
+        let registry = ProviderRegistry::new(cfg(&["openai", "groq", "ollama"], None, true));
+        let cheapest = registry.select_cheapest_provider_id().await;
+        assert_eq!(cheapest, Some("ollama"));
+
+        let registry = ProviderRegistry::new(cfg(&["openai", "openai", "openrouter"], None, true));
+        let cheapest = registry.select_cheapest_provider_id().await;
+        assert_eq!(cheapest, Some("openrouter"));
+
+        let registry = ProviderRegistry::new(cfg(&["unknown_provider"], None, true));
+        let cheapest = registry.select_cheapest_provider_id().await;
+        assert_eq!(cheapest, None);
     }
 }

@@ -234,8 +234,10 @@ fn strip_persisted_secrets(value: &mut Value) {
         if let Some(channels) = root.get_mut("channels").and_then(|v| v.as_object_mut()) {
             for channel in ["telegram", "discord", "slack"] {
                 if let Some(cfg) = channels.get_mut(channel).and_then(|v| v.as_object_mut()) {
-                    cfg.remove("bot_token");
-                    cfg.remove("botToken");
+                    if channel_has_runtime_secret(channel) {
+                        cfg.remove("bot_token");
+                        cfg.remove("botToken");
+                    }
                 }
             }
         }
@@ -256,6 +258,18 @@ fn strip_persisted_secrets(value: &mut Value) {
             }
         }
     }
+}
+
+fn channel_has_runtime_secret(channel_id: &str) -> bool {
+    let key = match channel_id {
+        "telegram" => "TANDEM_TELEGRAM_BOT_TOKEN",
+        "discord" => "TANDEM_DISCORD_BOT_TOKEN",
+        "slack" => "TANDEM_SLACK_BOT_TOKEN",
+        _ => return false,
+    };
+    std::env::var(key)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
 }
 
 async fn scrub_persisted_secrets(value: &mut Value, path: Option<&Path>) -> anyhow::Result<()> {
@@ -341,7 +355,14 @@ async fn resolve_global_config_path() -> anyhow::Result<PathBuf> {
         }
         return Ok(path);
     }
-    Ok(PathBuf::from(".tandem/global_config.json"))
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".config").join("tandem").join("config.json");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        return Ok(path);
+    }
+    Ok(PathBuf::from("config.json"))
 }
 
 fn env_layer() -> Value {
@@ -437,7 +458,7 @@ fn env_layer() -> Value {
                     "openai": {
                         "api_key": api_key,
                         "url": "https://api.openai.com/v1",
-                        "default_model": "gpt-4o-mini"
+                        "default_model": "gpt-5.2"
                     }
                 }
             }),
@@ -514,7 +535,7 @@ fn env_layer() -> Value {
                     "anthropic": {
                         "api_key": api_key,
                         "url": "https://api.anthropic.com/v1",
-                        "default_model": "claude-3-5-sonnet-latest"
+                        "default_model": "claude-sonnet-4-6"
                     }
                 }
             }),
@@ -567,21 +588,60 @@ fn parse_csv(raw: &str) -> Vec<String> {
         .collect()
 }
 
+fn first_nonempty_env(keys: &[String]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        std::env::var(key).ok().and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    })
+}
+
 fn add_openai_env(root: &mut Value, provider: &str, key_env: &str, default_url: &str, model: &str) {
-    if let Ok(api_key) = std::env::var(key_env) {
-        deep_merge(
-            root,
-            &json!({
-                "providers": {
-                    provider: {
-                        "api_key": api_key,
-                        "url": default_url,
-                        "default_model": model
-                    }
-                }
-            }),
-        );
+    let Ok(api_key) = std::env::var(key_env) else {
+        return;
+    };
+
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return;
     }
+
+    let mut provider_cfg = json!({
+        "api_key": api_key,
+        "url": default_url,
+    });
+
+    // Preserve explicit model selection from config by default.
+    // Only apply env-layer default_model when an explicit model env is provided.
+    let provider_upper = provider.to_ascii_uppercase();
+    let inferred_model_key = key_env.replace("API_KEY", "MODEL");
+    let model_keys = vec![
+        format!("{provider_upper}_MODEL"),
+        format!("{provider_upper}_DEFAULT_MODEL"),
+        inferred_model_key,
+    ];
+    let explicit_model = first_nonempty_env(&model_keys).unwrap_or_else(|| model.to_string());
+    if model_keys.iter().any(|key| {
+        std::env::var(key)
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+    }) {
+        provider_cfg["default_model"] = Value::String(explicit_model);
+    }
+
+    deep_merge(
+        root,
+        &json!({
+            "providers": {
+                provider: provider_cfg
+            }
+        }),
+    );
 }
 
 fn deep_merge(base: &mut Value, overlay: &Value) {
@@ -647,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_persisted_secrets_removes_channel_bot_tokens() {
+    fn strip_persisted_secrets_keeps_channel_bot_tokens_without_runtime_env() {
         let mut value = json!({
             "channels": {
                 "telegram": {
@@ -673,21 +733,21 @@ mod tests {
             .get("channels")
             .and_then(|v| v.get("telegram"))
             .and_then(Value::as_object)
-            .is_some_and(|obj| !obj.contains_key("bot_token")));
+            .is_some_and(|obj| obj.contains_key("bot_token")));
         assert!(value
             .get("channels")
             .and_then(|v| v.get("discord"))
             .and_then(Value::as_object)
-            .is_some_and(|obj| !obj.contains_key("botToken")));
+            .is_some_and(|obj| obj.contains_key("botToken")));
         assert!(value
             .get("channels")
             .and_then(|v| v.get("slack"))
             .and_then(Value::as_object)
-            .is_some_and(|obj| !obj.contains_key("bot_token")));
+            .is_some_and(|obj| obj.contains_key("bot_token")));
     }
 
     #[tokio::test]
-    async fn scrub_persisted_secrets_rewrites_channel_tokens_on_disk() {
+    async fn scrub_persisted_secrets_keeps_channel_tokens_on_disk_without_runtime_env() {
         let path = unique_temp_file("scrub");
         let original = json!({
             "channels": {
@@ -716,8 +776,84 @@ mod tests {
             .get("channels")
             .and_then(|v| v.get("telegram"))
             .and_then(Value::as_object)
-            .is_some_and(|obj| !obj.contains_key("bot_token")));
+            .is_some_and(|obj| obj.contains_key("bot_token")));
 
         let _ = fs::remove_file(&path).await;
+    }
+
+    #[test]
+    fn strip_persisted_secrets_removes_channel_bot_tokens_with_runtime_env() {
+        std::env::set_var("TANDEM_TELEGRAM_BOT_TOKEN", "runtime-secret");
+        std::env::set_var("TANDEM_DISCORD_BOT_TOKEN", "runtime-secret");
+        std::env::set_var("TANDEM_SLACK_BOT_TOKEN", "runtime-secret");
+
+        let mut value = json!({
+            "channels": {
+                "telegram": {
+                    "bot_token": "tg-secret"
+                },
+                "discord": {
+                    "botToken": "dc-secret"
+                },
+                "slack": {
+                    "bot_token": "sl-secret"
+                }
+            }
+        });
+
+        strip_persisted_secrets(&mut value);
+
+        assert!(value
+            .get("channels")
+            .and_then(|v| v.get("telegram"))
+            .and_then(Value::as_object)
+            .is_some_and(|obj| !obj.contains_key("bot_token")));
+        assert!(value
+            .get("channels")
+            .and_then(|v| v.get("discord"))
+            .and_then(Value::as_object)
+            .is_some_and(|obj| !obj.contains_key("botToken")));
+        assert!(value
+            .get("channels")
+            .and_then(|v| v.get("slack"))
+            .and_then(Value::as_object)
+            .is_some_and(|obj| !obj.contains_key("bot_token")));
+
+        std::env::remove_var("TANDEM_TELEGRAM_BOT_TOKEN");
+        std::env::remove_var("TANDEM_DISCORD_BOT_TOKEN");
+        std::env::remove_var("TANDEM_SLACK_BOT_TOKEN");
+    }
+
+    #[test]
+    fn openrouter_api_key_env_does_not_override_default_model_without_model_env() {
+        std::env::set_var("OPENROUTER_API_KEY", "sk-test");
+        std::env::remove_var("OPENROUTER_MODEL");
+        std::env::remove_var("OPENROUTER_DEFAULT_MODEL");
+
+        let env_layer: Value = env_layer();
+        let default_model = env_layer
+            .get("providers")
+            .and_then(|v| v.get("openrouter"))
+            .and_then(|v| v.get("default_model"));
+        assert!(default_model.is_none());
+
+        std::env::remove_var("OPENROUTER_API_KEY");
+    }
+
+    #[test]
+    fn openrouter_model_env_overrides_default_model_when_explicitly_set() {
+        std::env::set_var("OPENROUTER_API_KEY", "sk-test");
+        std::env::set_var("OPENROUTER_MODEL", "z-ai/glm-5");
+
+        let env_layer: Value = env_layer();
+        let default_model = env_layer
+            .get("providers")
+            .and_then(|v| v.get("openrouter"))
+            .and_then(|v| v.get("default_model"))
+            .and_then(Value::as_str);
+        assert_eq!(default_model, Some("z-ai/glm-5"));
+
+        std::env::remove_var("OPENROUTER_API_KEY");
+        std::env::remove_var("OPENROUTER_MODEL");
     }
 }

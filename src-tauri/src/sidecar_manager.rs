@@ -128,8 +128,22 @@ pub fn get_sidecar_binary_path(app: &AppHandle) -> Result<PathBuf> {
     if let Some(app_data_dir) = shared_app_data_dir(app) {
         let updated_binary = app_data_dir.join("binaries").join(binary_name);
         if updated_binary.exists() {
-            tracing::debug!("Using updated sidecar from AppData: {:?}", updated_binary);
-            return Ok(updated_binary);
+            if let Some(stored_version) = get_stored_sidecar_version(app) {
+                let bundled_version = format!("v{}", app.package_info().version);
+                if is_version_newer(&bundled_version, &stored_version) {
+                    tracing::warn!(
+                        "Ignoring stale AppData sidecar {} in favor of bundled {}",
+                        stored_version,
+                        bundled_version
+                    );
+                } else {
+                    tracing::debug!("Using updated sidecar from AppData: {:?}", updated_binary);
+                    return Ok(updated_binary);
+                }
+            } else {
+                tracing::debug!("Using updated sidecar from AppData: {:?}", updated_binary);
+                return Ok(updated_binary);
+            }
         }
     }
 
@@ -225,12 +239,28 @@ fn get_asset_name() -> &'static str {
     return "tandem-engine-linux-arm64.tar.gz";
 }
 
-/// Get the installed version from the store
-fn get_installed_version(app: &AppHandle) -> Option<String> {
+/// Get the installed sidecar version.
+///
+/// If the sidecar is running from AppData (downloaded updater binary), prefer the persisted
+/// sidecar version from settings. If the sidecar is bundled with the desktop app resources,
+/// report the app package version to avoid stale values from old beta downloads.
+fn get_stored_sidecar_version(app: &AppHandle) -> Option<String> {
     let store = app.store("settings.json").ok()?;
     store
         .get("sidecar_version")
         .and_then(|v| v.as_str().map(String::from))
+}
+
+fn get_installed_version(app: &AppHandle, binary_path: Option<&Path>) -> Option<String> {
+    let in_app_data = binary_path
+        .and_then(|path| shared_app_data_dir(app).map(|dir| path.starts_with(dir)))
+        .unwrap_or(false);
+
+    if in_app_data {
+        return get_stored_sidecar_version(app);
+    }
+
+    Some(format!("v{}", app.package_info().version))
 }
 
 /// Save the installed version to the store
@@ -264,7 +294,7 @@ pub async fn check_sidecar_status(app: &AppHandle) -> Result<SidecarStatus> {
         .unwrap_or(false);
 
     let version = if installed {
-        get_installed_version(app)
+        get_installed_version(app, binary_path.as_deref())
     } else {
         None
     };
@@ -330,7 +360,7 @@ struct ReleaseDiscovery {
 async fn fetch_release_discovery(app: &AppHandle) -> Result<ReleaseDiscovery> {
     let client = reqwest::Client::new();
     let releases = fetch_releases(app, &client, false).await?;
-    Ok(build_release_discovery(&releases, beta_channel_enabled()))
+    Ok(build_release_discovery(&releases, false))
 }
 
 fn build_release_discovery(
@@ -644,29 +674,8 @@ fn log_release_selection(context: &str, selected: &CompatibleRelease<'_>) {
 }
 
 fn select_release_for_download<'a>(releases: &'a [GitHubRelease]) -> Result<CompatibleRelease<'a>> {
-    let include_prerelease = beta_channel_enabled();
-
-    match select_latest_compatible_release(releases, include_prerelease) {
-        Ok(selected) => Ok(selected),
-        Err(primary_error) => {
-            if include_prerelease {
-                return Err(primary_error);
-            }
-
-            // Fallback: if stable filtering finds nothing compatible, allow prerelease releases.
-            // This keeps sidecar download functional when only prerelease artifacts are available.
-            match select_latest_compatible_release(releases, true) {
-                Ok(selected) => {
-                    tracing::warn!(
-                        selected_tag = %selected.release.tag_name,
-                        "No stable compatible tandem-engine release found; falling back to prerelease"
-                    );
-                    Ok(selected)
-                }
-                Err(_) => Err(primary_error),
-            }
-        }
-    }
+    // Stable-only updater policy: never opt into prerelease artifacts.
+    select_latest_compatible_release(releases, false)
 }
 
 fn should_offer_update(installed_version: Option<&str>, latest_version: Option<&str>) -> bool {
@@ -759,12 +768,6 @@ fn asset_name_matches_current_target(asset_name: &str) -> bool {
     {
         return asset_name.contains("linux") && asset_name.contains("arm64");
     }
-}
-
-fn beta_channel_enabled() -> bool {
-    std::env::var("TANDEM_OPENCODE_UPDATE_CHANNEL")
-        .map(|value| value.eq_ignore_ascii_case("beta"))
-        .unwrap_or(false)
 }
 
 fn get_release_cache_path(app: &AppHandle) -> Option<PathBuf> {

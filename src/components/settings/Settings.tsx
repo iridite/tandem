@@ -62,6 +62,7 @@ import {
   getStorageMigrationStatus,
   runStorageMigration,
   getEngineApiToken,
+  listModels,
   type EngineApiTokenInfo,
   type ProvidersConfig,
   type CustomBackgroundInfo,
@@ -77,6 +78,20 @@ interface SettingsProps {
   onProviderChange?: () => void; // Called when API keys are added/removed
   initialSection?: "providers" | "projects";
   onInitialSectionConsumed?: () => void;
+}
+
+interface LatestReleaseSummary {
+  tag: string;
+  title: string;
+  body: string;
+  htmlUrl: string;
+  publishedAt: string | null;
+}
+
+interface LatestJsonPayload {
+  version?: string;
+  notes?: string;
+  pub_date?: string;
 }
 
 export function Settings({
@@ -127,6 +142,10 @@ export function Settings({
   const [customModel, setCustomModel] = useState("");
   const [customApiKey, setCustomApiKey] = useState("");
   const [customEnabled, setCustomEnabled] = useState(false);
+  const [customProviderNotice, setCustomProviderNotice] = useState<{
+    kind: "success" | "error";
+    message: string;
+  } | null>(null);
 
   // Git initialization dialog state
   const [showGitDialog, setShowGitDialog] = useState(false);
@@ -139,11 +158,24 @@ export function Settings({
     null
   );
   const [migrationRunning, setMigrationRunning] = useState(false);
+  const [latestRelease, setLatestRelease] = useState<LatestReleaseSummary | null>(null);
+  const [latestReleaseLoading, setLatestReleaseLoading] = useState(false);
+  const [latestReleaseError, setLatestReleaseError] = useState<string | null>(null);
+  const [providerCatalogModels, setProviderCatalogModels] = useState<Record<string, string[]>>({});
 
   useEffect(() => {
     loadSettings();
     void loadCustomBackground();
+    void loadLatestReleaseNotes();
+    void loadProviderCatalogModels();
     getVersion().then(setAppVersion);
+  }, []);
+
+  useEffect(() => {
+    const timer = globalThis.setInterval(() => {
+      void loadProviderCatalogModels();
+    }, 20000);
+    return () => globalThis.clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -224,6 +256,113 @@ export function Settings({
       console.error("Failed to load settings:", err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadLatestReleaseNotes = async () => {
+    setLatestReleaseLoading(true);
+    setLatestReleaseError(null);
+
+    const fromGitHubApi = async (): Promise<LatestReleaseSummary> => {
+      const response = await globalThis.fetch(
+        "https://api.github.com/repos/frumu-ai/tandem/releases/latest",
+        {
+          headers: {
+            Accept: "application/vnd.github+json",
+          },
+        }
+      );
+      if (!response.ok) {
+        throw new Error(`Release notes request failed (${response.status})`);
+      }
+      const payload = (await response.json()) as Record<string, unknown>;
+      const tag = typeof payload.tag_name === "string" ? payload.tag_name : "latest";
+      const title = typeof payload.name === "string" && payload.name.trim() ? payload.name : tag;
+      const body = typeof payload.body === "string" ? payload.body.trim() : "";
+      const htmlUrl = typeof payload.html_url === "string" ? payload.html_url : "";
+      const publishedAt =
+        typeof payload.published_at === "string" && payload.published_at.trim().length > 0
+          ? payload.published_at
+          : null;
+      return { tag, title, body, htmlUrl, publishedAt };
+    };
+
+    const fromUpdaterLatestJson = async (): Promise<LatestReleaseSummary> => {
+      const response = await globalThis.fetch(
+        "https://github.com/frumu-ai/tandem/releases/latest/download/latest.json",
+        {
+          headers: {
+            Accept: "application/json",
+          },
+        }
+      );
+      if (!response.ok) {
+        throw new Error(`latest.json request failed (${response.status})`);
+      }
+      const payload = (await response.json()) as LatestJsonPayload;
+      const rawVersion = typeof payload.version === "string" ? payload.version.trim() : "latest";
+      const tag = rawVersion.startsWith("v") ? rawVersion : `v${rawVersion}`;
+      const body = typeof payload.notes === "string" ? payload.notes.trim() : "";
+      const publishedAt =
+        typeof payload.pub_date === "string" && payload.pub_date.trim().length > 0
+          ? payload.pub_date
+          : null;
+      return {
+        tag,
+        title: tag,
+        body,
+        htmlUrl: `https://github.com/frumu-ai/tandem/releases/tag/${encodeURIComponent(tag)}`,
+        publishedAt,
+      };
+    };
+
+    try {
+      const apiResult = await fromGitHubApi();
+      setLatestRelease(apiResult);
+    } catch (error) {
+      const primaryError = error instanceof Error ? error.message : String(error);
+      try {
+        const latestJsonResult = await fromUpdaterLatestJson();
+        setLatestRelease(latestJsonResult);
+        setLatestReleaseError(null);
+      } catch (fallbackError) {
+        const fallbackMessage =
+          fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+        setLatestReleaseError(
+          `Failed to fetch release metadata: ${primaryError}; ${fallbackMessage}`
+        );
+        setLatestRelease(null);
+      }
+    } finally {
+      setLatestReleaseLoading(false);
+    }
+  };
+
+  const normalizeProviderId = (providerId: string): string => {
+    const trimmed = providerId.trim().toLowerCase();
+    if (trimmed === "opencode" || trimmed === "zen") {
+      return "opencode_zen";
+    }
+    return trimmed;
+  };
+
+  const loadProviderCatalogModels = async () => {
+    try {
+      const models = await listModels();
+      const grouped: Record<string, Set<string>> = {};
+      for (const model of models) {
+        if (!model.provider || !model.id) continue;
+        const providerId = normalizeProviderId(model.provider);
+        if (!grouped[providerId]) grouped[providerId] = new Set();
+        grouped[providerId].add(model.id);
+      }
+      const next: Record<string, string[]> = {};
+      for (const [providerId, ids] of Object.entries(grouped)) {
+        next[providerId] = [...ids].sort((a, b) => a.localeCompare(b));
+      }
+      setProviderCatalogModels(next);
+    } catch {
+      setProviderCatalogModels({});
     }
   };
 
@@ -479,7 +618,18 @@ export function Settings({
   };
 
   const handleCustomProviderSave = async () => {
-    if (!providers || !customEndpoint.trim()) return;
+    if (!providers || !customEndpoint.trim()) {
+      setCustomProviderNotice({
+        kind: "error",
+        message: "Custom endpoint is required.",
+      });
+      return;
+    }
+    const normalizedModel = customModel.trim();
+    const selectedModel =
+      customEnabled && normalizedModel.length > 0
+        ? { provider_id: "custom", model_id: normalizedModel }
+        : (providers.selected_model ?? null);
 
     // When enabling custom provider, disable all others
     const updated: ProvidersConfig = {
@@ -494,23 +644,33 @@ export function Settings({
           enabled: customEnabled,
           default: customEnabled,
           endpoint: customEndpoint,
-          model: customModel || undefined,
+          model: normalizedModel || undefined,
           has_key: false, // Custom provider key checking not implemented yet
         },
       ],
-      selected_model: providers.selected_model ?? null,
+      selected_model: selectedModel,
     };
 
-    setProviders(updated);
-    await setProvidersConfig(updated);
+    try {
+      setProviders(updated);
+      await setProvidersConfig(updated);
 
-    // Store custom API key if provided
-    if (customApiKey.trim() && customEnabled) {
-      try {
+      // Store custom API key if provided
+      if (customApiKey.trim() && customEnabled) {
         await storeApiKey("custom_provider", customApiKey);
-      } catch (err) {
-        console.error("Failed to store custom API key:", err);
       }
+
+      onProviderChange?.();
+      setCustomProviderNotice({
+        kind: "success",
+        message: "Custom provider saved.",
+      });
+    } catch (err) {
+      console.error("Failed to save custom provider:", err);
+      setCustomProviderNotice({
+        kind: "error",
+        message: err instanceof Error ? err.message : "Failed to save custom provider. Check logs.",
+      });
     }
   };
 
@@ -518,6 +678,7 @@ export function Settings({
     setCustomEnabled(enabled);
 
     if (enabled && providers) {
+      const normalizedModel = customModel.trim();
       // When enabling custom provider, disable all others
       const updated: ProvidersConfig = {
         openrouter: { ...providers.openrouter, enabled: false, default: false },
@@ -531,20 +692,28 @@ export function Settings({
             enabled: true,
             default: true,
             endpoint: customEndpoint || "https://api.example.com/v1",
-            model: customModel || undefined,
+            model: normalizedModel || undefined,
             has_key: false, // Custom provider key checking not implemented yet
           },
         ],
-        selected_model: providers.selected_model ?? null,
+        selected_model:
+          normalizedModel.length > 0
+            ? { provider_id: "custom", model_id: normalizedModel }
+            : (providers.selected_model ?? null),
       };
 
       setProviders(updated);
       await setProvidersConfig(updated);
     } else if (!enabled && providers) {
       // Disable custom provider
+      const selectedModel = providers.selected_model;
       const updated: ProvidersConfig = {
         ...providers,
         custom: [],
+        selected_model:
+          selectedModel?.provider_id?.trim().toLowerCase() === "custom"
+            ? null
+            : (selectedModel ?? null),
       };
 
       setProviders(updated);
@@ -844,6 +1013,19 @@ export function Settings({
                             ? t("updates.downloadingUpdate", { ns: "settings" })
                             : ""}
             </div>
+            {updateStatus === "available" &&
+            updateInfo &&
+            typeof updateInfo.body === "string" &&
+            updateInfo.body.trim().length > 0 ? (
+              <div className="space-y-1">
+                <div className="text-xs font-semibold uppercase tracking-wide text-text-subtle">
+                  What&apos;s New
+                </div>
+                <div className="max-h-48 overflow-y-auto whitespace-pre-wrap rounded-md border border-border bg-surface-elevated/30 p-3 text-xs text-text-subtle">
+                  {updateInfo.body.trim()}
+                </div>
+              </div>
+            ) : null}
 
             {updateStatus === "downloading" && updateProgress && (
               <div className="space-y-2">
@@ -865,6 +1047,55 @@ export function Settings({
                 </div>
               </div>
             )}
+
+            <div className="space-y-2 rounded-md border border-border bg-surface-elevated/20 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-wide text-text-subtle">
+                    Latest Release Notes
+                  </div>
+                  <div className="text-[11px] text-text-muted">
+                    {latestRelease?.tag ?? "No release metadata loaded"}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void loadLatestReleaseNotes()}
+                    disabled={latestReleaseLoading}
+                  >
+                    {latestReleaseLoading ? "Loading..." : "Refresh"}
+                  </Button>
+                  {latestRelease?.htmlUrl ? (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => globalThis.open(latestRelease.htmlUrl, "_blank", "noopener")}
+                    >
+                      Open Full Notes
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
+              {latestReleaseError ? (
+                <div className="text-xs text-red-300">{latestReleaseError}</div>
+              ) : null}
+              {latestRelease?.publishedAt ? (
+                <div className="text-[11px] text-text-subtle">
+                  Published: {new Date(latestRelease.publishedAt).toLocaleString()}
+                </div>
+              ) : null}
+              {latestRelease?.body ? (
+                <div className="max-h-56 overflow-y-auto whitespace-pre-wrap rounded border border-border bg-surface p-3 text-xs text-text-subtle">
+                  {latestRelease.body}
+                </div>
+              ) : latestReleaseLoading ? null : (
+                <div className="text-xs text-text-subtle">
+                  No release notes body found for latest release.
+                </div>
+              )}
+            </div>
           </CardContent>
         </Card>
 
@@ -1319,6 +1550,7 @@ export function Settings({
                 endpoint={providers.opencode_zen.endpoint}
                 defaultEndpoint="https://opencode.ai/zen/v1"
                 model={providers.opencode_zen.model}
+                catalogModelIds={providerCatalogModels.opencode_zen ?? []}
                 isDefault={providers.opencode_zen.default}
                 enabled={providers.opencode_zen.enabled}
                 onEnabledChange={(enabled) => handleProviderChange("opencode_zen", enabled)}
@@ -1336,6 +1568,7 @@ export function Settings({
                 endpoint={providers.openrouter.endpoint}
                 defaultEndpoint="https://openrouter.ai/api/v1"
                 model={providers.openrouter.model}
+                catalogModelIds={providerCatalogModels.openrouter ?? []}
                 isDefault={providers.openrouter.default}
                 enabled={providers.openrouter.enabled}
                 onEnabledChange={(enabled) => handleProviderChange("openrouter", enabled)}
@@ -1353,6 +1586,7 @@ export function Settings({
                 endpoint={providers.anthropic.endpoint}
                 defaultEndpoint="https://api.anthropic.com"
                 model={providers.anthropic.model}
+                catalogModelIds={providerCatalogModels.anthropic ?? []}
                 isDefault={providers.anthropic.default}
                 enabled={providers.anthropic.enabled}
                 onEnabledChange={(enabled) => handleProviderChange("anthropic", enabled)}
@@ -1370,6 +1604,7 @@ export function Settings({
                 endpoint={providers.openai.endpoint}
                 defaultEndpoint="https://api.openai.com/v1"
                 model={providers.openai.model}
+                catalogModelIds={providerCatalogModels.openai ?? []}
                 isDefault={providers.openai.default}
                 enabled={providers.openai.enabled}
                 onEnabledChange={(enabled) => handleProviderChange("openai", enabled)}
@@ -1387,6 +1622,7 @@ export function Settings({
                 endpoint={providers.ollama.endpoint}
                 defaultEndpoint="http://localhost:11434"
                 model={providers.ollama.model}
+                catalogModelIds={providerCatalogModels.ollama ?? []}
                 isDefault={providers.ollama.default}
                 enabled={providers.ollama.enabled}
                 onEnabledChange={(enabled) => handleProviderChange("ollama", enabled)}
@@ -1404,6 +1640,7 @@ export function Settings({
                 endpoint={providers.poe.endpoint}
                 defaultEndpoint="https://api.poe.com/v1"
                 model={providers.poe.model}
+                catalogModelIds={providerCatalogModels.poe ?? []}
                 isDefault={providers.poe.default}
                 enabled={providers.poe.enabled}
                 onEnabledChange={(enabled) => handleProviderChange("poe", enabled)}
@@ -1479,6 +1716,17 @@ export function Settings({
                         >
                           {t("providersPanel.saveCustomProvider", { ns: "settings" })}
                         </Button>
+                        {customProviderNotice && (
+                          <p
+                            className={
+                              customProviderNotice.kind === "success"
+                                ? "text-xs text-success"
+                                : "text-xs text-error"
+                            }
+                          >
+                            {customProviderNotice.message}
+                          </p>
+                        )}
                       </CardContent>
                     </motion.div>
                   )}

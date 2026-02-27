@@ -116,7 +116,7 @@ static KNOWN_TOOLS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
         "run_command",
         "websearch",
         "webfetch",
-        "webfetch_document",
+        "webfetch_html",
         "todo_write",
         "todowrite",
         "new_task",
@@ -277,6 +277,9 @@ pub fn validate_mode_definition(mode: &ModeDefinition) -> Result<()> {
     if let Some(tools) = &mode.allowed_tools {
         for tool in tools {
             let canonical = canonical_tool_name(tool);
+            if canonical.starts_with("mcp.") {
+                continue;
+            }
             if !KNOWN_TOOLS.contains(canonical.as_str()) {
                 return Err(TandemError::ValidationError(format!(
                     "Unknown tool '{}' in allowed_tools",

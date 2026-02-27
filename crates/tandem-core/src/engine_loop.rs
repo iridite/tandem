@@ -82,6 +82,7 @@ pub struct EngineLoop {
     cancellations: CancellationRegistry,
     host_runtime_context: HostRuntimeContext,
     workspace_overrides: std::sync::Arc<RwLock<HashMap<String, u64>>>,
+    session_allowed_tools: std::sync::Arc<RwLock<HashMap<String, Vec<String>>>>,
     spawn_agent_hook: std::sync::Arc<RwLock<Option<std::sync::Arc<dyn SpawnAgentHook>>>>,
     tool_policy_hook: std::sync::Arc<RwLock<Option<std::sync::Arc<dyn ToolPolicyHook>>>>,
 }
@@ -110,6 +111,7 @@ impl EngineLoop {
             cancellations,
             host_runtime_context,
             workspace_overrides: std::sync::Arc::new(RwLock::new(HashMap::new())),
+            session_allowed_tools: std::sync::Arc::new(RwLock::new(HashMap::new())),
             spawn_agent_hook: std::sync::Arc::new(RwLock::new(None)),
             tool_policy_hook: std::sync::Arc::new(RwLock::new(None)),
         }
@@ -121,6 +123,22 @@ impl EngineLoop {
 
     pub async fn set_tool_policy_hook(&self, hook: std::sync::Arc<dyn ToolPolicyHook>) {
         *self.tool_policy_hook.write().await = Some(hook);
+    }
+
+    pub async fn set_session_allowed_tools(&self, session_id: &str, allowed_tools: Vec<String>) {
+        let normalized = allowed_tools
+            .into_iter()
+            .map(|tool| normalize_tool_name(&tool))
+            .filter(|tool| !tool.trim().is_empty())
+            .collect::<Vec<_>>();
+        self.session_allowed_tools
+            .write()
+            .await
+            .insert(session_id.to_string(), normalized);
+    }
+
+    pub async fn clear_session_allowed_tools(&self, session_id: &str) {
+        self.session_allowed_tools.write().await.remove(session_id);
     }
 
     pub async fn grant_workspace_override_for_session(
@@ -303,7 +321,24 @@ impl EngineLoop {
                         content: extra,
                     });
                 }
-                let tool_schemas = self.tools.list().await;
+                let mut tool_schemas = self.tools.list().await;
+                if active_agent.tools.is_some() {
+                    tool_schemas.retain(|schema| agent_can_use_tool(&active_agent, &schema.name));
+                }
+                if let Some(allowed_tools) = self
+                    .session_allowed_tools
+                    .read()
+                    .await
+                    .get(&session_id)
+                    .cloned()
+                {
+                    if !allowed_tools.is_empty() {
+                        tool_schemas.retain(|schema| {
+                            let normalized = normalize_tool_name(&schema.name);
+                            allowed_tools.iter().any(|tool| tool == &normalized)
+                        });
+                    }
+                }
                 if let Err(validation_err) = validate_tool_schemas(&tool_schemas) {
                     let detail = validation_err.to_string();
                     emit_event(
@@ -437,8 +472,37 @@ impl EngineLoop {
                             }
                         }
                         StreamChunk::ToolCallDelta { id, args_delta } => {
-                            let entry = streamed_tool_calls.entry(id).or_default();
+                            let entry = streamed_tool_calls.entry(id.clone()).or_default();
                             entry.args.push_str(&args_delta);
+                            let tool_name = if entry.name.trim().is_empty() {
+                                "tool".to_string()
+                            } else {
+                                normalize_tool_name(&entry.name)
+                            };
+                            let parsed_preview = if entry.name.trim().is_empty() {
+                                Value::String(truncate_text(&entry.args, 1_000))
+                            } else {
+                                parse_streamed_tool_args(&tool_name, &entry.args)
+                            };
+                            let mut tool_part = WireMessagePart::tool_invocation(
+                                &session_id,
+                                &user_message_id,
+                                tool_name.clone(),
+                                json!({}),
+                            );
+                            tool_part.id = Some(id.clone());
+                            self.event_bus.publish(EngineEvent::new(
+                                "message.part.updated",
+                                json!({
+                                    "part": tool_part,
+                                    "toolCallDelta": {
+                                        "id": id,
+                                        "tool": tool_name,
+                                        "argsDelta": truncate_text(&args_delta, 1_000),
+                                        "parsedArgsPreview": parsed_preview
+                                    }
+                                }),
+                            ));
                         }
                         StreamChunk::ToolCallEnd { id: _ } => {}
                     }
@@ -820,6 +884,17 @@ impl EngineLoop {
             Ok(args) => args,
             Err(message) => return Ok(Some(message)),
         };
+        if let Some(allowed_tools) = self
+            .session_allowed_tools
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+        {
+            if !allowed_tools.is_empty() && !allowed_tools.iter().any(|name| name == &tool) {
+                return Ok(Some(format!("Tool `{tool}` is not allowed for this run.")));
+            }
+        }
         if let Some(hook) = self.tool_policy_hook.read().await.clone() {
             let decision = hook
                 .evaluate_tool(ToolPolicyContext {
@@ -923,7 +998,31 @@ impl EngineLoop {
             effective_args = args;
         }
 
-        let args = self.plugins.inject_tool_args(&tool, effective_args).await;
+        let mut args = self.plugins.inject_tool_args(&tool, effective_args).await;
+        let tool_context = self.resolve_tool_execution_context(session_id).await;
+        if let Some((workspace_root, effective_cwd)) = tool_context.as_ref() {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert(
+                    "__workspace_root".to_string(),
+                    Value::String(workspace_root.clone()),
+                );
+                obj.insert(
+                    "__effective_cwd".to_string(),
+                    Value::String(effective_cwd.clone()),
+                );
+                obj.insert(
+                    "__session_id".to_string(),
+                    Value::String(session_id.to_string()),
+                );
+            }
+            tracing::info!(
+                "tool execution context session_id={} tool={} workspace_root={} effective_cwd={}",
+                session_id,
+                tool,
+                workspace_root,
+                effective_cwd
+            );
+        }
         let mut invoke_part =
             WireMessagePart::tool_invocation(session_id, message_id, tool.clone(), args.clone());
         if let Some(call_id) = tool_call_id.clone() {
@@ -956,6 +1055,8 @@ impl EngineLoop {
                     &tool,
                     &args_for_side_events,
                     &spawned.metadata,
+                    tool_context.as_ref().map(|ctx| ctx.0.as_str()),
+                    tool_context.as_ref().map(|ctx| ctx.1.as_str()),
                 )
                 .await;
                 let mut result_part = WireMessagePart::tool_result(
@@ -1013,6 +1114,8 @@ impl EngineLoop {
             &tool,
             &args_for_side_events,
             &result.metadata,
+            tool_context.as_ref().map(|ctx| ctx.0.as_str()),
+            tool_context.as_ref().map(|ctx| ctx.1.as_str()),
         )
         .await;
         let output = self.plugins.transform_tool_output(result.output).await;
@@ -1107,14 +1210,58 @@ impl EngineLoop {
         let workspace_path = PathBuf::from(&workspace);
         let candidate_paths = extract_tool_candidate_paths(tool, args);
         if candidate_paths.is_empty() {
+            if is_shell_tool_name(tool) {
+                if let Some(command) = extract_shell_command(args) {
+                    if shell_command_targets_sensitive_path(&command) {
+                        return Some(format!(
+                            "Sandbox blocked `{tool}` command targeting sensitive paths."
+                        ));
+                    }
+                }
+            }
             return None;
         }
-        let outside = candidate_paths
-            .iter()
-            .find(|path| !crate::is_within_workspace_root(Path::new(path), &workspace_path))?;
+        if let Some(sensitive) = candidate_paths.iter().find(|path| {
+            let raw = Path::new(path);
+            let resolved = if raw.is_absolute() {
+                raw.to_path_buf()
+            } else {
+                workspace_path.join(raw)
+            };
+            is_sensitive_path_candidate(&resolved)
+        }) {
+            return Some(format!(
+                "Sandbox blocked `{tool}` path `{sensitive}` (sensitive path policy)."
+            ));
+        }
+
+        let outside = candidate_paths.iter().find(|path| {
+            let raw = Path::new(path);
+            let resolved = if raw.is_absolute() {
+                raw.to_path_buf()
+            } else {
+                workspace_path.join(raw)
+            };
+            !crate::is_within_workspace_root(&resolved, &workspace_path)
+        })?;
         Some(format!(
             "Sandbox blocked `{tool}` path `{outside}` (workspace root: `{workspace}`)"
         ))
+    }
+
+    async fn resolve_tool_execution_context(&self, session_id: &str) -> Option<(String, String)> {
+        let session = self.storage.get_session(session_id).await?;
+        let workspace_root = session
+            .workspace_root
+            .or_else(|| crate::normalize_workspace_path(&session.directory))?;
+        let effective_cwd = if session.directory.trim().is_empty()
+            || session.directory.trim() == "."
+        {
+            workspace_root.clone()
+        } else {
+            crate::normalize_workspace_path(&session.directory).unwrap_or(workspace_root.clone())
+        };
+        Some((workspace_root, effective_cwd))
     }
 
     async fn workspace_override_active(&self, session_id: &str) -> bool {
@@ -1371,7 +1518,8 @@ fn is_read_only_tool(tool_name: &str) -> bool {
             | "ls"
             | "lsp"
             | "websearch"
-            | "webfetch_document"
+            | "webfetch"
+            | "webfetch_html"
     )
 }
 
@@ -1487,6 +1635,58 @@ fn tool_budget_for(tool_name: &str) -> usize {
     }
 }
 
+fn is_sensitive_path_candidate(path: &Path) -> bool {
+    let lowered = path.to_string_lossy().to_ascii_lowercase();
+    if lowered.contains("/.ssh/")
+        || lowered.ends_with("/.ssh")
+        || lowered.contains("/.gnupg/")
+        || lowered.ends_with("/.gnupg")
+    {
+        return true;
+    }
+    if lowered.contains("/.aws/credentials")
+        || lowered.ends_with("/.npmrc")
+        || lowered.ends_with("/.netrc")
+        || lowered.ends_with("/.pypirc")
+    {
+        return true;
+    }
+    if lowered.contains("id_rsa")
+        || lowered.contains("id_ed25519")
+        || lowered.contains("id_ecdsa")
+        || lowered.contains(".pem")
+        || lowered.contains(".p12")
+        || lowered.contains(".pfx")
+        || lowered.contains(".key")
+    {
+        return true;
+    }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let n = name.to_ascii_lowercase();
+        if n == ".env" || n.starts_with(".env.") {
+            return true;
+        }
+    }
+    false
+}
+
+fn shell_command_targets_sensitive_path(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let patterns = [
+        ".env",
+        ".ssh",
+        ".gnupg",
+        ".aws/credentials",
+        "id_rsa",
+        "id_ed25519",
+        ".pem",
+        ".p12",
+        ".pfx",
+        ".key",
+    ];
+    patterns.iter().any(|p| lower.contains(p))
+}
+
 #[derive(Debug, Clone)]
 struct NormalizedToolArgs {
     args: Value,
@@ -1555,10 +1755,6 @@ fn normalize_tool_args(
     } else if matches!(normalized_tool.as_str(), "read" | "write" | "edit") {
         if let Some(path) = extract_file_path_arg(&args) {
             args = set_file_path_arg(args, path);
-        } else if let Some(inferred) = infer_file_path_from_text(latest_assistant_context) {
-            args_source = "inferred_from_context".to_string();
-            args_integrity = "recovered".to_string();
-            args = set_file_path_arg(args, inferred);
         } else if let Some(inferred) = infer_file_path_from_text(latest_user_text) {
             args_source = "inferred_from_user".to_string();
             args_integrity = "recovered".to_string();
@@ -1579,6 +1775,23 @@ fn normalize_tool_args(
                 missing_terminal = true;
                 missing_terminal_reason = Some("WRITE_CONTENT_MISSING".to_string());
             }
+        }
+    } else if matches!(normalized_tool.as_str(), "webfetch" | "webfetch_html") {
+        if let Some(url) = extract_webfetch_url_arg(&args) {
+            args = set_webfetch_url_arg(args, url);
+        } else if let Some(inferred) = infer_url_from_text(latest_assistant_context) {
+            args_source = "inferred_from_context".to_string();
+            args_integrity = "recovered".to_string();
+            args = set_webfetch_url_arg(args, inferred);
+        } else if let Some(inferred) = infer_url_from_text(latest_user_text) {
+            args_source = "inferred_from_user".to_string();
+            args_integrity = "recovered".to_string();
+            args = set_webfetch_url_arg(args, inferred);
+        } else {
+            args_source = "missing".to_string();
+            args_integrity = "empty".to_string();
+            missing_terminal = true;
+            missing_terminal_reason = Some("WEBFETCH_URL_MISSING".to_string());
         }
     }
 
@@ -1840,13 +2053,41 @@ fn set_websearch_query_and_source(args: Value, query: Option<String>, query_sour
     Value::Object(obj)
 }
 
+fn set_webfetch_url_arg(args: Value, url: String) -> Value {
+    let mut obj = args.as_object().cloned().unwrap_or_default();
+    obj.insert("url".to_string(), Value::String(url));
+    Value::Object(obj)
+}
+
+fn extract_webfetch_url_arg(args: &Value) -> Option<String> {
+    const URL_KEYS: [&str; 5] = ["url", "uri", "link", "href", "target_url"];
+    for key in URL_KEYS {
+        if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
+            if let Some(url) = sanitize_url_candidate(value) {
+                return Some(url);
+            }
+        }
+    }
+    for container in ["arguments", "args", "input", "params"] {
+        if let Some(obj) = args.get(container) {
+            for key in URL_KEYS {
+                if let Some(value) = obj.get(key).and_then(|v| v.as_str()) {
+                    if let Some(url) = sanitize_url_candidate(value) {
+                        return Some(url);
+                    }
+                }
+            }
+        }
+    }
+    args.as_str().and_then(sanitize_url_candidate)
+}
+
 fn extract_websearch_query(args: &Value) -> Option<String> {
     const QUERY_KEYS: [&str; 5] = ["query", "q", "search_query", "searchQuery", "keywords"];
     for key in QUERY_KEYS {
         if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+            if let Some(query) = sanitize_websearch_query_candidate(value) {
+                return Some(query);
             }
         }
     }
@@ -1854,18 +2095,67 @@ fn extract_websearch_query(args: &Value) -> Option<String> {
         if let Some(obj) = args.get(container) {
             for key in QUERY_KEYS {
                 if let Some(value) = obj.get(key).and_then(|v| v.as_str()) {
-                    let trimmed = value.trim();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed.to_string());
+                    if let Some(query) = sanitize_websearch_query_candidate(value) {
+                        return Some(query);
                     }
                 }
             }
         }
     }
-    args.as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
+    args.as_str().and_then(sanitize_websearch_query_candidate)
+}
+
+fn sanitize_websearch_query_candidate(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(start) = lower.find("<arg_value>") {
+        let value_start = start + "<arg_value>".len();
+        let tail = &trimmed[value_start..];
+        let value = if let Some(end) = tail.to_ascii_lowercase().find("</arg_value>") {
+            &tail[..end]
+        } else {
+            tail
+        };
+        let cleaned = value.trim();
+        if !cleaned.is_empty() {
+            return Some(cleaned.to_string());
+        }
+    }
+
+    let without_wrappers = trimmed
+        .replace("<arg_key>", " ")
+        .replace("</arg_key>", " ")
+        .replace("<arg_value>", " ")
+        .replace("</arg_value>", " ");
+    let collapsed = without_wrappers
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+
+    let collapsed_lower = collapsed.to_ascii_lowercase();
+    if let Some(rest) = collapsed_lower.strip_prefix("websearch query ") {
+        let offset = collapsed.len() - rest.len();
+        let q = collapsed[offset..].trim();
+        if !q.is_empty() {
+            return Some(q.to_string());
+        }
+    }
+    if let Some(rest) = collapsed_lower.strip_prefix("query ") {
+        let offset = collapsed.len() - rest.len();
+        let q = collapsed[offset..].trim();
+        if !q.is_empty() {
+            return Some(q.to_string());
+        }
+    }
+
+    Some(collapsed)
 }
 
 fn infer_websearch_query_from_text(text: &str) -> Option<String> {
@@ -1958,6 +2248,65 @@ fn infer_file_path_from_text(text: &str) -> Option<String> {
     deduped.into_iter().next()
 }
 
+fn infer_url_from_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+
+    // Prefer backtick-delimited URLs when available.
+    let mut in_tick = false;
+    let mut tick_buf = String::new();
+    for ch in trimmed.chars() {
+        if ch == '`' {
+            if in_tick {
+                if let Some(url) = sanitize_url_candidate(&tick_buf) {
+                    candidates.push(url);
+                }
+                tick_buf.clear();
+            }
+            in_tick = !in_tick;
+            continue;
+        }
+        if in_tick {
+            tick_buf.push(ch);
+        }
+    }
+
+    // Fallback: scan whitespace tokens.
+    for raw in trimmed.split_whitespace() {
+        if let Some(url) = sanitize_url_candidate(raw) {
+            candidates.push(url);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .find(|candidate| seen.insert(candidate.clone()))
+}
+
+fn sanitize_url_candidate(raw: &str) -> Option<String> {
+    let token = raw
+        .trim()
+        .trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | '*' | '|'))
+        .trim_start_matches(['(', '[', '{', '<'])
+        .trim_end_matches([',', ';', ':', ')', ']', '}', '>'])
+        .trim_end_matches('.')
+        .trim();
+
+    if token.is_empty() {
+        return None;
+    }
+    let lower = token.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return None;
+    }
+    Some(token.to_string())
+}
+
 fn sanitize_path_candidate(raw: &str) -> Option<String> {
     let token = raw
         .trim()
@@ -1980,11 +2329,14 @@ fn sanitize_path_candidate(raw: &str) -> Option<String> {
     if is_root_only_path_token(token) {
         return None;
     }
+    if is_placeholder_path_token(token) {
+        return None;
+    }
 
     let looks_like_path = token.contains('/') || token.contains('\\');
     let has_file_ext = [
         ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".rs", ".ts", ".tsx", ".js", ".jsx",
-        ".py", ".go", ".java", ".cpp", ".c", ".h",
+        ".py", ".go", ".java", ".cpp", ".c", ".h", ".pdf", ".docx", ".pptx", ".xlsx", ".rtf",
     ]
     .iter()
     .any(|ext| lower.ends_with(ext));
@@ -1994,6 +2346,25 @@ fn sanitize_path_candidate(raw: &str) -> Option<String> {
     }
 
     Some(token.to_string())
+}
+
+fn is_placeholder_path_token(token: &str) -> bool {
+    let lowered = token.trim().to_ascii_lowercase();
+    if lowered.is_empty() {
+        return true;
+    }
+    matches!(
+        lowered.as_str(),
+        "files/directories"
+            | "file/directory"
+            | "relative/or/absolute/path"
+            | "path/to/file"
+            | "path/to/your/file"
+            | "tool/policy"
+            | "tools/policy"
+            | "the expected artifact file"
+            | "workspace/file"
+    )
 }
 
 fn is_malformed_tool_path_token(token: &str) -> bool {
@@ -2253,10 +2624,18 @@ fn should_force_workspace_probe(user_text: &str, completion: &str) -> bool {
     let asked_for_project_context = [
         "what is this project",
         "what's this project",
+        "what project is this",
         "explain this project",
         "analyze this project",
         "inspect this project",
         "look at the project",
+        "summarize this project",
+        "show me this project",
+        "what files are in",
+        "show files",
+        "list files",
+        "read files",
+        "browse files",
         "use glob",
         "run glob",
     ]
@@ -2270,12 +2649,25 @@ fn should_force_workspace_probe(user_text: &str, completion: &str) -> bool {
     let assistant_claimed_no_access = [
         "can't inspect",
         "cannot inspect",
+        "unable to inspect",
+        "unable to directly inspect",
+        "can't access",
+        "cannot access",
+        "unable to access",
+        "can't read files",
+        "cannot read files",
+        "unable to read files",
+        "tool restriction",
+        "tool restrictions",
         "don't have visibility",
+        "no visibility",
         "haven't been able to inspect",
         "i don't know what this project is",
         "need your help to",
         "sandbox",
+        "restriction",
         "system restriction",
+        "permissions restrictions",
     ]
     .iter()
     .any(|needle| reply.contains(needle));
@@ -2668,7 +3060,10 @@ fn parse_streamed_tool_args(tool_name: &str, raw_args: &str) -> Value {
     }
 
     if normalize_tool_name(tool_name) == "websearch" {
-        return json!({ "query": trimmed });
+        if let Some(query) = sanitize_websearch_query_candidate(trimmed) {
+            return json!({ "query": query });
+        }
+        return json!({});
     }
 
     json!({})
@@ -2683,18 +3078,16 @@ fn normalize_streamed_tool_args(tool_name: &str, parsed: Value, raw: &str) -> Va
     match parsed {
         Value::Object(mut obj) => {
             if !has_websearch_query(&obj) && !raw.trim().is_empty() {
-                obj.insert("query".to_string(), Value::String(raw.trim().to_string()));
+                if let Some(query) = sanitize_websearch_query_candidate(raw) {
+                    obj.insert("query".to_string(), Value::String(query));
+                }
             }
             Value::Object(obj)
         }
-        Value::String(s) => {
-            let q = s.trim();
-            if q.is_empty() {
-                json!({})
-            } else {
-                json!({ "query": q })
-            }
-        }
+        Value::String(s) => match sanitize_websearch_query_candidate(&s) {
+            Some(query) => json!({ "query": query }),
+            None => json!({}),
+        },
         other => other,
     }
 }
@@ -3004,6 +3397,8 @@ async fn emit_tool_side_events(
     tool: &str,
     args: &serde_json::Value,
     metadata: &serde_json::Value,
+    workspace_root: Option<&str>,
+    effective_cwd: Option<&str>,
 ) {
     if tool == "todo_write" {
         let todos_from_metadata = metadata
@@ -3026,7 +3421,9 @@ async fn emit_tool_side_events(
             "todo.updated",
             json!({
                 "sessionID": session_id,
-                "todos": normalized
+                "todos": normalized,
+                "workspaceRoot": workspace_root,
+                "effectiveCwd": effective_cwd
             }),
         ));
     }
@@ -3036,30 +3433,68 @@ async fn emit_tool_side_events(
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        let request = storage
-            .add_question_request(session_id, message_id, questions.clone())
-            .await
-            .ok();
-        bus.publish(EngineEvent::new(
-            "question.asked",
-            json!({
-                "id": request
-                    .as_ref()
-                    .map(|req| req.id.clone())
-                    .unwrap_or_else(|| format!("q-{}", uuid::Uuid::new_v4())),
-                "sessionID": session_id,
-                "messageID": message_id,
-                "questions": questions,
-                "tool": request.and_then(|req| {
-                    req.tool.map(|tool| {
-                        json!({
-                            "callID": tool.call_id,
-                            "messageID": tool.message_id
+        if questions.is_empty() {
+            tracing::warn!(
+                "question tool produced empty questions payload; skipping question.asked event session_id={} message_id={}",
+                session_id,
+                message_id
+            );
+        } else {
+            let request = storage
+                .add_question_request(session_id, message_id, questions.clone())
+                .await
+                .ok();
+            bus.publish(EngineEvent::new(
+                "question.asked",
+                json!({
+                    "id": request
+                        .as_ref()
+                        .map(|req| req.id.clone())
+                        .unwrap_or_else(|| format!("q-{}", uuid::Uuid::new_v4())),
+                    "sessionID": session_id,
+                    "messageID": message_id,
+                    "questions": questions,
+                    "tool": request.and_then(|req| {
+                        req.tool.map(|tool| {
+                            json!({
+                                "callID": tool.call_id,
+                                "messageID": tool.message_id
+                            })
                         })
-                    })
-                })
-            }),
-        ));
+                    }),
+                    "workspaceRoot": workspace_root,
+                    "effectiveCwd": effective_cwd
+                }),
+            ));
+        }
+    }
+    if let Some(events) = metadata.get("events").and_then(|v| v.as_array()) {
+        for event in events {
+            let Some(event_type) = event.get("type").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !event_type.starts_with("agent_team.") {
+                continue;
+            }
+            let mut properties = event
+                .get("properties")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            properties
+                .entry("sessionID".to_string())
+                .or_insert(json!(session_id));
+            properties
+                .entry("messageID".to_string())
+                .or_insert(json!(message_id));
+            properties
+                .entry("workspaceRoot".to_string())
+                .or_insert(json!(workspace_root));
+            properties
+                .entry("effectiveCwd".to_string())
+                .or_insert(json!(effective_cwd));
+            bus.publish(EngineEvent::new(event_type, Value::Object(properties)));
+        }
     }
 }
 
@@ -3228,6 +3663,8 @@ mod tests {
             "todo_write",
             &json!({"todos":[{"content":"ship parity"}]}),
             &json!({"todos":[{"content":"ship parity"}]}),
+            Some("."),
+            Some("."),
         )
         .await;
 
@@ -3266,6 +3703,8 @@ mod tests {
             "question",
             &json!({"questions":[{"header":"Topic","question":"Pick one","options":[{"label":"A","description":"d"}]}]}),
             &json!({"questions":[{"header":"Topic","question":"Pick one","options":[{"label":"A","description":"d"}]}]}),
+            Some("."),
+            Some("."),
         )
         .await;
 
@@ -3457,6 +3896,18 @@ Call: todowrite(task_id=3, status="in_progress")
     }
 
     #[test]
+    fn streamed_websearch_args_strip_arg_key_value_wrappers() {
+        let parsed = parse_streamed_tool_args(
+            "websearch",
+            "query</arg_key><arg_value>taj card what is it benefits how to apply</arg_value>",
+        );
+        assert_eq!(
+            parsed.get("query").and_then(|v| v.as_str()),
+            Some("taj card what is it benefits how to apply")
+        );
+    }
+
+    #[test]
     fn normalize_tool_args_websearch_infers_from_user_text() {
         let normalized =
             normalize_tool_args("websearch", json!({}), "web search meaning of life", "");
@@ -3491,6 +3942,49 @@ Call: todowrite(task_id=3, status="in_progress")
         assert!(normalized.missing_terminal);
         assert_eq!(normalized.args_source, "missing");
         assert_eq!(normalized.args_integrity, "empty");
+    }
+
+    #[test]
+    fn normalize_tool_args_webfetch_infers_url_from_user_prompt() {
+        let normalized = normalize_tool_args(
+            "webfetch",
+            json!({}),
+            "Please fetch `https://tandem.frumu.ai/docs/` in markdown mode",
+            "",
+        );
+        assert!(!normalized.missing_terminal);
+        assert_eq!(
+            normalized.args.get("url").and_then(|v| v.as_str()),
+            Some("https://tandem.frumu.ai/docs/")
+        );
+        assert_eq!(normalized.args_source, "inferred_from_user");
+        assert_eq!(normalized.args_integrity, "recovered");
+    }
+
+    #[test]
+    fn normalize_tool_args_webfetch_recovers_nested_url_alias() {
+        let normalized = normalize_tool_args(
+            "webfetch",
+            json!({"args":{"uri":"https://example.com/page"}}),
+            "",
+            "",
+        );
+        assert!(!normalized.missing_terminal);
+        assert_eq!(
+            normalized.args.get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/page")
+        );
+        assert_eq!(normalized.args_source, "provider_json");
+    }
+
+    #[test]
+    fn normalize_tool_args_webfetch_fails_when_url_unrecoverable() {
+        let normalized = normalize_tool_args("webfetch", json!({}), "fetch the site", "");
+        assert!(normalized.missing_terminal);
+        assert_eq!(
+            normalized.missing_terminal_reason.as_deref(),
+            Some("WEBFETCH_URL_MISSING")
+        );
     }
 
     #[test]
@@ -3540,20 +4034,18 @@ Call: todowrite(task_id=3, status="in_progress")
     }
 
     #[test]
-    fn normalize_tool_args_read_infers_path_from_assistant_context() {
+    fn normalize_tool_args_read_does_not_infer_path_from_assistant_context() {
         let normalized = normalize_tool_args(
             "read",
             json!({}),
             "generic instruction",
             "I will read src-tauri/src/orchestrator/engine.rs first.",
         );
-        assert!(!normalized.missing_terminal);
+        assert!(normalized.missing_terminal);
         assert_eq!(
-            normalized.args.get("path").and_then(|v| v.as_str()),
-            Some("src-tauri/src/orchestrator/engine.rs")
+            normalized.missing_terminal_reason.as_deref(),
+            Some("FILE_PATH_MISSING")
         );
-        assert_eq!(normalized.args_source, "inferred_from_context");
-        assert_eq!(normalized.args_integrity, "recovered");
     }
 
     #[test]
@@ -3700,6 +4192,43 @@ Call: todowrite(task_id=3, status="in_progress")
             normalized.missing_terminal_reason.as_deref(),
             Some("FILE_PATH_MISSING")
         );
+    }
+
+    #[test]
+    fn normalize_tool_args_read_rejects_placeholder_path() {
+        let normalized = normalize_tool_args("read", json!({"path":"files/directories"}), "", "");
+        assert!(normalized.missing_terminal);
+        assert_eq!(
+            normalized.missing_terminal_reason.as_deref(),
+            Some("FILE_PATH_MISSING")
+        );
+    }
+
+    #[test]
+    fn normalize_tool_args_read_rejects_tool_policy_placeholder_path() {
+        let normalized = normalize_tool_args("read", json!({"path":"tool/policy"}), "", "");
+        assert!(normalized.missing_terminal);
+        assert_eq!(
+            normalized.missing_terminal_reason.as_deref(),
+            Some("FILE_PATH_MISSING")
+        );
+    }
+
+    #[test]
+    fn normalize_tool_args_read_recovers_pdf_path_from_user_text() {
+        let normalized = normalize_tool_args(
+            "read",
+            json!({"path":"tool/policy"}),
+            "Read `T1011U kitöltési útmutató.pdf` and summarize.",
+            "",
+        );
+        assert!(!normalized.missing_terminal);
+        assert_eq!(
+            normalized.args.get("path").and_then(|v| v.as_str()),
+            Some("T1011U kitöltési útmutató.pdf")
+        );
+        assert_eq!(normalized.args_source, "inferred_from_user");
+        assert_eq!(normalized.args_integrity, "recovered");
     }
 
     #[test]

@@ -18,7 +18,13 @@ impl AgentPrompts {
         objective: &str,
         workspace_summary: &str,
         constraints: &PlannerConstraints,
+        analysis_summary: Option<&str>,
     ) -> String {
+        let analysis_section = analysis_summary
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|summary| format!("\n## Planning Analysis\n{}\n", summary))
+            .unwrap_or_default();
         format!(
             r#"You are a Planning Agent for a multi-agent orchestration system.
 
@@ -29,10 +35,11 @@ Create a task plan to accomplish the following objective:
 
 ## Workspace Context
 {workspace_summary}
+{analysis_section}
 
 ## Constraints
 - Maximum tasks: {max_tasks}
-- Available tools: read_file, write_file, search, apply_patch
+- Available tools: glob, read, write, edit, apply_patch, websearch, webfetch, webfetch_html, codesearch
 - Research enabled: {research_enabled}
 
 ## Output Format
@@ -82,12 +89,47 @@ Example:
    (avoid repeated local shell discovery loops; use web research and produce concrete starter artifacts)
 8. The first wave of work should include multiple runnable tasks whenever objective scope allows it.
    Only final synthesis/integration tasks should depend on many prior tasks.
+9. If local sources are sparse (for example one PDF and little else) but objective needs broader requirements/context:
+   - include explicit web research tasks using `websearch` + `webfetch`
+   - still include explicit local extraction tasks for the primary source file(s)
+   - include concrete artifact-writing tasks (`write`/`edit`/`apply_patch`) for final deliverables.
 
 Output ONLY the JSON array, no other text."#,
             objective = objective,
             workspace_summary = workspace_summary,
+            analysis_section = analysis_section,
             max_tasks = constraints.max_tasks,
             research_enabled = constraints.research_enabled,
+        )
+    }
+
+    pub fn build_planner_analysis_prompt(objective: &str, workspace_summary: &str) -> String {
+        format!(
+            r#"You are an Analysis Agent preparing context for an orchestrator planner.
+
+## Objective
+{objective}
+
+## Workspace Context
+{workspace_summary}
+
+## Your Job
+Produce a concise analysis that will help planning quality.
+
+Required sections:
+1. Scope interpretation
+2. Files/areas likely involved
+3. Risks and unknowns
+4. Candidate milestones
+5. Suggested parallelization opportunities
+
+Rules:
+- Be concrete and evidence-based from the provided workspace context.
+- Do not output JSON.
+- Keep it concise (max ~350 words).
+"#,
+            objective = objective,
+            workspace_summary = workspace_summary,
         )
     }
 
@@ -95,8 +137,14 @@ Output ONLY the JSON array, no other text."#,
     pub fn build_builder_prompt(
         task: &Task,
         file_context: &str,
+        context_pack_summary: Option<&str>,
         previous_output: Option<&str>,
     ) -> String {
+        let context_pack_section = context_pack_summary
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("\n## Continuation Context\n{}\n", s))
+            .unwrap_or_default();
         let previous_section = previous_output
             .map(|o| format!("\n## Previous Attempt Output\n{}\n", o))
             .unwrap_or_default();
@@ -114,6 +162,7 @@ Output ONLY the JSON array, no other text."#,
 
 ## Relevant Files
 {file_context}
+{context_pack_section}
 {previous_section}
 ## Output Requirements
 1. Make the necessary code changes to complete this task
@@ -147,6 +196,7 @@ Complete this task now."#,
                 .collect::<Vec<_>>()
                 .join("\n"),
             file_context = file_context,
+            context_pack_section = context_pack_section,
             previous_section = previous_section,
         )
     }
@@ -156,9 +206,13 @@ Complete this task now."#,
         task: &Task,
         changes_diff: &str,
         build_output: Option<&str>,
+        changed_file_evidence: Option<&str>,
     ) -> String {
         let build_section = build_output
             .map(|o| format!("\n## Build/Test Output\n```\n{}\n```\n", o))
+            .unwrap_or_default();
+        let evidence_section = changed_file_evidence
+            .map(|o| format!("\n## Changed File Evidence\n{}\n", o))
             .unwrap_or_default();
 
         format!(
@@ -177,8 +231,12 @@ Complete this task now."#,
 {diff}
 ```
 {build_section}
+{evidence_section}
 ## Your Job
 Evaluate whether the changes satisfy ALL acceptance criteria.
+Use the changed-file evidence and diff entries as primary proof.
+If acceptance criteria require specific document sections or findings, verify those sections are present in file evidence.
+If evidence is insufficient to verify completion, return `"passed": false` and explain exactly what is missing.
 
 ## Output Format
 You MUST output a JSON object with:
@@ -215,6 +273,7 @@ Be strict but fair. Output ONLY the JSON object."#,
                 .join("\n"),
             diff = changes_diff,
             build_section = build_section,
+            evidence_section = evidence_section,
         )
     }
 

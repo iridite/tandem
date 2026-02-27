@@ -20,6 +20,12 @@ cd examples/vps-web-portal
 sudo TANDEM_STATE_DIR=/srv/tandem bash setup-vps.sh
 ```
 
+To keep the engine sandbox limited to `TANDEM_STATE_DIR` only (no `/home/$USER` access), run:
+
+```bash
+sudo TANDEM_ALLOW_HOME_ACCESS=0 bash ./setup-vps.sh
+```
+
 Optional: pre-create `.env` in this folder with provider keys (`OPENROUTER_API_KEY`, etc.).  
 The script merges those into `/etc/tandem/engine.env` automatically.
 
@@ -77,10 +83,11 @@ using the invoking user (via `SUDO_USER`) and discovered absolute binary paths a
 
 Tool resolution is deterministic and does not depend on interactive shell startup files (`.bashrc`, `.profile`):
 
-1. Prefer `pnpm` (`PNPM_HOME`, user-local and common system paths, then `corepack pnpm`).
-2. Fallback to `npm` if `pnpm` is not available.
-3. Resolve `node` and `tandem-engine` from absolute paths for use in systemd `ExecStart`.
-4. If no standalone `tandem-engine` binary is usable, fallback to `npx -y @frumu/tandem`.
+1. Prefer `npm` for `@frumu/tandem` global install (ensures native postinstall runs consistently).
+2. Fallback to `pnpm` only when explicitly enabled with `SETUP_ALLOW_PNPM_FALLBACK=1`.
+3. Refresh `@frumu/tandem` to `@latest` on each setup run (disable with `SETUP_ENGINE_AUTO_UPDATE=0`).
+4. Resolve `node` and `tandem-engine` from absolute paths for use in systemd `ExecStart`.
+5. If no standalone `tandem-engine` binary is usable, fallback to `npx -y @frumu/tandem`.
 
 Or follow the manual steps below.
 
@@ -115,6 +122,7 @@ Create `/etc/tandem/engine.env`:
 sudo mkdir -p /etc/tandem
 TANDEM_API_TOKEN=your-generated-tandem-token-here
 TANDEM_STATE_DIR=/srv/tandem
+TANDEM_MEMORY_DB_PATH=/srv/tandem/memory.sqlite
 ```
 
 For persistent provider keys (recommended on VPS), use the template in this folder:
@@ -157,7 +165,7 @@ Navigate to the project directory and install the required dependencies:
 
 ```bash
 cd vps-web-portal
-pnpm install
+npm install
 ```
 
 ### Environment Configuration
@@ -183,13 +191,13 @@ Use this section only if you are not running `setup-vps.sh`.
 Build the Vite React frontend for production:
 
 ```bash
-pnpm run build
+npm run build
 ```
 
 Start the Node.js Express server to host the application. We recommend using PM2 to keep the server alive forever:
 
 ```bash
-pnpm install -g pm2
+npm install -g pm2
 pm2 start npm --name "tandem-portal" -- run start
 ```
 
@@ -223,6 +231,9 @@ On first login (or when no provider/model is configured), the portal now opens a
 2. Enter an API key (if required)
 3. Pick a default model
 
+The new **Ops** workspace is available immediately after login (it does not require provider setup),
+so you can manage missions, automations/routines, MCP, channels, and agent-team controls even before model defaults are set.
+
 Storage behavior:
 
 - Provider API keys are sent via engine runtime auth (`PUT /auth/{provider}`), which is runtime-only.
@@ -241,6 +252,33 @@ For production persistence across restarts:
 3. **Interactive RPG:** An AI Text Adventure game demonstrating the `Questions API` over Streaming SSE.
 4. **Second Brain:** Grant an agent local system context using Local MCP (Model Context Protocol).
 5. **Connectors:** Setup Slack, Discord, or Telegram bots so your team can @ the engine directly.
+6. **Ops Workspace:** Unified mission/automation/MCP/agent-team/channel control center with live global events, run artifact browser, and engine process controls.
+
+### Ops Workspace Highlights
+
+- Full mission lifecycle controls (`/mission`, `/mission/{id}`, `/mission/{id}/event`)
+- Dual automation compatibility (`/automations/*` and `/routines/*`)
+- Agent-team operations (`/agent-team/*`) including spawn approvals and cancellation
+- MCP lifecycle and tool visibility (`/mcp/*`, `/mcp/tools`, `/tool/ids`)
+- Channel config + status (`/channels/config`, `/channels/status`, `/channels/{name}`)
+- Unified live SSE stream view (`/global/event`)
+- Run artifact browser (`/{automations|routines}/runs/{id}/artifacts`) with safe local preview
+- Engine process controls via portal backend (`/portal/system/engine/*`)
+
+### Engine Process Controls (systemd)
+
+`setup-vps.sh` now installs:
+
+- `/usr/local/bin/tandem-engine-ctl` (restricted helper: `status|start|stop|restart`)
+- `/etc/sudoers.d/tandem-portal-engine-control` (passwordless execution only for that helper)
+
+Portal `.env` includes:
+
+- `TANDEM_SYSTEM_CONTROL_MODE=systemd`
+- `TANDEM_ENGINE_SERVICE_NAME=tandem-engine.service`
+- `TANDEM_ENGINE_CONTROL_SCRIPT=/usr/local/bin/tandem-engine-ctl`
+- `TANDEM_ARTIFACT_READ_ROOTS=/srv/tandem`
+- `TANDEM_PORTAL_MAX_ARTIFACT_BYTES=1048576`
 
 ## Security Note
 

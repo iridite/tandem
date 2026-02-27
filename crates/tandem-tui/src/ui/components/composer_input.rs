@@ -18,6 +18,10 @@ impl ComposerInputState {
         &self.text
     }
 
+    pub fn cursor_byte_index(&self) -> usize {
+        self.cursor
+    }
+
     pub fn set_text(&mut self, text: String) {
         self.text = text;
         self.cursor = self.clamp_boundary(self.cursor.min(self.text.len()));
@@ -63,6 +67,22 @@ impl ComposerInputState {
         self.text.drain(self.cursor..next);
     }
 
+    pub fn remove_range(&mut self, start: usize, end: usize) {
+        if start >= end || end > self.text.len() {
+            return;
+        }
+        if !self.text.is_char_boundary(start) || !self.text.is_char_boundary(end) {
+            return;
+        }
+        self.text.drain(start..end);
+        if self.cursor > end {
+            self.cursor = self.cursor.saturating_sub(end - start);
+        } else if self.cursor > start {
+            self.cursor = start;
+        }
+        self.cursor = self.clamp_boundary(self.cursor);
+    }
+
     pub fn move_left(&mut self) {
         self.cursor = self.prev_boundary(self.cursor);
     }
@@ -106,10 +126,10 @@ impl ComposerInputState {
             return 3;
         }
         let inner_width = (width - 2) as usize;
-        let mut rows = 1usize;
+        let mut rows = 0usize;
         for line in self.text.split('\n') {
             let chars = line.chars().count().max(1);
-            rows += (chars - 1) / inner_width;
+            rows += ((chars - 1) / inner_width) + 1;
         }
         let content_rows = rows.clamp(1, 6) as u16;
         (content_rows + 2).clamp(3, 8)
@@ -247,5 +267,14 @@ mod tests {
         let h = c.desired_height(40);
         assert!(h <= 8);
         assert!(h >= 3);
+    }
+
+    #[test]
+    fn desired_height_grows_for_newlines() {
+        let mut one = ComposerInputState::new();
+        one.insert_str("line1");
+        let mut two = ComposerInputState::new();
+        two.insert_str("line1\nline2");
+        assert!(two.desired_height(80) > one.desired_height(80));
     }
 }

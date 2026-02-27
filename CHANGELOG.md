@@ -5,10 +5,181 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.8]
+## [0.3.22] - 2026-02-26
 
 ### Added
 
+- **Engine-first context-driving runtime surfaces**: Expanded context-run APIs and client wiring for event replay, checkpoint access, deterministic next-step selection, and todo->step synchronization so Desktop/TUI consume the same engine-owned truth.
+- **Desktop Blackboard panel system**: Added shared Blackboard panel module for Orchestrator + Command Center with docked/expanded/fullscreen modes, decision lineage views, drift details drawer, search/filter controls, and keyboard-first navigation.
+- **Blackboard contract test suite**: Added dedicated `test:blackboard` coverage for projection/filtering, follow-mode state transitions, refresh policy, and drift drawer state behavior.
+
+### Changed
+
+- **Blackboard refresh behavior**: Switched to debounced event-driven blackboard refresh with sequence watermarking (`last_blackboard_refresh_seq`) and relevant-event family gating to reduce redundant fetch pressure during long runs.
+- **Orchestrator/Command Center parity**: Unified both surfaces on shared blackboard UI/state/policy helpers to keep behavior consistent across run-control entrypoints.
+- **Two-pass orchestrator planning**: Planning now performs an analysis pass before DAG generation to improve task quality and reduce low-context first plans.
+- **Context-aware execution prompts**: Builder prompts now include continuation context from context-pack summaries so retries/resumes stay on-track instead of restarting from scratch.
+- **Planner tool contract alignment**: Planner prompt tool inventory now matches actual runtime tools (`glob/read/write/edit/apply_patch/websearch/webfetch/webfetch_html/codesearch`) and explicitly plans web research when local source material is sparse.
+- **Tool path normalization hardening**: File-path normalization now rejects synthetic placeholders like `files/directories` and `tool/policy`, recognizes document extensions (`.pdf/.docx/.pptx/.xlsx/.rtf`), and avoids deriving file paths from assistant narrative context.
+- **Release metadata bump**: Updated app/runtime package versions to `0.3.22` for desktop/TUI release alignment.
+
+### Fixed
+
+- **Follow-mode predictability**: Follow now auto-focuses only on new `meta_next_step_selected` decisions and pauses on manual navigation, preventing jumpy recentering on unrelated event noise.
+- **Drift/debug visibility**: Added actionable drift and checkpoint navigation affordances with copyable debug payloads for incident triage.
+- **Task/session continuity on restart and retry**: Orchestrator now restores task session bindings from checkpoints and preserves failed-task session context by default during retry.
+- **Planning/execution token accounting visibility**: Budget token usage now records prompt+response estimates for planner analysis/planner/builder/validator calls, preventing misleading near-zero token displays.
+- **Blackboard event coverage for engine runs**: Blackboard projection and refresh logic now recognize orchestrator event families (for example `context_pack_built`, planning/task/run events), improving live context visibility in both Orchestrator and Command Center.
+- **Write-required task fail-fast behavior**: Orchestrator now fails fast with explicit errors when builder recovery performs no tool calls or only read-only tool calls on tasks that require file modifications.
+- **Read/write sandbox diagnostics and Windows path handling**: Tool path policy now accepts Windows verbatim paths (`\\?\...`) when in-workspace, performs lexical in-workspace checks for non-existent targets, and returns actionable denied-path diagnostics (workspace root/effective cwd/suggested path).
+- **Read tool error transparency**: `read` now returns explicit failure reasons (`path_not_found`, `path_is_directory`, `read_text_failed`) instead of silent empty output, reducing retry loops and validator misclassification.
+- **Blackboard task-trace visibility**: Blackboard projection/filtering/refresh now includes `task_trace` events (for example `FIRST_TOOL_CALL: glob`) and Orchestrator surfaces paused-run error context directly in the panel.
+- **Validator evidence gating for file-output tasks**: Validation prompts now include concrete snippets from changed files and explicitly fail when completion is claimed without verifiable output content.
+- **Malformed required-arg tool-call fast timeout**: Pending tool calls that likely omitted required args (for example repeated `read {}`) now time out quickly instead of hanging for long watchdog windows.
+- **Provisional tool-start timeout guardrails**: Provisional/partial tool starts (for example `read` before finalized args arrive) no longer trigger the malformed-args fast-timeout path, reducing false `TOOL_TIMEOUT` failures during streamed tool-call assembly.
+- **Sidecar `run_conflict` recovery**: Message send/start-run now honors `retryAfterMs` and retries conflict responses instead of surfacing immediate hard failures during active-run handoff.
+- **Stale active-run conflict breaker**: Repeated `run_conflict` responses for the same active run now trigger active-run probing and targeted cancellation of stale runs, preventing long conflict retry loops and session thrash.
+- **Provider stream failure classification**: Server now maps upstream provider stream/server failures to structured `PROVIDER_SERVER_ERROR` codes for clearer diagnostics and retry behavior.
+
+## [0.3.21]
+
+### Changed
+
+- **Global storage path standardization**: Unified global Tandem state fallbacks across engine/runtime/server/channels/skills/core to OS-native app-data roots (`.../tandem`) with consistent `data`/security/config placement and reduced ad-hoc relative-path defaults.
+- **Global storage override support**: Added `TANDEM_HOME` support to shared storage path resolution so operators can pin a canonical global Tandem root explicitly in CI/server environments.
+
+### Fixed
+
+- **Crates publish-order dependency gap**: Added `crates/tandem-agent-teams` to deterministic publish-order manifests/scripts before `crates/tandem-tools`, preventing crates.io publish failures from unresolved intra-release dependency lookup.
+
+## [0.3.20] - 2026-02-25
+
+### Changed
+
+- **TUI agent fanout mode handoff**: `/agent fanout` now auto-switches `plan -> orchestrate` before teammate delegation to reduce plan-mode gating/approval churn during coordinated multi-agent runs.
+- **TUI agent-team workflow integration**: Added coordinated fanout team bootstrapping (`TeamCreate` + delegated `task` routing), mailbox/member session binding, and teammate-target normalization (`A2`/`a2`/`agent-2`) to improve local team execution consistency.
+
+### Fixed
+
+- **TUI small-paste readability and composer rendering**: Small pastes (1-2 lines) now insert directly without `[Pasted ...]` tokens, CRLF is normalized, and composer height now expands correctly for explicit newlines (fixes overlapped/cropped second-line input rendering).
+- **OpenAI-compatible stream parsing robustness (OpenRouter, tool flows)**: Provider streaming now accepts both `choices[].delta` and `choices[].message` payload shapes for text and tool-call fields, preventing empty assistant replies and missed tool execution when providers return non-delta message chunks.
+- **Provider token-budget safety default**: OpenAI-compatible provider requests now set an explicit bounded `max_tokens` default (`2048`, overridable via `TANDEM_PROVIDER_MAX_TOKENS`) to prevent accidental large-budget requests (for example `65536`) that trigger 402 credit failures on simple prompts/tool invocations.
+
+## [0.3.19]
+
+### Changed
+
+- **VPS Stress Lab parity upgrade**: Server-side stress scenarios (`remote`, `file`, `inline`) now execute true async run flows and wait for run completion, aligning Tandem latency measurement with end-to-end provider/tool execution instead of submission-only timing.
+- **Cross-system benchmark comparison in portal**: Added OpenCode benchmark ingestion (`latest`, `history`, `by-date`, `health`) and in-UI Tandem vs OpenCode delta reporting for matched stress scenarios.
+- **OpenCode benchmark runtime mode**: Added warm attached execution support (`opencode serve` + `run --attach`) to avoid cold-start CLI overhead during repeated benchmark runs.
+- **Portal Caddy/API routing compatibility**: Standardized `/api/v1` compatibility behavior and health endpoint support for external benchmark-service integration.
+- **TUI interaction model and keyboard UX refresh**: Updated request-center/question handling, mode/status highlighting, sessions UX hints, and command ergonomics (including agent fanout and session delete affordances) for clearer in-terminal workflows.
+- **TUI dependency/runtime modernization**: Migrated terminal stack to `ratatui 0.30`/`crossterm 0.29`, replaced third-party throbber dependency with local spinner components, and aligned render paths for better cross-platform behavior.
+
+### Fixed
+
+- **Engine request observability coverage**: Added explicit timing/slow-request instrumentation for `session.command`, `session.get`, and `session.list` server routes to improve bottleneck diagnosis under load.
+- **Stress chart rendering stability**: Fixed NaN polyline generation in Stress Lab line charts when metric series are all-zero or sparsely initialized.
+- **Server-side model selection for stress runs**: Portal server stress runner now resolves and injects an explicit provider/model for prompt scenarios, preventing misleading providerless-like latency readings in LLM tests.
+- **TUI plan/request deadlock and queue conflicts**: Fixed several plan-mode edge cases that could cause repeated `409 session has active run` loops after question/approval handoffs by routing follow-up prompts through safe queue semantics.
+- **TUI question answer fidelity and visibility**: Fixed option selection/confirm behavior in compact request mode and added explicit confirmation output showing submitted question answers.
+- **TUI paste reliability on Windows**: Added burst-aware paste handling with tokenized placeholders to prevent accidental line-by-line replay, unintended submits, and input corruption during large clipboard pastes.
+- **TUI session/task persistence parity**: Restored task reconstruction when re-opening historical sessions by broadening tool-part parsing (`tool`, `tool_call`, `tool_use` forms), so plan sessions reopen with their task lists instead of plain chat-only views.
+
+## [0.3.18]
+
+### Fixed
+
+- **Provider model override from env API-key bootstrap**: Setting `OPENROUTER_API_KEY` no longer forces `providers.openrouter.default_model` to `openai/gpt-4o-mini` in the env layer.
+- **Model-selection persistence in VPS/web deployments**: Engine now preserves configured provider default model (for example `z-ai/glm-5`) unless an explicit model env var is set.
+- **Config env-layer behavior clarity**: OpenAI-compatible env bootstrap now treats API key and model override separately; model override is applied only when explicitly provided via env.
+
+## [0.3.17]
+
+### Changed
+
+- **Channel session bootstrap defaults**: Channel-created sessions now include a practical default permission set so long-running channel workflows do not silently stall waiting for hidden permission prompts.
+- **Channel SSE attach strategy**: Channel run streaming now subscribes at the session level for better compatibility with engines that emit session-scoped events.
+- **Portal run observability UX**: Web example dashboards now include richer watchdog/runtime traces and clearer status transitions around stream-ready, run-activity, and poll-finalized completion paths.
+
+### Fixed
+
+- **Run stream event parsing for channels**: Channel dispatcher now consumes `message.part.updated` text deltas and additional terminal run lifecycle variants, improving reply reliability in chat connectors.
+- **Telegram diagnostics quality**: Telegram adapter now logs richer poll failure diagnostics (debug transport context + non-success HTTP status/body preview) for production debugging.
+- **Permission/approval visibility in portal**: Added global pending-approval visibility and one-click approval action in the portal shell, plus clearer no-pending messaging.
+- **Portal SSE reliability in examples**: Web examples now prefer session-level event streaming to avoid runs appearing as `connected/ready` with no live deltas.
+
+## [0.3.16]
+
+### Fixed
+
+- **What's New release-note mismatch**: Desktop now fetches release notes for the installed app tag from GitHub at runtime instead of relying on a hardcoded local markdown import.
+- **Safe fallback behavior**: If release-note fetch fails or a version body is unavailable, the What's New overlay shows no stale notes and links users to the latest GitHub release page.
+- **Plan task execution integrity**: "Execute Pending Tasks" now uses a strict completion contract and validates task completion from actual `todowrite`-driven todo status updates, not assistant text claims.
+- **Pending-task payload correctness**: Chat execution now receives pending-only tasks (instead of all todos), so execution prompts and sidebar counts stay consistent.
+
+## [0.3.15]
+
+### Added
+
+- **Channel slash-command expansion**: Added new channel commands for run control and observability:
+  - `/run`
+  - `/cancel` (and `/abort` alias)
+  - `/todos` (and `/todo` alias)
+  - `/requests`
+  - `/answer <question_id> <text>`
+  - `/providers`
+  - `/models [provider]`
+- **Channel model switching**: Added `/model <model_id>` to update the default provider's active model from connected chat channels without requiring provider/token switching flows.
+
+### Changed
+
+- **Channel command docs**: Updated channel integration docs/help text to reflect expanded command coverage and model control from chat channels.
+- **Provider settings model UX**: Anthropic/OpenAI settings now use text-input-first model selection with updated current model suggestions and clearer provider-specific placeholders.
+
+### Fixed
+
+- **Custom provider config sync (llama-swap/OpenAI-compatible)**: Desktop now writes enabled custom provider endpoint/model into engine config (`providers.custom`) and updates default-provider routing when custom is selected.
+- **Custom provider registry support**: Engine provider registry now accepts custom/non-built-in provider IDs from config instead of falling back to `local` only.
+- **Custom endpoint normalization hardening**: OpenAI-compatible base URL normalization now handles trailing `/v1`, repeated `/v1/v1`, and full-path inputs (for example `/v1/chat/completions`) to prevent malformed request URLs.
+- **Transient provider reachability resilience**: Added short retry behavior for connection/timeout failures when calling OpenAI-compatible providers, reducing one-off local gateway startup hiccups.
+- **Settings save feedback**: Saving Custom Provider in Settings now shows explicit success/error feedback instead of silently completing with no user confirmation.
+- **Provider error diagnostics**: Provider call failures now include clearer endpoint + failure-category guidance (`connection error` / `timeout`) to speed up local gateway troubleshooting.
+
+## [0.3.14]
+
+### Fixed
+
+- **Endless sidecar update prompt hotfix**: Desktop now avoids preferring stale AppData sidecar binaries when the bundled engine version is newer, preventing false "you have v0.3.0" update loops after upgrading.
+- **Version label rendering**: Update UI normalizes engine version labels to avoid duplicated prefixes like `vv0.3.12`.
+
+## [0.3.12]
+
+### Fixed
+
+- **MCP runtime compatibility hotfix**: Desktop now falls back to MCP server `tool_cache` via `GET /mcp` when legacy/mixed engine builds return `404` for `GET /mcp/tools`, preventing Extensions MCP tab load failures (`Failed to load MCP runtime`).
+- **Registry publish pipeline ordering**: Fixed crates publish order and dependency coverage in CI scripts/workflow so tandem workspace crate dependencies publish in valid sequence.
+
+## [0.3.11]
+
+### Changed
+
+- **Provider model selection now catalog-backed in Settings**: OpenAI, Anthropic, and OpenCode Zen settings now prefer live engine catalog model IDs when available instead of static-only model lists.
+
+### Fixed
+
+- **Custom provider routing and validation (#14)**: Fixed `custom` provider resolution in desktop Tauri routing so explicit custom provider/model selections dispatch correctly for chat and automation flows.
+- **Custom provider selection persistence**: Saving/enabling a custom provider now updates `providers_config.selected_model` when a model is provided, preventing silent fallback to unrelated provider/model selections.
+- **Release notes fallback in Settings**: Release notes now fall back to updater `latest.json` metadata when GitHub Releases API fetch fails.
+- **Bundled sidecar version reporting**: Sidecar updater status now reports bundled-engine version from app package metadata, avoiding stale beta values from old downloaded sidecar records.
+
+## [0.3.9]
+
+### Added
+
+- **Memory Consolidation**: Added opt-in LLM summarization of session memory using the cheapest available configured provider (prioritizing local/free options like Ollama, Groq, OpenRouter).
+- **Channel Tool Policy**: Added explicit policy controls (`allow_all`, `deny_all`, `require_approval`) for tool execution in messaging channels, configurable via `config.json` or `TANDEM_CHANNEL_TOOL_POLICY` env var.
+- **Richer Channel Session Metadata**: Upgraded channel session tracking to persist detailed `SessionRecord` metadata (created/last-seen timestamps, channel, sender) instead of bare IDs.
 - **Headless Web Admin UI (embedded, single-file)**: Added an embedded `/admin` web interface served directly by `tandem-server` using a baked-in `admin.html` shell (no external assets/build pipeline at runtime).
 - **Realtime Admin UX**: Added SSE-driven UI refresh behavior (with polling fallback) for channel/session/memory visibility in the headless admin surface.
 - **Channel Admin API surface**: Added channel-management endpoints for headless control:
@@ -31,6 +202,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Shared memory DB auto-wiring in engine**: `tandem-engine` now auto-configures `TANDEM_MEMORY_DB_PATH` to the shared Tandem `memory.sqlite` path when unset, aligning connected app/tool memory access by default.
 - **Engine host runtime context contract**: Added shared `HostRuntimeContext` (`os`, `arch`, `shell_family`, `path_style`) in shared types/wire payloads and surfaced it through engine health/session/run metadata.
 - **Server run-start environment observability**: `session.run.started` lifecycle events now include canonical engine environment metadata for cross-client parity.
+- **MCP Automated Agents surface (Desktop)**: Added a dedicated `Agent Automation` page (robot-nav entry) for connector operations, scheduled routine wiring, and run triage separate from Command Center orchestration.
+- **Mission Workshop (Desktop)**: Added in-page mission drafting assistance that converts plain-language goals into routine objective, success criteria, and suggested execution mode.
+- **Ready-made automation templates**: Added starter templates for daily research, issue triage, and release reporting with built-in `webfetch_document` inclusion patterns.
+- **Automation run observability UX**: Added per-run event rail chips (`Plan/Do/Verify/Approval/Blocked/Failed`), run filters (`All/Pending/Blocked/Failed`), and run details panel (timeline/reasons/outputs/artifacts).
+- **Automation model routing controls**: Added provider/model selection and preset-based model routing for standalone + orchestrated automations, including role model hints for orchestrator/planner/worker/verifier/notifier.
+- **Automation model-selection run events**: Added `routine.run.model_selected` emission so selected provider/model and selection source are visible in run streams.
 
 ### Changed
 
@@ -46,6 +223,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Engine prompt assembly (OS-aware)**: `tandem-core` now prepends a deterministic `[Execution Environment]` block (engine-detected OS/shell/path style) to model runs by default (`TANDEM_OS_AWARE_PROMPTS` toggle).
 - **Canonical OS authority policy**: Runtime behavior now trusts engine-detected host environment as the source of truth rather than client-provided OS hints.
 - **Engine health diagnostics**: `/global/health` now exposes `environment` metadata for troubleshooting and external clients.
+- **Routines/automations API compatibility in sidecar bridge**: Desktop routine calls now gracefully fall back to legacy `/routines` endpoints when `/automations` returns `404`, enabling mixed-version app/engine operation.
+- **Automation docs expansion**: Added setup and usage guidance for MCP automated agents, provider notes (Arcade/Composio), headless “just run” flow, model-routing examples, and release-readiness test checklist.
 
 ### Fixed
 
@@ -53,6 +232,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Workspace/path error taxonomy**: Replaced broad Windows `os error 3` pause messaging with clearer classification (`WORKSPACE_NOT_FOUND`, path-not-found fail-fast) so runs stop/recover deterministically.
 - **Orchestrator retry-loop suppression**: Invalid tool args and path-not-found failures now fail task attempts directly instead of repeatedly re-queuing.
 - **Task session workspace pinning**: Child task sessions are now pinned to the orchestrator workspace path, with preflight checks before session creation.
+- **Workspace switch propagation (CC-001)**: New runs now persist canonical `workspace_root` and inject explicit workspace/cwd into tool execution so file ops resolve against the selected Command Center workspace (not stale process CWD).
+- **Workspace hot-switch engine invalidation (CC-001)**: Switching active project now invalidates stale in-memory orchestrator engines bound to other workspaces, preventing cross-workspace drift in subsequent runs.
+- **Selected Run objective readability (CC-002)**: Added inline objective truncation with `Show more` / `Show less` toggle so large prompts no longer overwhelm the Selected Run panel by default.
+- **Runs list status visibility (CC-003)**: Runs now surface status badges, start/end timestamps, and last-error snippets in Command Center for faster state triage without digging through logs.
 - **Tool timeout resilience for file ops**: Increased `read`/`write` tool timeouts to reduce premature synthetic terminal errors on larger workspaces.
 - **Tool history ID collision fix**: Tool execution IDs now include session/message/part context (not just `part_id`) to prevent cross-session overwrite/correlation drift.
 - **Structured stream error codes**: Stream tool/session terminal events now carry optional `error_code` metadata for clearer diagnostics in orchestrator + UI.
@@ -77,6 +260,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Windows shell mismatch loops**: Expanded Windows shell guardrails to translate common Unix patterns, block unsafe Unix-only commands with structured guidance, and emit `os_guardrail_applied`/`guardrail_reason` metadata.
 - **OS mismatch retry suppression**: Engine loop now suppresses repeated identical shell calls after path/shell mismatch signatures and steers model/tool flow toward cross-platform tools (`read`, `glob`, `grep`).
 - **OS mismatch error taxonomy**: Server dispatch now classifies common path/shell mismatch failures as `OS_MISMATCH` for clearer diagnostics.
+- **Automation endpoint 404 startup noise**: Reduced desktop sidecar error loops/circuit-breaker churn when new automation routes are unavailable on older engines via endpoint fallback handling.
+- **Automation model policy validation**: Hardened create/patch validation for `model_policy` shape (`default_model`, `role_models.*` with required `provider_id` + `model_id`) and explicit clear semantics (`model_policy: {}` on patch).
 
 ## [0.3.7] - 2026-02-18
 
@@ -884,7 +1069,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Project-based organization
 - Real-time streaming responses
 
-[0.3.8]: https://github.com/frumu-ai/tandem/compare/v0.3.7...HEAD
+[0.3.17]: https://github.com/frumu-ai/tandem/compare/v0.3.16...HEAD
+[0.3.16]: https://github.com/frumu-ai/tandem/compare/v0.3.15...v0.3.16
+[0.3.15]: https://github.com/frumu-ai/tandem/compare/v0.3.14...v0.3.15
+[0.3.14]: https://github.com/frumu-ai/tandem/compare/v0.3.13...v0.3.14
+[0.3.12]: https://github.com/frumu-ai/tandem/compare/v0.3.11...v0.3.12
+[0.3.11]: https://github.com/frumu-ai/tandem/compare/v0.3.10...v0.3.11
+[0.3.10]: https://github.com/frumu-ai/tandem/compare/v0.3.9...v0.3.10
+[0.3.9]: https://github.com/frumu-ai/tandem/compare/v0.3.7...v0.3.9
 [0.3.7]: https://github.com/frumu-ai/tandem/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/frumu-ai/tandem/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/frumu-ai/tandem/compare/v0.3.2...v0.3.5

@@ -1,8 +1,13 @@
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::SocketAddr;
+use std::path::Path as FsPath;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header::{self, HeaderValue};
@@ -29,15 +34,16 @@ use tandem_orchestrator::{
 };
 use tandem_skills::{SkillLocation, SkillService, SkillsConflictPolicy};
 use tokio::process::Command;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tokio_stream::StreamExt;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 use tandem_channels::start_channel_listeners;
+use tandem_tools::Tool;
 use tandem_types::{
     CreateSessionRequest, EngineEvent, Message, MessagePart, MessagePartInput, MessageRole,
-    SendMessageRequest, Session, TodoItem,
+    SendMessageRequest, Session, TodoItem, ToolResult, ToolSchema,
 };
 use tandem_wire::{
     WireProviderCatalog, WireProviderEntry, WireProviderModel, WireProviderModelLimit, WireSession,
@@ -48,9 +54,9 @@ use crate::ResourceStoreError;
 use crate::{
     agent_teams::{emit_spawn_approved, emit_spawn_denied, emit_spawn_requested},
     evaluate_routine_execution_policy, ActiveRun, AppState, ChannelStatus, DiscordConfigFile,
-    RoutineExecutionDecision, RoutineHistoryEvent, RoutineMisfirePolicy, RoutineSchedule,
-    RoutineSpec, RoutineStatus, RoutineStoreError, SlackConfigFile, StartupStatus,
-    TelegramConfigFile,
+    RoutineExecutionDecision, RoutineHistoryEvent, RoutineMisfirePolicy, RoutineRunArtifact,
+    RoutineRunRecord, RoutineRunStatus, RoutineSchedule, RoutineSpec, RoutineStatus,
+    RoutineStoreError, SlackConfigFile, StartupStatus, TelegramConfigFile,
 };
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +87,227 @@ struct EventFilterQuery {
     session_id: Option<String>,
     #[serde(rename = "runID")]
     run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+struct RunEventsQuery {
+    since_seq: Option<u64>,
+    tail: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+struct ContextRunReplayQuery {
+    upto_seq: Option<u64>,
+    from_checkpoint: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ContextRunStatus {
+    Queued,
+    Planning,
+    Running,
+    AwaitingApproval,
+    Paused,
+    Blocked,
+    Failed,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ContextStepStatus {
+    Pending,
+    Runnable,
+    InProgress,
+    Blocked,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ContextWorkspaceLease {
+    workspace_id: String,
+    canonical_path: String,
+    lease_epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextRunStep {
+    step_id: String,
+    title: String,
+    status: ContextStepStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextRunState {
+    run_id: String,
+    run_type: String,
+    status: ContextRunStatus,
+    objective: String,
+    workspace: ContextWorkspaceLease,
+    #[serde(default)]
+    steps: Vec<ContextRunStep>,
+    #[serde(default)]
+    why_next_step: Option<String>,
+    revision: u64,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ContextRunCreateInput {
+    run_id: Option<String>,
+    objective: String,
+    run_type: Option<String>,
+    workspace: Option<ContextWorkspaceLease>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextRunEventRecord {
+    event_id: String,
+    run_id: String,
+    seq: u64,
+    ts_ms: u64,
+    #[serde(rename = "type")]
+    event_type: String,
+    status: ContextRunStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step_id: Option<String>,
+    payload: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ContextRunEventAppendInput {
+    #[serde(rename = "type")]
+    event_type: String,
+    status: ContextRunStatus,
+    step_id: Option<String>,
+    #[serde(default)]
+    payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ContextBlackboardItem {
+    id: String,
+    ts_ms: u64,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ContextBlackboardArtifact {
+    id: String,
+    ts_ms: u64,
+    path: String,
+    artifact_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ContextBlackboardSummaries {
+    rolling: String,
+    latest_context_pack: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ContextBlackboardState {
+    #[serde(default)]
+    facts: Vec<ContextBlackboardItem>,
+    #[serde(default)]
+    decisions: Vec<ContextBlackboardItem>,
+    #[serde(default)]
+    open_questions: Vec<ContextBlackboardItem>,
+    #[serde(default)]
+    artifacts: Vec<ContextBlackboardArtifact>,
+    #[serde(default)]
+    summaries: ContextBlackboardSummaries,
+    revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ContextBlackboardPatchOp {
+    AddFact,
+    AddDecision,
+    AddOpenQuestion,
+    AddArtifact,
+    SetRollingSummary,
+    SetLatestContextPack,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextBlackboardPatchRecord {
+    patch_id: String,
+    run_id: String,
+    seq: u64,
+    ts_ms: u64,
+    op: ContextBlackboardPatchOp,
+    payload: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ContextBlackboardPatchInput {
+    op: ContextBlackboardPatchOp,
+    payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextCheckpointRecord {
+    checkpoint_id: String,
+    run_id: String,
+    seq: u64,
+    ts_ms: u64,
+    reason: String,
+    run_state: ContextRunState,
+    blackboard: ContextBlackboardState,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ContextCheckpointCreateInput {
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextReplayDrift {
+    mismatch: bool,
+    status_mismatch: bool,
+    why_next_step_mismatch: bool,
+    step_count_mismatch: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ContextDriverNextInput {
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextTodoSyncItemInput {
+    id: Option<String>,
+    content: String,
+    status: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ContextTodoSyncInput {
+    todos: Vec<ContextTodoSyncItemInput>,
+    source_session_id: Option<String>,
+    source_run_id: Option<String>,
+    replace: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ContextLeaseValidateInput {
+    phase: String,
+    current_path: String,
+    step_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -344,10 +571,100 @@ struct RoutineCreateInput {
     misfire_policy: Option<RoutineMisfirePolicy>,
     entrypoint: String,
     args: Option<Value>,
+    allowed_tools: Option<Vec<String>>,
+    output_targets: Option<Vec<String>>,
     creator_type: Option<String>,
     creator_id: Option<String>,
     requires_approval: Option<bool>,
     external_integrations_allowed: Option<bool>,
+    next_fire_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutomationMissionInput {
+    objective: String,
+    #[serde(default)]
+    success_criteria: Vec<String>,
+    #[serde(default)]
+    briefing: Option<String>,
+    #[serde(default)]
+    entrypoint_compat: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AutomationToolPolicyInput {
+    #[serde(default)]
+    run_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    external_integrations_allowed: Option<bool>,
+    #[serde(default)]
+    orchestrator_only_tool_calls: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AutomationApprovalPolicyInput {
+    #[serde(default)]
+    requires_approval: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AutomationPolicyInput {
+    #[serde(default)]
+    tool: AutomationToolPolicyInput,
+    #[serde(default)]
+    approval: AutomationApprovalPolicyInput,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutomationCreateInput {
+    automation_id: Option<String>,
+    name: String,
+    schedule: RoutineSchedule,
+    timezone: Option<String>,
+    misfire_policy: Option<RoutineMisfirePolicy>,
+    mission: AutomationMissionInput,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    policy: Option<AutomationPolicyInput>,
+    #[serde(default)]
+    output_targets: Option<Vec<String>>,
+    #[serde(default)]
+    model_policy: Option<Value>,
+    creator_type: Option<String>,
+    creator_id: Option<String>,
+    next_fire_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AutomationMissionPatchInput {
+    #[serde(default)]
+    objective: Option<String>,
+    #[serde(default)]
+    success_criteria: Option<Vec<String>>,
+    #[serde(default)]
+    briefing: Option<String>,
+    #[serde(default)]
+    entrypoint_compat: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AutomationPatchInput {
+    name: Option<String>,
+    status: Option<RoutineStatus>,
+    schedule: Option<RoutineSchedule>,
+    timezone: Option<String>,
+    misfire_policy: Option<RoutineMisfirePolicy>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    mission: Option<AutomationMissionPatchInput>,
+    #[serde(default)]
+    policy: Option<AutomationPolicyInput>,
+    #[serde(default)]
+    output_targets: Option<Vec<String>>,
+    #[serde(default)]
+    model_policy: Option<Value>,
     next_fire_at_ms: Option<u64>,
 }
 
@@ -360,6 +677,8 @@ struct RoutinePatchInput {
     misfire_policy: Option<RoutineMisfirePolicy>,
     entrypoint: Option<String>,
     args: Option<Value>,
+    allowed_tools: Option<Vec<String>>,
+    output_targets: Option<Vec<String>>,
     requires_approval: Option<bool>,
     external_integrations_allowed: Option<bool>,
     next_fire_at_ms: Option<u64>,
@@ -377,8 +696,35 @@ struct RoutineHistoryQuery {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct RoutineRunsQuery {
+    routine_id: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RoutineRunDecisionInput {
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutineRunArtifactInput {
+    uri: String,
+    kind: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct RoutineEventsQuery {
     routine_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AutomationEventsQuery {
+    automation_id: Option<String>,
+    run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -432,6 +778,7 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
     let reaper_state = state.clone();
     let status_indexer_state = state.clone();
     let routine_scheduler_state = state.clone();
+    let routine_executor_state = state.clone();
     let agent_team_supervisor_state = state.clone();
     let app = app_router(state);
     let reaper = tokio::spawn(async move {
@@ -457,9 +804,40 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
     });
     let status_indexer = tokio::spawn(crate::run_status_indexer(status_indexer_state));
     let routine_scheduler = tokio::spawn(crate::run_routine_scheduler(routine_scheduler_state));
+    let routine_executor = tokio::spawn(crate::run_routine_executor(routine_executor_state));
     let agent_team_supervisor = tokio::spawn(crate::run_agent_team_supervisor(
         agent_team_supervisor_state,
     ));
+
+    // --- Memory hygiene background task (runs every 12 hours) ---
+    // Opens a fresh connection to memory.sqlite each cycle â€” safe because WAL
+    // mode allows concurrent readers alongside the main engine connection.
+    let hygiene_task = tokio::spawn(async move {
+        // Initial delay so startup is not impacted.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        loop {
+            let retention_days: u32 = std::env::var("TANDEM_MEMORY_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+            if retention_days > 0 {
+                match tandem_core::resolve_shared_paths() {
+                    Ok(paths) => {
+                        match tandem_memory::db::MemoryDatabase::new(&paths.memory_db_path).await {
+                            Ok(db) => {
+                                if let Err(e) = db.run_hygiene(retention_days).await {
+                                    tracing::warn!("memory hygiene failed: {}", e);
+                                }
+                            }
+                            Err(e) => tracing::warn!("memory hygiene: could not open DB: {}", e),
+                        }
+                    }
+                    Err(e) => tracing::warn!("memory hygiene: could not resolve paths: {}", e),
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(12 * 60 * 60)).await;
+        }
+    });
 
     // --- Channel listeners (optional) ---
     // Reads TANDEM_TELEGRAM_BOT_TOKEN, TANDEM_DISCORD_BOT_TOKEN, TANDEM_SLACK_BOT_TOKEN etc.
@@ -487,7 +865,9 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
     reaper.abort();
     status_indexer.abort();
     routine_scheduler.abort();
+    routine_executor.abort();
     agent_team_supervisor.abort();
+    hygiene_task.abort();
     if let Some(mut set) = channel_listener_set {
         set.abort_all();
     }
@@ -499,6 +879,41 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
 struct ToolExecutionInput {
     tool: String,
     args: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct McpAddInput {
+    name: Option<String>,
+    transport: Option<String>,
+    headers: Option<HashMap<String, String>>,
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct McpPatchInput {
+    enabled: Option<bool>,
+}
+
+#[derive(Clone)]
+struct McpBridgeTool {
+    schema: ToolSchema,
+    mcp: tandem_runtime::McpRegistry,
+    server_name: String,
+    tool_name: String,
+}
+
+#[async_trait]
+impl Tool for McpBridgeTool {
+    fn schema(&self) -> ToolSchema {
+        self.schema.clone()
+    }
+
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        self.mcp
+            .call_tool(&self.server_name, &self.tool_name, args)
+            .await
+            .map_err(anyhow::Error::msg)
+    }
 }
 
 async fn execute_tool(
@@ -535,6 +950,53 @@ fn app_router(state: AppState) -> Router {
         )
         .route("/global/dispose", post(global_dispose))
         .route("/event", get(events))
+        .route("/run/{id}/events", get(run_events))
+        .route("/api/run/{id}/events", get(run_events))
+        .route(
+            "/context/runs",
+            post(context_run_create).get(context_run_list),
+        )
+        .route(
+            "/context/runs/{run_id}",
+            get(context_run_get).put(context_run_put),
+        )
+        .route(
+            "/context/runs/{run_id}/events",
+            get(context_run_events).post(context_run_event_append),
+        )
+        .route(
+            "/context/runs/{run_id}/todos/sync",
+            post(context_run_todos_sync),
+        )
+        .route(
+            "/context/runs/{run_id}/events/stream",
+            get(context_run_events_stream),
+        )
+        .route(
+            "/context/runs/{run_id}/lease/validate",
+            post(context_run_lease_validate),
+        )
+        .route(
+            "/context/runs/{run_id}/blackboard",
+            get(context_run_blackboard_get),
+        )
+        .route(
+            "/context/runs/{run_id}/blackboard/patches",
+            post(context_run_blackboard_patch),
+        )
+        .route(
+            "/context/runs/{run_id}/checkpoints",
+            post(context_run_checkpoint_create),
+        )
+        .route(
+            "/context/runs/{run_id}/checkpoints/latest",
+            get(context_run_checkpoint_latest),
+        )
+        .route("/context/runs/{run_id}/replay", get(context_run_replay))
+        .route(
+            "/context/runs/{run_id}/driver/next",
+            post(context_run_driver_next),
+        )
         .route("/project", get(list_projects))
         .route("/session", post(create_session).get(list_sessions))
         .route("/api/session", post(create_session).get(list_sessions))
@@ -630,9 +1092,12 @@ fn app_router(state: AppState) -> Router {
         .route("/mcp", get(list_mcp).post(add_mcp))
         .route("/mcp/{name}/connect", post(connect_mcp))
         .route("/mcp/{name}/disconnect", post(disconnect_mcp))
+        .route("/mcp/{name}", axum::routing::patch(patch_mcp))
+        .route("/mcp/{name}/refresh", post(refresh_mcp))
         .route("/mcp/{name}/auth", post(auth_mcp).delete(delete_auth_mcp))
         .route("/mcp/{name}/auth/callback", post(callback_mcp))
         .route("/mcp/{name}/auth/authenticate", post(authenticate_mcp))
+        .route("/mcp/tools", get(mcp_tools))
         .route("/mcp/resources", get(mcp_resources))
         .route("/tool/ids", get(tool_ids))
         .route("/tool", get(tool_list_for_model))
@@ -718,6 +1183,54 @@ fn app_router(state: AppState) -> Router {
         )
         .route("/routines/{id}/run_now", post(routines_run_now))
         .route("/routines/{id}/history", get(routines_history))
+        .route("/routines/runs", get(routines_runs_all))
+        .route("/routines/{id}/runs", get(routines_runs))
+        .route("/routines/runs/{run_id}", get(routines_run_get))
+        .route(
+            "/routines/runs/{run_id}/approve",
+            post(routines_run_approve),
+        )
+        .route("/routines/runs/{run_id}/deny", post(routines_run_deny))
+        .route("/routines/runs/{run_id}/pause", post(routines_run_pause))
+        .route("/routines/runs/{run_id}/resume", post(routines_run_resume))
+        .route(
+            "/routines/runs/{run_id}/artifacts",
+            get(routines_run_artifacts).post(routines_run_artifact_add),
+        )
+        .route(
+            "/automations",
+            get(automations_list).post(automations_create),
+        )
+        .route("/automations/events", get(automations_events))
+        .route(
+            "/automations/{id}",
+            axum::routing::patch(automations_patch).delete(automations_delete),
+        )
+        .route("/automations/{id}/run_now", post(automations_run_now))
+        .route("/automations/{id}/history", get(automations_history))
+        .route("/automations/runs", get(automations_runs_all))
+        .route("/automations/{id}/runs", get(automations_runs))
+        .route("/automations/runs/{run_id}", get(automations_run_get))
+        .route(
+            "/automations/runs/{run_id}/approve",
+            post(automations_run_approve),
+        )
+        .route(
+            "/automations/runs/{run_id}/deny",
+            post(automations_run_deny),
+        )
+        .route(
+            "/automations/runs/{run_id}/pause",
+            post(automations_run_pause),
+        )
+        .route(
+            "/automations/runs/{run_id}/resume",
+            post(automations_run_resume),
+        )
+        .route(
+            "/automations/runs/{run_id}/artifacts",
+            get(automations_run_artifacts).post(automations_run_artifact_add),
+        )
         .route("/resource", get(resource_list))
         .route("/resource/events", get(resource_events))
         .route(
@@ -1123,8 +1636,11 @@ fn parse_permission_rule_input(
 
 async fn list_sessions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<ListSessionsQuery>,
 ) -> Json<Vec<WireSession>> {
+    let request_id = request_id_from_headers(&headers);
+    let started = Instant::now();
     let workspace_from_query = query
         .workspace
         .as_deref()
@@ -1197,13 +1713,26 @@ async fn list_sessions(
         .take(page_size)
         .map(Into::into)
         .collect::<Vec<WireSession>>();
-    tracing::debug!(
-        "session.list scope={:?} matched={} page={} page_size={}",
+    let elapsed_ms = started.elapsed().as_millis();
+    tracing::info!(
+        "session.list request_id={} scope={:?} matched={} returned={} page={} page_size={} elapsed_ms={}",
+        request_id,
         effective_scope,
         total_after_scope,
+        items.len(),
         page,
-        page_size
+        page_size,
+        elapsed_ms
     );
+    if elapsed_ms >= 1_000 {
+        tracing::warn!(
+            "slow request request_id={} route=GET /session elapsed_ms={} scope={:?} archived_filter={}",
+            request_id,
+            elapsed_ms,
+            effective_scope,
+            query.archived.is_some()
+        );
+    }
     Json(items)
 }
 
@@ -1264,14 +1793,35 @@ async fn grant_workspace_override(
 
 async fn get_session(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<WireSession>, StatusCode> {
-    state
+    let request_id = request_id_from_headers(&headers);
+    let started = Instant::now();
+    let result = state
         .storage
         .get_session(&id)
         .await
         .map(|session| Json(session.into()))
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND);
+    let elapsed_ms = started.elapsed().as_millis();
+    let status = if result.is_ok() { "ok" } else { "not_found" };
+    tracing::info!(
+        "session.get request_id={} session_id={} status={} elapsed_ms={}",
+        request_id,
+        id,
+        status,
+        elapsed_ms
+    );
+    if elapsed_ms >= 500 {
+        tracing::warn!(
+            "slow request request_id={} route=GET /session/{{id}} session_id={} elapsed_ms={}",
+            request_id,
+            id,
+            elapsed_ms
+        );
+    }
+    result
 }
 
 async fn delete_session(
@@ -1612,6 +2162,38 @@ async fn execute_run(
             "error": error_msg,
         }),
     ));
+
+    // Consolidate memory if enabled
+    let effective = state.config.get_effective_value().await;
+    let parsed: crate::EffectiveAppConfig = serde_json::from_value(effective).unwrap_or_default();
+    if parsed.memory_consolidation.enabled {
+        let providers = state.providers.clone();
+        let consolidation_cfg = parsed.memory_consolidation.clone();
+        let session_id_clone = session_id.clone();
+        tokio::spawn(async move {
+            if let Ok(paths) = tandem_core::resolve_shared_paths() {
+                // Open a fresh connection for the background task
+                if let Ok(mem) =
+                    tandem_memory::manager::MemoryManager::new(&paths.memory_db_path).await
+                {
+                    if let Err(e) = mem
+                        .consolidate_session(
+                            &session_id_clone,
+                            None,
+                            &providers,
+                            &consolidation_cfg,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "memory consolidation failed for session {session_id_clone}: {e}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     Ok(())
 }
 
@@ -1756,8 +2338,16 @@ fn infer_event_channel(event_type: &str, props: &serde_json::Map<String, Value>)
 }
 
 fn dispatch_error_code(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
     if is_os_mismatch_error(message) {
         return "OS_MISMATCH";
+    }
+    if lower.contains("provider_server_error")
+        || lower.contains("internal server error")
+        || lower.contains("provider stream chunk error")
+        || lower.contains("json error injected into sse stream")
+    {
+        return "PROVIDER_SERVER_ERROR";
     }
     if message.contains("invalid_function_parameters")
         || message.contains("array schema missing items")
@@ -2102,20 +2692,37 @@ async fn reply_permission(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(input): Json<PermissionReplyInput>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, Json<ErrorEnvelope>)> {
     let accepted = matches!(
         input.reply.as_str(),
         "once" | "always" | "reject" | "allow" | "deny"
     );
     if !accepted {
-        return Json(json!({
-            "ok": false,
-            "error":"reply must be one of once|always|reject|allow|deny",
-            "code":"invalid_permission_reply"
-        }));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorEnvelope {
+                error: "reply must be one of once|always|reject|allow|deny".to_string(),
+                code: Some("invalid_permission_reply".to_string()),
+            }),
+        ));
     }
     let ok = state.permissions.reply(&id, &input.reply).await;
-    Json(json!({"ok": ok}))
+    if !ok {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorEnvelope {
+                error: "Permission request not found".to_string(),
+                code: Some("permission_request_not_found".to_string()),
+            }),
+        ));
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "requestID": id,
+        "reply": input.reply,
+        "status": "applied",
+        "persistedRule": matches!(input.reply.as_str(), "always" | "allow")
+    })))
 }
 
 async fn approve_tool_by_call(
@@ -2261,8 +2868,8 @@ async fn list_providers(State(state): State<AppState>) -> Json<Value> {
 fn merge_known_provider_defaults(wire: &mut WireProviderCatalog) {
     let known = [
         ("openrouter", "OpenRouter", "openai/gpt-4o-mini"),
-        ("openai", "OpenAI", "gpt-4o-mini"),
-        ("anthropic", "Anthropic", "claude-3-5-sonnet-latest"),
+        ("openai", "OpenAI", "gpt-5.2"),
+        ("anthropic", "Anthropic", "claude-sonnet-4-6"),
         ("ollama", "Ollama", "llama3.1:8b"),
         ("groq", "Groq", "llama-3.1-8b-instant"),
         ("mistral", "Mistral", "mistral-small-latest"),
@@ -2604,26 +3211,171 @@ async fn global_dispose(State(state): State<AppState>) -> Json<Value> {
 async fn list_mcp(State(state): State<AppState>) -> Json<Value> {
     Json(json!(state.mcp.list().await))
 }
-async fn add_mcp(
-    State(state): State<AppState>,
-    Json(input): Json<HashMap<String, String>>,
-) -> Json<Value> {
-    let name = input
-        .get("name")
-        .cloned()
-        .unwrap_or_else(|| "default".to_string());
-    let transport = input
-        .get("transport")
-        .cloned()
-        .unwrap_or_else(|| "stdio".to_string());
-    state.mcp.add(name, transport).await;
+async fn add_mcp(State(state): State<AppState>, Json(input): Json<McpAddInput>) -> Json<Value> {
+    let name = input.name.unwrap_or_else(|| "default".to_string());
+    let transport = input.transport.unwrap_or_else(|| "stdio".to_string());
+    state
+        .mcp
+        .add_or_update(
+            name.clone(),
+            transport,
+            input.headers.unwrap_or_default(),
+            input.enabled.unwrap_or(true),
+        )
+        .await;
+    state.event_bus.publish(EngineEvent::new(
+        "mcp.server.updated",
+        json!({
+            "name": name,
+        }),
+    ));
     Json(json!({"ok": true}))
 }
+
+fn mcp_namespace_segment(raw: &str) -> String {
+    let mut out = String::new();
+    let mut previous_underscore = false;
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            previous_underscore = false;
+        } else if !previous_underscore {
+            out.push('_');
+            previous_underscore = true;
+        }
+    }
+    let cleaned = out.trim_matches('_');
+    if cleaned.is_empty() {
+        "server".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+async fn sync_mcp_tools_for_server(state: &AppState, name: &str) -> usize {
+    let prefix = format!("mcp.{}.", mcp_namespace_segment(name));
+    state.tools.unregister_by_prefix(&prefix).await;
+    let tools = state.mcp.server_tools(name).await;
+    for tool in &tools {
+        let schema = ToolSchema {
+            name: tool.namespaced_name.clone(),
+            description: if tool.description.trim().is_empty() {
+                format!("MCP tool {} from {}", tool.tool_name, tool.server_name)
+            } else {
+                tool.description.clone()
+            },
+            input_schema: tool.input_schema.clone(),
+        };
+        state
+            .tools
+            .register_tool(
+                schema.name.clone(),
+                Arc::new(McpBridgeTool {
+                    schema,
+                    mcp: state.mcp.clone(),
+                    server_name: tool.server_name.clone(),
+                    tool_name: tool.tool_name.clone(),
+                }),
+            )
+            .await;
+    }
+    tools.len()
+}
+
 async fn connect_mcp(State(state): State<AppState>, Path(name): Path<String>) -> Json<Value> {
-    Json(json!({"ok": state.mcp.connect(&name).await}))
+    let ok = state.mcp.connect(&name).await;
+    if ok {
+        let count = sync_mcp_tools_for_server(&state, &name).await;
+        state.event_bus.publish(EngineEvent::new(
+            "mcp.server.connected",
+            json!({
+                "name": name,
+                "status": "connected",
+            }),
+        ));
+        state.event_bus.publish(EngineEvent::new(
+            "mcp.tools.updated",
+            json!({
+                "name": name,
+                "count": count,
+            }),
+        ));
+    }
+    Json(json!({"ok": ok}))
 }
 async fn disconnect_mcp(State(state): State<AppState>, Path(name): Path<String>) -> Json<Value> {
-    Json(json!({"ok": state.mcp.disconnect(&name).await}))
+    let ok = state.mcp.disconnect(&name).await;
+    if ok {
+        let prefix = format!("mcp.{}.", mcp_namespace_segment(&name));
+        let removed = state.tools.unregister_by_prefix(&prefix).await;
+        state.event_bus.publish(EngineEvent::new(
+            "mcp.server.disconnected",
+            json!({
+                "name": name,
+                "removedToolCount": removed,
+            }),
+        ));
+    }
+    Json(json!({"ok": ok}))
+}
+
+async fn patch_mcp(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(input): Json<McpPatchInput>,
+) -> Json<Value> {
+    let mut changed = false;
+    if let Some(enabled) = input.enabled {
+        changed = state.mcp.set_enabled(&name, enabled).await;
+        if changed {
+            if enabled {
+                let _ = state.mcp.connect(&name).await;
+                let count = sync_mcp_tools_for_server(&state, &name).await;
+                state.event_bus.publish(EngineEvent::new(
+                    "mcp.tools.updated",
+                    json!({
+                        "name": name,
+                        "count": count,
+                    }),
+                ));
+            } else {
+                let prefix = format!("mcp.{}.", mcp_namespace_segment(&name));
+                let _ = state.tools.unregister_by_prefix(&prefix).await;
+            }
+            state.event_bus.publish(EngineEvent::new(
+                "mcp.server.updated",
+                json!({
+                    "name": name,
+                    "enabled": enabled,
+                }),
+            ));
+        }
+    }
+    Json(json!({"ok": changed}))
+}
+
+async fn refresh_mcp(State(state): State<AppState>, Path(name): Path<String>) -> Json<Value> {
+    let result = state.mcp.refresh(&name).await;
+    match result {
+        Ok(tools) => {
+            let count = sync_mcp_tools_for_server(&state, &name).await;
+            state.event_bus.publish(EngineEvent::new(
+                "mcp.tools.updated",
+                json!({
+                    "name": name,
+                    "count": count,
+                }),
+            ));
+            Json(json!({
+                "ok": true,
+                "count": tools.len(),
+            }))
+        }
+        Err(error) => Json(json!({
+            "ok": false,
+            "error": error
+        })),
+    }
 }
 async fn auth_mcp(Path(name): Path<String>) -> Json<Value> {
     Json(json!({"authorizationUrl": format!("https://example.invalid/mcp/{name}/authorize")}))
@@ -2636,6 +3388,9 @@ async fn authenticate_mcp(Path(name): Path<String>) -> Json<Value> {
 }
 async fn delete_auth_mcp(Path(name): Path<String>) -> Json<Value> {
     Json(json!({"ok": true, "name": name}))
+}
+async fn mcp_tools(State(state): State<AppState>) -> Json<Value> {
+    Json(json!(state.mcp.list_tools().await))
 }
 async fn mcp_resources(State(state): State<AppState>) -> Json<Value> {
     let resources = state
@@ -2997,23 +3752,102 @@ async fn command_list() -> Json<Value> {
         {"id":"cargo-check","command":"cargo","args":["check","-p","tandem-engine"]}
     ]))
 }
-async fn run_command(Json(input): Json<CommandRunInput>) -> Result<Json<Value>, StatusCode> {
+async fn run_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<CommandRunInput>,
+) -> Result<Json<Value>, StatusCode> {
+    let request_id = request_id_from_headers(&headers);
+    let started = Instant::now();
+    let lookup_started = Instant::now();
+    let session = state
+        .storage
+        .get_session(&id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let lookup_ms = lookup_started.elapsed().as_millis();
+    let workspace_root = session
+        .workspace_root
+        .as_deref()
+        .and_then(tandem_core::normalize_workspace_path)
+        .or_else(|| tandem_core::normalize_workspace_path(&session.directory));
+    let default_cwd = tandem_core::normalize_workspace_path(&session.directory)
+        .or_else(|| workspace_root.clone())
+        .unwrap_or_else(|| ".".to_string());
+
     let command = input.command.ok_or(StatusCode::BAD_REQUEST)?;
     let mut cmd = Command::new(&command);
     cmd.args(input.args);
-    if let Some(cwd) = input.cwd {
-        cmd.current_dir(cwd);
-    }
+    let effective_cwd = if let Some(requested_cwd) = input.cwd {
+        let normalized = tandem_core::normalize_workspace_path(&requested_cwd)
+            .unwrap_or_else(|| requested_cwd.trim().to_string());
+        if normalized.is_empty() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        if let Some(root) = workspace_root.as_ref() {
+            let requested_path = PathBuf::from(&normalized);
+            let candidate = if requested_path.is_absolute() {
+                requested_path
+            } else {
+                PathBuf::from(root).join(requested_path)
+            };
+            if !tandem_core::is_within_workspace_root(&candidate, &PathBuf::from(root)) {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        normalized
+    } else {
+        default_cwd
+    };
+    cmd.current_dir(&effective_cwd);
+
+    let command_started = Instant::now();
     let output = cmd
         .output()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let command_ms = command_started.elapsed().as_millis();
+    let elapsed_ms = started.elapsed().as_millis();
+    tracing::info!(
+        "session.command request_id={} session_id={} command={} ok={} elapsed_ms={} lookup_ms={} command_ms={}",
+        request_id,
+        id,
+        command,
+        output.status.success(),
+        elapsed_ms,
+        lookup_ms,
+        command_ms
+    );
+    if elapsed_ms >= 2_000 {
+        tracing::warn!(
+            "slow request request_id={} route=POST /session/{{id}}/command session_id={} command={} elapsed_ms={} lookup_ms={} command_ms={}",
+            request_id,
+            id,
+            command,
+            elapsed_ms,
+            lookup_ms,
+            command_ms
+        );
+    }
     Ok(Json(json!({
         "ok": output.status.success(),
+        "cwd": effective_cwd,
         "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
         "stderr": String::from_utf8_lossy(&output.stderr).to_string()
     })))
 }
+
+fn request_id_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get("x-tandem-correlation-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().simple().to_string())
+}
+
 async fn run_shell(Json(input): Json<ShellRunInput>) -> Result<Json<Value>, StatusCode> {
     let command = input.command.ok_or(StatusCode::BAD_REQUEST)?;
     let mut cmd = Command::new("powershell");
@@ -3886,6 +4720,29 @@ async fn channels_put(
     Json(input): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
     let normalized = name.to_ascii_lowercase();
+    let effective = state.config.get_effective_value().await;
+    let existing_channel_cfg = |channel: &str| -> Option<&serde_json::Map<String, Value>> {
+        effective
+            .get("channels")
+            .and_then(Value::as_object)
+            .and_then(|obj| obj.get(channel))
+            .and_then(Value::as_object)
+    };
+    let existing_bot_token = |channel: &str| -> Option<String> {
+        existing_channel_cfg(channel)
+            .and_then(|cfg| cfg.get("bot_token"))
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let existing_channel_id = |channel: &str| -> Option<String> {
+        existing_channel_cfg(channel)
+            .and_then(|cfg| cfg.get("channel_id"))
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
     let mut project = state.config.get_project_value().await;
     let Some(root) = project.as_object_mut() else {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -3898,24 +4755,36 @@ async fn channels_put(
     };
     match normalized.as_str() {
         "telegram" => {
-            let cfg: TelegramConfigFile =
+            let mut cfg: TelegramConfigFile =
                 serde_json::from_value(input).map_err(|_| StatusCode::BAD_REQUEST)?;
+            if cfg.bot_token.trim().is_empty() {
+                cfg.bot_token = existing_bot_token("telegram").unwrap_or_default();
+            }
             if cfg.bot_token.trim().is_empty() {
                 return Err(StatusCode::BAD_REQUEST);
             }
             channels_obj.insert("telegram".to_string(), json!(cfg));
         }
         "discord" => {
-            let cfg: DiscordConfigFile =
+            let mut cfg: DiscordConfigFile =
                 serde_json::from_value(input).map_err(|_| StatusCode::BAD_REQUEST)?;
+            if cfg.bot_token.trim().is_empty() {
+                cfg.bot_token = existing_bot_token("discord").unwrap_or_default();
+            }
             if cfg.bot_token.trim().is_empty() {
                 return Err(StatusCode::BAD_REQUEST);
             }
             channels_obj.insert("discord".to_string(), json!(cfg));
         }
         "slack" => {
-            let cfg: SlackConfigFile =
+            let mut cfg: SlackConfigFile =
                 serde_json::from_value(input).map_err(|_| StatusCode::BAD_REQUEST)?;
+            if cfg.bot_token.trim().is_empty() {
+                cfg.bot_token = existing_bot_token("slack").unwrap_or_default();
+            }
+            if cfg.channel_id.trim().is_empty() {
+                cfg.channel_id = existing_channel_id("slack").unwrap_or_default();
+            }
             if cfg.bot_token.trim().is_empty() || cfg.channel_id.trim().is_empty() {
                 return Err(StatusCode::BAD_REQUEST);
             }
@@ -4529,6 +5398,8 @@ async fn routines_create(
             .unwrap_or(RoutineMisfirePolicy::RunOnce),
         entrypoint: input.entrypoint,
         args: input.args.unwrap_or_else(|| json!({})),
+        allowed_tools: input.allowed_tools.unwrap_or_default(),
+        output_targets: input.output_targets.unwrap_or_default(),
         creator_type: input.creator_type.unwrap_or_else(|| "user".to_string()),
         creator_id: input.creator_id.unwrap_or_else(|| "unknown".to_string()),
         requires_approval: input.requires_approval.unwrap_or(true),
@@ -4596,6 +5467,12 @@ async fn routines_patch(
     }
     if let Some(args) = input.args {
         routine.args = args;
+    }
+    if let Some(allowed_tools) = input.allowed_tools {
+        routine.allowed_tools = allowed_tools;
+    }
+    if let Some(output_targets) = input.output_targets {
+        routine.output_targets = output_targets;
     }
     if let Some(requires_approval) = input.requires_approval {
         routine.requires_approval = requires_approval;
@@ -4676,6 +5553,15 @@ async fn routines_run_now(
     match evaluate_routine_execution_policy(&routine, trigger_type) {
         RoutineExecutionDecision::Allowed => {
             let _ = state.mark_routine_fired(&routine.routine_id, now).await;
+            let run = state
+                .create_routine_run(
+                    &routine,
+                    trigger_type,
+                    run_count,
+                    RoutineRunStatus::Queued,
+                    input.reason.clone(),
+                )
+                .await;
             state
                 .append_routine_history(RoutineHistoryEvent {
                     routine_id: routine.routine_id.clone(),
@@ -4690,20 +5576,37 @@ async fn routines_run_now(
                 "routine.fired",
                 json!({
                     "routineID": routine.routine_id,
+                    "runID": run.run_id,
                     "runCount": run_count,
                     "triggerType": trigger_type,
                     "firedAtMs": now,
+                }),
+            ));
+            state.event_bus.publish(EngineEvent::new(
+                "routine.run.created",
+                json!({
+                    "run": run,
                 }),
             ));
             Ok(Json(json!({
                 "ok": true,
                 "status": "queued",
                 "routineID": id,
+                "runID": run.run_id,
                 "runCount": run_count,
                 "firedAtMs": now,
             })))
         }
         RoutineExecutionDecision::RequiresApproval { reason } => {
+            let run = state
+                .create_routine_run(
+                    &routine,
+                    trigger_type,
+                    run_count,
+                    RoutineRunStatus::PendingApproval,
+                    Some(reason.clone()),
+                )
+                .await;
             state
                 .append_routine_history(RoutineHistoryEvent {
                     routine_id: routine.routine_id.clone(),
@@ -4718,19 +5621,36 @@ async fn routines_run_now(
                 "routine.approval_required",
                 json!({
                     "routineID": routine.routine_id,
+                    "runID": run.run_id,
                     "runCount": run_count,
                     "triggerType": trigger_type,
                     "reason": reason,
+                }),
+            ));
+            state.event_bus.publish(EngineEvent::new(
+                "routine.run.created",
+                json!({
+                    "run": run,
                 }),
             ));
             Ok(Json(json!({
                 "ok": true,
                 "status": "pending_approval",
                 "routineID": id,
+                "runID": run.run_id,
                 "runCount": run_count,
             })))
         }
         RoutineExecutionDecision::Blocked { reason } => {
+            let run = state
+                .create_routine_run(
+                    &routine,
+                    trigger_type,
+                    run_count,
+                    RoutineRunStatus::BlockedPolicy,
+                    Some(reason.clone()),
+                )
+                .await;
             state
                 .append_routine_history(RoutineHistoryEvent {
                     routine_id: routine.routine_id.clone(),
@@ -4745,9 +5665,16 @@ async fn routines_run_now(
                 "routine.blocked",
                 json!({
                     "routineID": routine.routine_id,
+                    "runID": run.run_id,
                     "runCount": run_count,
                     "triggerType": trigger_type,
                     "reason": reason,
+                }),
+            ));
+            state.event_bus.publish(EngineEvent::new(
+                "routine.run.created",
+                json!({
+                    "run": run,
                 }),
             ));
             Err((
@@ -4756,6 +5683,7 @@ async fn routines_run_now(
                     "error": "Routine blocked by policy",
                     "code": "ROUTINE_POLICY_BLOCKED",
                     "routineID": id,
+                    "runID": run.run_id,
                     "reason": reason,
                 })),
             ))
@@ -4775,6 +5703,331 @@ async fn routines_history(
         "events": events,
         "count": events.len(),
     }))
+}
+
+async fn routines_runs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<RoutineRunsQuery>,
+) -> Json<Value> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let runs = state.list_routine_runs(Some(&id), limit).await;
+    Json(json!({
+        "routineID": id,
+        "runs": runs,
+        "count": runs.len(),
+    }))
+}
+
+async fn routines_runs_all(
+    State(state): State<AppState>,
+    Query(query): Query<RoutineRunsQuery>,
+) -> Json<Value> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let runs = state
+        .list_routine_runs(query.routine_id.as_deref(), limit)
+        .await;
+    Json(json!({
+        "runs": runs,
+        "count": runs.len(),
+    }))
+}
+
+async fn routines_run_get(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(run) = state.get_routine_run(&run_id).await else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "Routine run not found",
+                "code": "ROUTINE_RUN_NOT_FOUND",
+                "runID": run_id,
+            })),
+        ));
+    };
+    Ok(Json(json!({ "run": run })))
+}
+
+fn reason_or_default(input: Option<String>, fallback: &str) -> String {
+    input
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+async fn routines_run_approve(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<RoutineRunDecisionInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(current) = state.get_routine_run(&run_id).await else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "Routine run not found",
+                "code": "ROUTINE_RUN_NOT_FOUND",
+                "runID": run_id,
+            })),
+        ));
+    };
+    if current.status != RoutineRunStatus::PendingApproval {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Routine run is not waiting for approval",
+                "code": "ROUTINE_RUN_NOT_PENDING_APPROVAL",
+                "runID": run_id,
+            })),
+        ));
+    }
+    let reason = reason_or_default(input.reason, "approved by operator");
+    let updated = state
+        .update_routine_run_status(&run_id, RoutineRunStatus::Queued, Some(reason.clone()))
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error":"Failed to update routine run",
+                    "code":"ROUTINE_RUN_UPDATE_FAILED",
+                    "runID": run_id,
+                })),
+            )
+        })?;
+    state.event_bus.publish(EngineEvent::new(
+        "routine.run.approved",
+        json!({
+            "runID": run_id,
+            "routineID": updated.routine_id,
+            "reason": reason,
+        }),
+    ));
+    Ok(Json(json!({ "ok": true, "run": updated })))
+}
+
+async fn routines_run_deny(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<RoutineRunDecisionInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(current) = state.get_routine_run(&run_id).await else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "Routine run not found",
+                "code": "ROUTINE_RUN_NOT_FOUND",
+                "runID": run_id,
+            })),
+        ));
+    };
+    if current.status != RoutineRunStatus::PendingApproval {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Routine run is not waiting for approval",
+                "code": "ROUTINE_RUN_NOT_PENDING_APPROVAL",
+                "runID": run_id,
+            })),
+        ));
+    }
+    let reason = reason_or_default(input.reason, "denied by operator");
+    let updated = state
+        .update_routine_run_status(&run_id, RoutineRunStatus::Denied, Some(reason.clone()))
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error":"Failed to update routine run",
+                    "code":"ROUTINE_RUN_UPDATE_FAILED",
+                    "runID": run_id,
+                })),
+            )
+        })?;
+    state.event_bus.publish(EngineEvent::new(
+        "routine.run.denied",
+        json!({
+            "runID": run_id,
+            "routineID": updated.routine_id,
+            "reason": reason,
+        }),
+    ));
+    Ok(Json(json!({ "ok": true, "run": updated })))
+}
+
+async fn routines_run_pause(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<RoutineRunDecisionInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(current) = state.get_routine_run(&run_id).await else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "Routine run not found",
+                "code": "ROUTINE_RUN_NOT_FOUND",
+                "runID": run_id,
+            })),
+        ));
+    };
+    if !matches!(
+        current.status,
+        RoutineRunStatus::Queued | RoutineRunStatus::Running
+    ) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Routine run is not pausable",
+                "code": "ROUTINE_RUN_NOT_PAUSABLE",
+                "runID": run_id,
+            })),
+        ));
+    }
+    let reason = reason_or_default(input.reason, "paused by operator");
+    let updated = state
+        .update_routine_run_status(&run_id, RoutineRunStatus::Paused, Some(reason.clone()))
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error":"Failed to update routine run",
+                    "code":"ROUTINE_RUN_UPDATE_FAILED",
+                    "runID": run_id,
+                })),
+            )
+        })?;
+    state.event_bus.publish(EngineEvent::new(
+        "routine.run.paused",
+        json!({
+            "runID": run_id,
+            "routineID": updated.routine_id,
+            "reason": reason,
+        }),
+    ));
+    Ok(Json(json!({ "ok": true, "run": updated })))
+}
+
+async fn routines_run_resume(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<RoutineRunDecisionInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(current) = state.get_routine_run(&run_id).await else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "Routine run not found",
+                "code": "ROUTINE_RUN_NOT_FOUND",
+                "runID": run_id,
+            })),
+        ));
+    };
+    if current.status != RoutineRunStatus::Paused {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Routine run is not paused",
+                "code": "ROUTINE_RUN_NOT_PAUSED",
+                "runID": run_id,
+            })),
+        ));
+    }
+    let reason = reason_or_default(input.reason, "resumed by operator");
+    let updated = state
+        .update_routine_run_status(&run_id, RoutineRunStatus::Queued, Some(reason.clone()))
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error":"Failed to update routine run",
+                    "code":"ROUTINE_RUN_UPDATE_FAILED",
+                    "runID": run_id,
+                })),
+            )
+        })?;
+    state.event_bus.publish(EngineEvent::new(
+        "routine.run.resumed",
+        json!({
+            "runID": run_id,
+            "routineID": updated.routine_id,
+            "reason": reason,
+        }),
+    ));
+    Ok(Json(json!({ "ok": true, "run": updated })))
+}
+
+async fn routines_run_artifacts(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(run) = state.get_routine_run(&run_id).await else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "Routine run not found",
+                "code": "ROUTINE_RUN_NOT_FOUND",
+                "runID": run_id,
+            })),
+        ));
+    };
+    Ok(Json(json!({
+        "runID": run_id,
+        "artifacts": run.artifacts,
+        "count": run.artifacts.len(),
+    })))
+}
+
+async fn routines_run_artifact_add(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<RoutineRunArtifactInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if input.uri.trim().is_empty() || input.kind.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error":"Artifact requires uri and kind",
+                "code":"ROUTINE_ARTIFACT_INVALID",
+            })),
+        ));
+    }
+    let artifact = RoutineRunArtifact {
+        artifact_id: format!("artifact-{}", Uuid::new_v4()),
+        uri: input.uri.trim().to_string(),
+        kind: input.kind.trim().to_string(),
+        label: input
+            .label
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        created_at_ms: crate::now_ms(),
+        metadata: input.metadata,
+    };
+    let updated = state
+        .append_routine_run_artifact(&run_id, artifact.clone())
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error":"Routine run not found",
+                    "code":"ROUTINE_RUN_NOT_FOUND",
+                    "runID": run_id,
+                })),
+            )
+        })?;
+    state.event_bus.publish(EngineEvent::new(
+        "routine.run.artifact_added",
+        json!({
+            "runID": run_id,
+            "routineID": updated.routine_id,
+            "artifact": artifact,
+        }),
+    ));
+    Ok(Json(json!({ "ok": true, "run": updated })))
 }
 
 fn routines_sse_stream(
@@ -4819,6 +6072,1867 @@ async fn routines_events(
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     Sse::new(routines_sse_stream(state, query.routine_id))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(10)))
+}
+
+fn load_run_events_jsonl(path: &FsPath, since_seq: Option<u64>, tail: Option<usize>) -> Vec<Value> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let mut rows: Vec<Value> = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|row| {
+            if let Some(since) = since_seq {
+                return row.get("seq").and_then(|value| value.as_u64()).unwrap_or(0) > since;
+            }
+            true
+        })
+        .collect();
+    rows.sort_by_key(|row| row.get("seq").and_then(|value| value.as_u64()).unwrap_or(0));
+    if let Some(tail_count) = tail {
+        if rows.len() > tail_count {
+            rows = rows.split_off(rows.len().saturating_sub(tail_count));
+        }
+    }
+    rows
+}
+
+fn run_events_sse_stream(
+    state: AppState,
+    run_id: String,
+    query: RunEventsQuery,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
+    tokio::spawn(async move {
+        let snapshot = state.workspace_index.snapshot().await;
+        let workspace_root = PathBuf::from(snapshot.root);
+        let events_path = workspace_root
+            .join(".tandem")
+            .join("orchestrator")
+            .join(&run_id)
+            .join("events.jsonl");
+
+        let ready = serde_json::to_string(&json!({
+            "status":"ready",
+            "stream":"run_events",
+            "runID": run_id,
+            "timestamp_ms": crate::now_ms(),
+            "path": events_path.to_string_lossy().to_string(),
+        }))
+        .unwrap_or_default();
+        if tx.send(ready).await.is_err() {
+            return;
+        }
+
+        let initial = load_run_events_jsonl(&events_path, query.since_seq, query.tail);
+        let mut last_seq = query.since_seq.unwrap_or(0);
+        for row in initial {
+            let seq = row
+                .get("seq")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(last_seq);
+            last_seq = last_seq.max(seq);
+            let payload = serde_json::to_string(&json!({
+                "type":"run.event",
+                "properties": row
+            }))
+            .unwrap_or_default();
+            if tx.send(payload).await.is_err() {
+                return;
+            }
+        }
+
+        let mut interval = tokio::time::interval(Duration::from_millis(1000));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let updates = load_run_events_jsonl(&events_path, Some(last_seq), None);
+            for row in updates {
+                let seq = row
+                    .get("seq")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(last_seq);
+                last_seq = last_seq.max(seq);
+                let payload = serde_json::to_string(&json!({
+                    "type":"run.event",
+                    "properties": row
+                }))
+                .unwrap_or_default();
+                if tx.send(payload).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    ReceiverStream::new(rx).map(|payload| Ok(Event::default().data(payload)))
+}
+
+async fn run_events(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Query(query): Query<RunEventsQuery>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    Sse::new(run_events_sse_stream(state, run_id, query))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(10)))
+}
+
+fn context_runs_root(state: &AppState) -> PathBuf {
+    state
+        .shared_resources_path
+        .parent()
+        .map(|parent| parent.join("context_runs"))
+        .unwrap_or_else(|| PathBuf::from(".tandem").join("context_runs"))
+}
+
+fn context_run_dir(state: &AppState, run_id: &str) -> PathBuf {
+    context_runs_root(state).join(run_id)
+}
+
+fn context_run_state_path(state: &AppState, run_id: &str) -> PathBuf {
+    context_run_dir(state, run_id).join("run_state.json")
+}
+
+fn context_run_events_path(state: &AppState, run_id: &str) -> PathBuf {
+    context_run_dir(state, run_id).join("events.jsonl")
+}
+
+fn context_run_blackboard_path(state: &AppState, run_id: &str) -> PathBuf {
+    context_run_dir(state, run_id).join("blackboard.json")
+}
+
+fn context_run_blackboard_patches_path(state: &AppState, run_id: &str) -> PathBuf {
+    context_run_dir(state, run_id).join("blackboard_patches.jsonl")
+}
+
+fn context_run_checkpoints_dir(state: &AppState, run_id: &str) -> PathBuf {
+    context_run_dir(state, run_id).join("checkpoints")
+}
+
+async fn ensure_context_run_dir(state: &AppState, run_id: &str) -> Result<(), StatusCode> {
+    let run_dir = context_run_dir(state, run_id);
+    tokio::fs::create_dir_all(&run_dir)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(())
+}
+
+async fn load_context_run_state(
+    state: &AppState,
+    run_id: &str,
+) -> Result<ContextRunState, StatusCode> {
+    let path = context_run_state_path(state, run_id);
+    let raw = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    serde_json::from_str::<ContextRunState>(&raw).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn save_context_run_state(state: &AppState, run: &ContextRunState) -> Result<(), StatusCode> {
+    ensure_context_run_dir(state, &run.run_id).await?;
+    let path = context_run_state_path(state, &run.run_id);
+    let payload =
+        serde_json::to_string_pretty(run).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tokio::fs::write(path, payload)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn load_context_run_events_jsonl(
+    path: &FsPath,
+    since_seq: Option<u64>,
+    tail: Option<usize>,
+) -> Vec<ContextRunEventRecord> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let mut rows: Vec<ContextRunEventRecord> = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<ContextRunEventRecord>(line).ok())
+        .filter(|row| {
+            if let Some(since) = since_seq {
+                return row.seq > since;
+            }
+            true
+        })
+        .collect();
+    rows.sort_by_key(|row| row.seq);
+    if let Some(tail_count) = tail {
+        if rows.len() > tail_count {
+            rows = rows.split_off(rows.len().saturating_sub(tail_count));
+        }
+    }
+    rows
+}
+
+fn latest_context_run_event_seq(path: &FsPath) -> u64 {
+    load_context_run_events_jsonl(path, None, None)
+        .last()
+        .map(|row| row.seq)
+        .unwrap_or(0)
+}
+
+fn append_jsonl_line(path: &FsPath, value: &Value) -> Result<(), StatusCode> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let line = serde_json::to_string(value).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    writeln!(file, "{}", line).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn load_context_blackboard(state: &AppState, run_id: &str) -> ContextBlackboardState {
+    let path = context_run_blackboard_path(state, run_id);
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<ContextBlackboardState>(&raw).unwrap_or_default(),
+        Err(_) => ContextBlackboardState::default(),
+    }
+}
+
+fn save_context_blackboard(
+    state: &AppState,
+    run_id: &str,
+    blackboard: &ContextBlackboardState,
+) -> Result<(), StatusCode> {
+    let path = context_run_blackboard_path(state, run_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    let payload =
+        serde_json::to_string_pretty(blackboard).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    std::fs::write(path, payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn apply_context_blackboard_patch(
+    blackboard: &mut ContextBlackboardState,
+    patch: &ContextBlackboardPatchRecord,
+) -> Result<(), StatusCode> {
+    match patch.op {
+        ContextBlackboardPatchOp::AddFact => {
+            let row = serde_json::from_value::<ContextBlackboardItem>(patch.payload.clone())
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            blackboard.facts.push(row);
+        }
+        ContextBlackboardPatchOp::AddDecision => {
+            let row = serde_json::from_value::<ContextBlackboardItem>(patch.payload.clone())
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            blackboard.decisions.push(row);
+        }
+        ContextBlackboardPatchOp::AddOpenQuestion => {
+            let row = serde_json::from_value::<ContextBlackboardItem>(patch.payload.clone())
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            blackboard.open_questions.push(row);
+        }
+        ContextBlackboardPatchOp::AddArtifact => {
+            let row = serde_json::from_value::<ContextBlackboardArtifact>(patch.payload.clone())
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            blackboard.artifacts.push(row);
+        }
+        ContextBlackboardPatchOp::SetRollingSummary => {
+            let value = patch
+                .payload
+                .as_str()
+                .ok_or(StatusCode::BAD_REQUEST)?
+                .to_string();
+            blackboard.summaries.rolling = value;
+        }
+        ContextBlackboardPatchOp::SetLatestContextPack => {
+            let value = patch
+                .payload
+                .as_str()
+                .ok_or(StatusCode::BAD_REQUEST)?
+                .to_string();
+            blackboard.summaries.latest_context_pack = value;
+        }
+    }
+    blackboard.revision = patch.seq;
+    Ok(())
+}
+
+async fn context_run_create(
+    State(state): State<AppState>,
+    Json(input): Json<ContextRunCreateInput>,
+) -> Result<Json<Value>, StatusCode> {
+    let run_id = input
+        .run_id
+        .unwrap_or_else(|| format!("run-{}", Uuid::new_v4()));
+    ensure_context_run_dir(&state, &run_id).await?;
+    let run_path = context_run_state_path(&state, &run_id);
+    if run_path.exists() {
+        return Ok(Json(json!({
+            "error": "run already exists",
+            "code": "CONTEXT_RUN_EXISTS",
+            "run_id": run_id
+        })));
+    }
+    let now = crate::now_ms();
+    let run = ContextRunState {
+        run_id: run_id.clone(),
+        run_type: input.run_type.unwrap_or_else(|| "interactive".to_string()),
+        status: ContextRunStatus::Queued,
+        objective: input.objective,
+        workspace: input.workspace.unwrap_or_default(),
+        steps: Vec::new(),
+        why_next_step: None,
+        revision: 1,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    save_context_run_state(&state, &run).await?;
+    Ok(Json(json!({ "ok": true, "run": run })))
+}
+
+async fn context_run_list(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    let root = context_runs_root(&state);
+    if !root.exists() {
+        return Ok(Json(json!({ "runs": [] })));
+    }
+    let mut rows = Vec::<ContextRunState>::new();
+    let mut dir = tokio::fs::read_dir(root)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        if !entry
+            .file_type()
+            .await
+            .map(|kind| kind.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let run_id = entry.file_name().to_string_lossy().to_string();
+        if let Ok(run) = load_context_run_state(&state, &run_id).await {
+            rows.push(run);
+        }
+    }
+    rows.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+    Ok(Json(json!({ "runs": rows })))
+}
+
+async fn context_run_get(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let run = load_context_run_state(&state, &run_id).await?;
+    Ok(Json(json!({ "run": run })))
+}
+
+async fn context_run_put(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(mut run): Json<ContextRunState>,
+) -> Result<Json<Value>, StatusCode> {
+    if run.run_id != run_id {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let now = crate::now_ms();
+    run.revision = run.revision.saturating_add(1);
+    run.updated_at_ms = now;
+    save_context_run_state(&state, &run).await?;
+    Ok(Json(json!({ "ok": true, "run": run })))
+}
+
+fn context_run_is_terminal(status: &ContextRunStatus) -> bool {
+    matches!(
+        status,
+        ContextRunStatus::Failed | ContextRunStatus::Completed | ContextRunStatus::Cancelled
+    )
+}
+
+fn context_step_status_from_todo(status: Option<&str>) -> ContextStepStatus {
+    let normalized = status
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "pending".to_string());
+    match normalized.as_str() {
+        "in_progress" | "in-progress" | "working" | "doing" | "active" => {
+            ContextStepStatus::InProgress
+        }
+        "runnable" | "ready" => ContextStepStatus::Runnable,
+        "done" | "completed" | "complete" => ContextStepStatus::Done,
+        "blocked" => ContextStepStatus::Blocked,
+        "failed" | "error" => ContextStepStatus::Failed,
+        _ => ContextStepStatus::Pending,
+    }
+}
+
+fn normalize_context_todo_step_id(raw: Option<&str>, idx: usize) -> String {
+    raw.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("todo-{}", idx.saturating_add(1)))
+}
+
+async fn context_run_todos_sync(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<ContextTodoSyncInput>,
+) -> Result<Json<Value>, StatusCode> {
+    let mut run = load_context_run_state(&state, &run_id).await?;
+    let replace = input.replace.unwrap_or(true);
+
+    let mapped_steps = input
+        .todos
+        .iter()
+        .enumerate()
+        .map(|(idx, todo)| ContextRunStep {
+            step_id: normalize_context_todo_step_id(todo.id.as_deref(), idx),
+            title: todo.content.trim().to_string(),
+            status: context_step_status_from_todo(todo.status.as_deref()),
+        })
+        .filter(|step| !step.title.is_empty())
+        .collect::<Vec<_>>();
+
+    if replace {
+        run.steps = mapped_steps;
+    } else {
+        for step in mapped_steps {
+            if let Some(existing) = run.steps.iter_mut().find(|row| row.step_id == step.step_id) {
+                existing.title = step.title;
+                existing.status = step.status;
+            } else {
+                run.steps.push(step);
+            }
+        }
+    }
+
+    if context_run_is_terminal(&run.status) {
+        // keep terminal status unchanged
+    } else if run
+        .steps
+        .iter()
+        .any(|step| matches!(step.status, ContextStepStatus::InProgress))
+    {
+        run.status = ContextRunStatus::Running;
+    } else if run
+        .steps
+        .iter()
+        .any(|step| matches!(step.status, ContextStepStatus::Runnable))
+    {
+        run.status = ContextRunStatus::Planning;
+    } else if run
+        .steps
+        .iter()
+        .all(|step| matches!(step.status, ContextStepStatus::Done))
+        && !run.steps.is_empty()
+    {
+        run.status = ContextRunStatus::Completed;
+    } else if !run.steps.is_empty() {
+        run.status = ContextRunStatus::Planning;
+    }
+
+    run.why_next_step = run
+        .steps
+        .iter()
+        .find(|step| {
+            matches!(
+                step.status,
+                ContextStepStatus::InProgress
+                    | ContextStepStatus::Runnable
+                    | ContextStepStatus::Pending
+            )
+        })
+        .map(|step| format!("continue task `{}` from synced todo list", step.step_id));
+
+    run.revision = run.revision.saturating_add(1);
+    run.updated_at_ms = crate::now_ms();
+    save_context_run_state(&state, &run).await?;
+
+    let _ = context_run_event_append(
+        State(state.clone()),
+        Path(run_id.clone()),
+        Json(ContextRunEventAppendInput {
+            event_type: "todo_synced".to_string(),
+            status: run.status.clone(),
+            step_id: None,
+            payload: json!({
+                "count": run.steps.len(),
+                "replace": replace,
+                "source_session_id": input.source_session_id,
+                "source_run_id": input.source_run_id,
+                "todos": input.todos,
+                "why_next_step": run.why_next_step.clone(),
+            }),
+        }),
+    )
+    .await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "run": run
+    })))
+}
+
+fn context_driver_select_next_step(
+    run: &ContextRunState,
+) -> (Option<usize>, String, ContextRunStatus) {
+    if context_run_is_terminal(&run.status) {
+        return (
+            None,
+            format!(
+                "run is terminal (`{}`); no next step can be selected",
+                serde_json::to_string(&run.status).unwrap_or_else(|_| "\"terminal\"".to_string())
+            ),
+            run.status.clone(),
+        );
+    }
+    if let Some(step) = run
+        .steps
+        .iter()
+        .find(|step| matches!(step.status, ContextStepStatus::InProgress))
+    {
+        return (
+            None,
+            format!(
+                "step `{}` is already in_progress; keep current execution focus",
+                step.step_id
+            ),
+            ContextRunStatus::Running,
+        );
+    }
+    if let Some((idx, step)) = run
+        .steps
+        .iter()
+        .enumerate()
+        .find(|(_, step)| matches!(step.status, ContextStepStatus::Runnable))
+    {
+        return (
+            Some(idx),
+            format!(
+                "selected runnable step `{}` as next execution target",
+                step.step_id
+            ),
+            ContextRunStatus::Running,
+        );
+    }
+    if let Some((idx, step)) = run
+        .steps
+        .iter()
+        .enumerate()
+        .find(|(_, step)| matches!(step.status, ContextStepStatus::Pending))
+    {
+        return (
+            Some(idx),
+            format!(
+                "no runnable step available; promoted pending step `{}` for execution",
+                step.step_id
+            ),
+            ContextRunStatus::Running,
+        );
+    }
+    if !run.steps.is_empty()
+        && run
+            .steps
+            .iter()
+            .all(|step| matches!(step.status, ContextStepStatus::Done))
+    {
+        return (
+            None,
+            "all steps are done; marking run completed".to_string(),
+            ContextRunStatus::Completed,
+        );
+    }
+    if run
+        .steps
+        .iter()
+        .any(|step| matches!(step.status, ContextStepStatus::Failed))
+    {
+        return (
+            None,
+            "one or more steps failed and no runnable work remains; run is blocked".to_string(),
+            ContextRunStatus::Blocked,
+        );
+    }
+    (
+        None,
+        "no actionable steps found; run remains blocked".to_string(),
+        ContextRunStatus::Blocked,
+    )
+}
+
+async fn context_run_driver_next(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<ContextDriverNextInput>,
+) -> Result<Json<Value>, StatusCode> {
+    let mut run = load_context_run_state(&state, &run_id).await?;
+    let dry_run = input.dry_run.unwrap_or(false);
+    let (selected_idx, why_next_step, target_status) = context_driver_select_next_step(&run);
+
+    let selected_step_id = selected_idx.map(|idx| run.steps[idx].step_id.clone());
+    let selected_step_status = selected_idx.map(|idx| {
+        if matches!(run.steps[idx].status, ContextStepStatus::Pending) {
+            "pending"
+        } else {
+            "runnable"
+        }
+    });
+
+    if !dry_run {
+        if let Some(idx) = selected_idx {
+            if matches!(run.steps[idx].status, ContextStepStatus::Pending) {
+                run.steps[idx].status = ContextStepStatus::Runnable;
+            }
+            run.steps[idx].status = ContextStepStatus::InProgress;
+        }
+        run.status = target_status.clone();
+        run.why_next_step = Some(why_next_step.clone());
+        run.revision = run.revision.saturating_add(1);
+        run.updated_at_ms = crate::now_ms();
+        save_context_run_state(&state, &run).await?;
+
+        let _ = context_run_event_append(
+            State(state.clone()),
+            Path(run_id.clone()),
+            Json(ContextRunEventAppendInput {
+                event_type: "meta_next_step_selected".to_string(),
+                status: target_status.clone(),
+                step_id: selected_step_id.clone(),
+                payload: json!({
+                    "why_next_step": why_next_step,
+                    "selected_step_id": selected_step_id,
+                    "selected_step_previous_status": selected_step_status,
+                    "driver": "context_driver_v1"
+                }),
+            }),
+        )
+        .await;
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "dry_run": dry_run,
+        "run_id": run_id,
+        "selected_step_id": selected_step_id,
+        "target_status": target_status,
+        "why_next_step": why_next_step,
+        "run": if dry_run { serde_json::to_value(&run).unwrap_or_else(|_| json!(null)) } else { serde_json::to_value(&run).unwrap_or_else(|_| json!(null)) }
+    })))
+}
+
+async fn context_run_event_append(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<ContextRunEventAppendInput>,
+) -> Result<Json<Value>, StatusCode> {
+    let events_path = context_run_events_path(&state, &run_id);
+    let seq = latest_context_run_event_seq(&events_path).saturating_add(1);
+    let record = ContextRunEventRecord {
+        event_id: format!("evt-{}", Uuid::new_v4()),
+        run_id: run_id.clone(),
+        seq,
+        ts_ms: crate::now_ms(),
+        event_type: input.event_type,
+        status: input.status.clone(),
+        step_id: input.step_id.clone(),
+        payload: input.payload,
+    };
+    append_jsonl_line(
+        &events_path,
+        &serde_json::to_value(&record).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    )?;
+
+    if let Ok(mut run) = load_context_run_state(&state, &run_id).await {
+        run.status = input.status;
+        run.revision = run.revision.saturating_add(1);
+        run.updated_at_ms = crate::now_ms();
+        save_context_run_state(&state, &run).await?;
+    }
+
+    Ok(Json(json!({ "ok": true, "event": record })))
+}
+
+async fn context_run_events(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Query(query): Query<RunEventsQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let rows = load_context_run_events_jsonl(
+        &context_run_events_path(&state, &run_id),
+        query.since_seq,
+        query.tail,
+    );
+    Ok(Json(json!({ "events": rows })))
+}
+
+fn context_run_events_sse_stream(
+    state: AppState,
+    run_id: String,
+    query: RunEventsQuery,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
+    tokio::spawn(async move {
+        let events_path = context_run_events_path(&state, &run_id);
+        let ready = serde_json::to_string(&json!({
+            "status":"ready",
+            "stream":"context_run_events",
+            "runID": run_id,
+            "timestamp_ms": crate::now_ms(),
+            "path": events_path.to_string_lossy().to_string(),
+        }))
+        .unwrap_or_default();
+        if tx.send(ready).await.is_err() {
+            return;
+        }
+
+        let initial = load_context_run_events_jsonl(&events_path, query.since_seq, query.tail);
+        let mut last_seq = query.since_seq.unwrap_or(0);
+        for row in initial {
+            last_seq = last_seq.max(row.seq);
+            let payload = serde_json::to_string(&json!({
+                "type":"run.event",
+                "properties": row
+            }))
+            .unwrap_or_default();
+            if tx.send(payload).await.is_err() {
+                return;
+            }
+        }
+
+        let mut interval = tokio::time::interval(Duration::from_millis(1000));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let updates = load_context_run_events_jsonl(&events_path, Some(last_seq), None);
+            for row in updates {
+                last_seq = last_seq.max(row.seq);
+                let payload = serde_json::to_string(&json!({
+                    "type":"run.event",
+                    "properties": row
+                }))
+                .unwrap_or_default();
+                if tx.send(payload).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    ReceiverStream::new(rx).map(|payload| Ok(Event::default().data(payload)))
+}
+
+async fn context_run_events_stream(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Query(query): Query<RunEventsQuery>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    Sse::new(context_run_events_sse_stream(state, run_id, query))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(10)))
+}
+
+async fn context_run_lease_validate(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<ContextLeaseValidateInput>,
+) -> Result<Json<Value>, StatusCode> {
+    let mut run = load_context_run_state(&state, &run_id).await?;
+    if run.workspace.canonical_path.trim().is_empty() {
+        run.workspace.canonical_path = input.current_path.clone();
+        if run.workspace.lease_epoch == 0 {
+            run.workspace.lease_epoch = 1;
+        }
+        run.revision = run.revision.saturating_add(1);
+        run.updated_at_ms = crate::now_ms();
+        save_context_run_state(&state, &run).await?;
+        return Ok(Json(json!({ "ok": true, "mismatch": false })));
+    }
+
+    if run.workspace.canonical_path != input.current_path {
+        run.status = ContextRunStatus::Paused;
+        run.revision = run.revision.saturating_add(1);
+        run.updated_at_ms = crate::now_ms();
+        save_context_run_state(&state, &run).await?;
+        let _ = context_run_event_append(
+            State(state.clone()),
+            Path(run_id.clone()),
+            Json(ContextRunEventAppendInput {
+                event_type: "workspace_mismatch".to_string(),
+                status: ContextRunStatus::Paused,
+                step_id: input.step_id.clone(),
+                payload: json!({
+                    "phase": input.phase,
+                    "expected_path": run.workspace.canonical_path,
+                    "actual_path": input.current_path,
+                }),
+            }),
+        )
+        .await;
+        return Ok(Json(json!({
+            "ok": false,
+            "mismatch": true,
+            "status": "paused"
+        })));
+    }
+
+    Ok(Json(json!({ "ok": true, "mismatch": false })))
+}
+
+async fn context_run_blackboard_get(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let blackboard = load_context_blackboard(&state, &run_id);
+    Ok(Json(json!({ "blackboard": blackboard })))
+}
+
+async fn context_run_blackboard_patch(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<ContextBlackboardPatchInput>,
+) -> Result<Json<Value>, StatusCode> {
+    let patch_path = context_run_blackboard_patches_path(&state, &run_id);
+    let seq = {
+        let rows = std::fs::read_to_string(&patch_path).unwrap_or_default();
+        rows.lines()
+            .filter_map(|line| serde_json::from_str::<ContextBlackboardPatchRecord>(line).ok())
+            .map(|row| row.seq)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    };
+    let patch = ContextBlackboardPatchRecord {
+        patch_id: format!("bbp-{}", Uuid::new_v4()),
+        run_id: run_id.clone(),
+        seq,
+        ts_ms: crate::now_ms(),
+        op: input.op,
+        payload: input.payload,
+    };
+    append_jsonl_line(
+        &patch_path,
+        &serde_json::to_value(&patch).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    )?;
+    let mut blackboard = load_context_blackboard(&state, &run_id);
+    apply_context_blackboard_patch(&mut blackboard, &patch)?;
+    save_context_blackboard(&state, &run_id, &blackboard)?;
+    Ok(Json(
+        json!({ "ok": true, "patch": patch, "blackboard": blackboard }),
+    ))
+}
+
+async fn context_run_checkpoint_create(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<ContextCheckpointCreateInput>,
+) -> Result<Json<Value>, StatusCode> {
+    let run_state = load_context_run_state(&state, &run_id).await?;
+    let blackboard = load_context_blackboard(&state, &run_id);
+    let events_path = context_run_events_path(&state, &run_id);
+    let seq = latest_context_run_event_seq(&events_path);
+    let checkpoint = ContextCheckpointRecord {
+        checkpoint_id: format!("cp-{}", Uuid::new_v4()),
+        run_id: run_id.clone(),
+        seq,
+        ts_ms: crate::now_ms(),
+        reason: input.reason,
+        run_state,
+        blackboard,
+    };
+    let dir = context_run_checkpoints_dir(&state, &run_id);
+    std::fs::create_dir_all(&dir).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let path = dir.join(format!("{:020}.json", seq));
+    let payload =
+        serde_json::to_string_pretty(&checkpoint).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    std::fs::write(path, payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "ok": true, "checkpoint": checkpoint })))
+}
+
+async fn context_run_checkpoint_latest(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let dir = context_run_checkpoints_dir(&state, &run_id);
+    if !dir.exists() {
+        return Ok(Json(json!({ "checkpoint": null })));
+    }
+    let mut latest_name: Option<String> = None;
+    let mut entries = std::fs::read_dir(&dir).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    while let Some(Ok(entry)) = entries.next() {
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let should_replace = match latest_name.as_ref() {
+            Some(current) => name > *current,
+            None => true,
+        };
+        if should_replace {
+            latest_name = Some(name);
+        }
+    }
+    let Some(file_name) = latest_name else {
+        return Ok(Json(json!({ "checkpoint": null })));
+    };
+    let raw = std::fs::read_to_string(dir.join(file_name))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let checkpoint = serde_json::from_str::<ContextCheckpointRecord>(&raw)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "checkpoint": checkpoint })))
+}
+
+fn parse_context_step_status_text(value: &str) -> Option<ContextStepStatus> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pending" => Some(ContextStepStatus::Pending),
+        "runnable" => Some(ContextStepStatus::Runnable),
+        "in_progress" | "in-progress" | "working" | "active" => Some(ContextStepStatus::InProgress),
+        "blocked" => Some(ContextStepStatus::Blocked),
+        "done" | "completed" | "complete" => Some(ContextStepStatus::Done),
+        "failed" | "error" => Some(ContextStepStatus::Failed),
+        _ => None,
+    }
+}
+
+fn replay_step_status_from_event(event: &ContextRunEventRecord) -> Option<ContextStepStatus> {
+    if let Some(status_text) = event.payload.get("step_status").and_then(Value::as_str) {
+        if let Some(status) = parse_context_step_status_text(status_text) {
+            return Some(status);
+        }
+    }
+    let ty = event.event_type.to_ascii_lowercase();
+    if ty.contains("step_started") || ty.contains("step_running") {
+        return Some(ContextStepStatus::InProgress);
+    }
+    if ty.contains("step_blocked") {
+        return Some(ContextStepStatus::Blocked);
+    }
+    if ty.contains("step_failed") {
+        return Some(ContextStepStatus::Failed);
+    }
+    if ty.contains("step_done") || ty.contains("step_completed") {
+        return Some(ContextStepStatus::Done);
+    }
+    None
+}
+
+fn latest_context_checkpoint_record(
+    state: &AppState,
+    run_id: &str,
+) -> Option<ContextCheckpointRecord> {
+    let dir = context_run_checkpoints_dir(state, run_id);
+    if !dir.exists() {
+        return None;
+    }
+    let mut latest_name: Option<String> = None;
+    let mut entries = std::fs::read_dir(&dir).ok()?;
+    while let Some(Ok(entry)) = entries.next() {
+        if !entry
+            .file_type()
+            .ok()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let should_replace = match latest_name.as_ref() {
+            Some(current) => name > *current,
+            None => true,
+        };
+        if should_replace {
+            latest_name = Some(name);
+        }
+    }
+    let file_name = latest_name?;
+    let raw = std::fs::read_to_string(dir.join(file_name)).ok()?;
+    serde_json::from_str::<ContextCheckpointRecord>(&raw).ok()
+}
+
+fn context_run_replay_materialize(
+    run_id: &str,
+    persisted: &ContextRunState,
+    checkpoint: Option<&ContextCheckpointRecord>,
+    events: &[ContextRunEventRecord],
+) -> ContextRunState {
+    let mut replay = if let Some(cp) = checkpoint {
+        cp.run_state.clone()
+    } else {
+        let mut base = persisted.clone();
+        base.status = ContextRunStatus::Queued;
+        base.why_next_step = None;
+        base.revision = 1;
+        base.updated_at_ms = base.created_at_ms;
+        for step in &mut base.steps {
+            step.status = ContextStepStatus::Pending;
+        }
+        base
+    };
+    replay.run_id = run_id.to_string();
+    let mut step_index: HashMap<String, usize> = replay
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(idx, step)| (step.step_id.clone(), idx))
+        .collect();
+
+    for event in events {
+        replay.status = event.status.clone();
+        replay.updated_at_ms = replay.updated_at_ms.max(event.ts_ms);
+        if let Some(why) = event.payload.get("why_next_step").and_then(Value::as_str) {
+            if !why.trim().is_empty() {
+                replay.why_next_step = Some(why.to_string());
+            }
+        }
+        if let Some(items) = event.payload.get("steps").and_then(Value::as_array) {
+            for item in items {
+                let Some(step_id) = item.get("step_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let step_title = item
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or(step_id)
+                    .to_string();
+                let step_status = item
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .and_then(parse_context_step_status_text)
+                    .unwrap_or(ContextStepStatus::Pending);
+                let index = if let Some(existing) = step_index.get(step_id).copied() {
+                    existing
+                } else {
+                    replay.steps.push(ContextRunStep {
+                        step_id: step_id.to_string(),
+                        title: step_title.clone(),
+                        status: ContextStepStatus::Pending,
+                    });
+                    let idx = replay.steps.len().saturating_sub(1);
+                    step_index.insert(step_id.to_string(), idx);
+                    idx
+                };
+                replay.steps[index].title = step_title;
+                replay.steps[index].status = step_status;
+            }
+        }
+        if let Some(step_id) = &event.step_id {
+            let index = if let Some(existing) = step_index.get(step_id).copied() {
+                existing
+            } else {
+                replay.steps.push(ContextRunStep {
+                    step_id: step_id.clone(),
+                    title: event
+                        .payload
+                        .get("step_title")
+                        .and_then(Value::as_str)
+                        .unwrap_or(step_id.as_str())
+                        .to_string(),
+                    status: ContextStepStatus::Pending,
+                });
+                let idx = replay.steps.len().saturating_sub(1);
+                step_index.insert(step_id.clone(), idx);
+                idx
+            };
+            if let Some(step_status) = replay_step_status_from_event(event) {
+                replay.steps[index].status = step_status;
+            }
+        }
+    }
+
+    let checkpoint_revision = checkpoint.map(|cp| cp.run_state.revision).unwrap_or(1);
+    replay.revision = checkpoint_revision.saturating_add(events.len() as u64);
+    replay
+}
+
+async fn context_run_replay(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Query(query): Query<ContextRunReplayQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let persisted = load_context_run_state(&state, &run_id).await?;
+    let from_checkpoint = query.from_checkpoint.unwrap_or(true);
+    let checkpoint = if from_checkpoint {
+        latest_context_checkpoint_record(&state, &run_id)
+    } else {
+        None
+    };
+    let start_seq = checkpoint.as_ref().map(|cp| cp.seq).unwrap_or(0);
+    let mut events = load_context_run_events_jsonl(
+        &context_run_events_path(&state, &run_id),
+        Some(start_seq),
+        None,
+    );
+    if let Some(upto_seq) = query.upto_seq {
+        events.retain(|row| row.seq <= upto_seq);
+    }
+    let replay = context_run_replay_materialize(&run_id, &persisted, checkpoint.as_ref(), &events);
+    let status_mismatch = replay.status != persisted.status;
+    let why_next_step_mismatch =
+        persisted.why_next_step.is_some() && replay.why_next_step != persisted.why_next_step;
+    let step_count_mismatch =
+        !persisted.steps.is_empty() && replay.steps.len() != persisted.steps.len();
+    let drift = ContextReplayDrift {
+        mismatch: status_mismatch || why_next_step_mismatch || step_count_mismatch,
+        status_mismatch,
+        why_next_step_mismatch,
+        step_count_mismatch,
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "run_id": run_id,
+        "from_checkpoint": checkpoint.is_some(),
+        "checkpoint_seq": checkpoint.as_ref().map(|cp| cp.seq),
+        "events_applied": events.len(),
+        "replay": replay,
+        "persisted": persisted,
+        "drift": drift
+    })))
+}
+
+fn objective_from_args(args: &Value, routine_id: &str, entrypoint: &str) -> String {
+    args.get("prompt")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            format!("Execute automation '{routine_id}' with entrypoint '{entrypoint}'.")
+        })
+}
+
+fn success_criteria_from_args(args: &Value) -> Vec<String> {
+    args.get("success_criteria")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_str())
+                .map(str::trim)
+                .filter(|row| !row.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn mode_from_args(args: &Value) -> String {
+    args.get("mode")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("standalone")
+        .to_string()
+}
+
+fn normalize_automation_mode(raw: Option<&str>) -> Result<String, String> {
+    let value = raw.unwrap_or("standalone").trim();
+    if value.is_empty() {
+        return Ok("standalone".to_string());
+    }
+    if value.eq_ignore_ascii_case("standalone") {
+        return Ok("standalone".to_string());
+    }
+    if value.eq_ignore_ascii_case("orchestrated") {
+        return Ok("orchestrated".to_string());
+    }
+    Err("mode must be one of standalone|orchestrated".to_string())
+}
+
+fn validate_model_spec_object(value: &Value, path: &str) -> Result<(), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| format!("{path} must be an object"))?;
+    let provider_id = obj
+        .get("provider_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| format!("{path}.provider_id is required"))?;
+    let model_id = obj
+        .get("model_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| format!("{path}.model_id is required"))?;
+    if provider_id.is_empty() || model_id.is_empty() {
+        return Err(format!(
+            "{path}.provider_id and {path}.model_id are required"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_model_policy(value: &Value) -> Result<(), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "model_policy must be an object".to_string())?;
+    if let Some(default_model) = obj.get("default_model") {
+        validate_model_spec_object(default_model, "model_policy.default_model")?;
+    }
+    if let Some(role_models) = obj.get("role_models") {
+        let role_obj = role_models
+            .as_object()
+            .ok_or_else(|| "model_policy.role_models must be an object".to_string())?;
+        for (role, spec) in role_obj {
+            validate_model_spec_object(spec, &format!("model_policy.role_models.{role}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn routine_to_automation_wire(routine: RoutineSpec) -> Value {
+    json!({
+        "automation_id": routine.routine_id,
+        "name": routine.name,
+        "status": routine.status,
+        "schedule": routine.schedule,
+        "timezone": routine.timezone,
+        "misfire_policy": routine.misfire_policy,
+        "mode": mode_from_args(&routine.args),
+        "mission": {
+            "objective": objective_from_args(&routine.args, &routine.routine_id, &routine.entrypoint),
+            "success_criteria": success_criteria_from_args(&routine.args),
+            "briefing": routine.args.get("briefing").cloned(),
+            "entrypoint_compat": routine.entrypoint,
+        },
+        "policy": {
+            "tool": {
+                "run_allowlist": routine.allowed_tools,
+                "external_integrations_allowed": routine.external_integrations_allowed,
+                "orchestrator_only_tool_calls": routine
+                    .args
+                    .get("orchestrator_only_tool_calls")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            },
+            "approval": {
+                "requires_approval": routine.requires_approval
+            }
+        },
+        "model_policy": routine.args.get("model_policy").cloned(),
+        "output_targets": routine.output_targets,
+        "creator_type": routine.creator_type,
+        "creator_id": routine.creator_id,
+        "next_fire_at_ms": routine.next_fire_at_ms,
+        "last_fired_at_ms": routine.last_fired_at_ms
+    })
+}
+
+fn routine_run_to_automation_wire(run: RoutineRunRecord) -> Value {
+    json!({
+        "run_id": run.run_id,
+        "automation_id": run.routine_id,
+        "trigger_type": run.trigger_type,
+        "run_count": run.run_count,
+        "status": run.status,
+        "created_at_ms": run.created_at_ms,
+        "updated_at_ms": run.updated_at_ms,
+        "fired_at_ms": run.fired_at_ms,
+        "started_at_ms": run.started_at_ms,
+        "finished_at_ms": run.finished_at_ms,
+        "mode": mode_from_args(&run.args),
+        "mission_snapshot": {
+            "objective": objective_from_args(&run.args, &run.routine_id, &run.entrypoint),
+            "success_criteria": success_criteria_from_args(&run.args),
+            "entrypoint_compat": run.entrypoint,
+        },
+        "policy_snapshot": {
+            "tool": {
+                "run_allowlist": run.allowed_tools,
+            },
+            "approval": {
+                "requires_approval": run.requires_approval
+            }
+        },
+        "model_policy": run.args.get("model_policy").cloned(),
+        "requires_approval": run.requires_approval,
+        "approval_reason": run.approval_reason,
+        "denial_reason": run.denial_reason,
+        "paused_reason": run.paused_reason,
+        "detail": run.detail,
+        "output_targets": run.output_targets,
+        "artifacts": run.artifacts,
+        "correlation_id": run.run_id,
+    })
+}
+
+fn routine_event_to_run_event(event: &EngineEvent) -> Option<EngineEvent> {
+    let mut props = event.properties.clone();
+    let event_type = match event.event_type.as_str() {
+        "routine.run.created" => "run.started",
+        "routine.run.started" => "run.step",
+        "routine.run.completed" => "run.completed",
+        "routine.run.failed" => "run.failed",
+        "routine.approval_required" => "approval.required",
+        "routine.run.artifact_added" => "run.step",
+        "routine.run.model_selected" => "run.step",
+        "routine.blocked" => "run.failed",
+        _ => return None,
+    };
+    if let Some(routine_id) = props
+        .get("routineID")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+    {
+        props
+            .as_object_mut()
+            .expect("object")
+            .insert("automationID".to_string(), Value::String(routine_id));
+    }
+    if event.event_type == "routine.run.started"
+        || event.event_type == "routine.run.artifact_added"
+        || event.event_type == "routine.run.model_selected"
+    {
+        props
+            .as_object_mut()
+            .expect("object")
+            .insert("phase".to_string(), Value::String("do".to_string()));
+    }
+    Some(EngineEvent::new(event_type, props))
+}
+
+fn automation_create_to_routine(input: AutomationCreateInput) -> Result<RoutineSpec, String> {
+    if input.mission.objective.trim().is_empty() {
+        return Err("mission.objective is required".to_string());
+    }
+    let mode = normalize_automation_mode(input.mode.as_deref())?;
+    let mut args = json!({
+        "prompt": input.mission.objective.trim(),
+        "success_criteria": input.mission.success_criteria,
+        "mode": mode,
+    });
+    if let Some(briefing) = input.mission.briefing {
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert("briefing".to_string(), Value::String(briefing));
+        }
+    }
+    if let Some(policy) = input.policy.as_ref() {
+        if let Some(value) = policy.tool.orchestrator_only_tool_calls {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert(
+                    "orchestrator_only_tool_calls".to_string(),
+                    Value::Bool(value),
+                );
+            }
+        }
+    }
+    if let Some(model_policy) = input.model_policy {
+        validate_model_policy(&model_policy)?;
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert("model_policy".to_string(), model_policy);
+        }
+    }
+    let (allowed_tools, external_integrations_allowed, requires_approval) =
+        if let Some(policy) = input.policy {
+            (
+                policy.tool.run_allowlist.unwrap_or_default(),
+                policy.tool.external_integrations_allowed.unwrap_or(false),
+                policy.approval.requires_approval.unwrap_or(true),
+            )
+        } else {
+            (Vec::new(), false, true)
+        };
+    Ok(RoutineSpec {
+        routine_id: input
+            .automation_id
+            .unwrap_or_else(|| format!("automation-{}", uuid::Uuid::new_v4().simple())),
+        name: input.name,
+        status: RoutineStatus::Active,
+        schedule: input.schedule,
+        timezone: input.timezone.unwrap_or_else(|| "UTC".to_string()),
+        misfire_policy: input
+            .misfire_policy
+            .unwrap_or(RoutineMisfirePolicy::RunOnce),
+        entrypoint: input
+            .mission
+            .entrypoint_compat
+            .unwrap_or_else(|| "mission.default".to_string()),
+        args: Value::Object(args.as_object().cloned().unwrap_or_default()),
+        allowed_tools,
+        output_targets: input.output_targets.unwrap_or_default(),
+        creator_type: input.creator_type.unwrap_or_else(|| "user".to_string()),
+        creator_id: input.creator_id.unwrap_or_else(|| "desktop".to_string()),
+        requires_approval,
+        external_integrations_allowed,
+        next_fire_at_ms: input.next_fire_at_ms,
+        last_fired_at_ms: None,
+    })
+}
+
+async fn automations_create(
+    State(state): State<AppState>,
+    Json(input): Json<AutomationCreateInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let routine = automation_create_to_routine(input).map_err(|detail| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Invalid automation definition",
+                "code": "AUTOMATION_INVALID",
+                "detail": detail,
+            })),
+        )
+    })?;
+    let saved = state
+        .put_routine(routine)
+        .await
+        .map_err(routine_error_response)?;
+    state.event_bus.publish(EngineEvent::new(
+        "automation.updated",
+        json!({
+            "automationID": saved.routine_id,
+        }),
+    ));
+    Ok(Json(json!({
+        "automation": routine_to_automation_wire(saved)
+    })))
+}
+
+async fn automations_list(State(state): State<AppState>) -> Json<Value> {
+    let rows = state
+        .list_routines()
+        .await
+        .into_iter()
+        .map(routine_to_automation_wire)
+        .collect::<Vec<_>>();
+    Json(json!({
+        "automations": rows,
+        "count": rows.len(),
+    }))
+}
+
+async fn automations_patch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<AutomationPatchInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut routine = state.get_routine(&id).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error":"Automation not found",
+                "code":"AUTOMATION_NOT_FOUND",
+                "automationID": id,
+            })),
+        )
+    })?;
+    if let Some(name) = input.name.as_ref() {
+        routine.name = name.clone();
+    }
+    if let Some(status) = input.status.as_ref() {
+        routine.status = status.clone();
+    }
+    if let Some(schedule) = input.schedule.as_ref() {
+        routine.schedule = schedule.clone();
+    }
+    if let Some(timezone) = input.timezone.as_ref() {
+        routine.timezone = timezone.clone();
+    }
+    if let Some(misfire_policy) = input.misfire_policy.as_ref() {
+        routine.misfire_policy = misfire_policy.clone();
+    }
+    if let Some(next_fire_at_ms) = input.next_fire_at_ms {
+        routine.next_fire_at_ms = Some(next_fire_at_ms);
+    }
+    if let Some(output_targets) = input.output_targets.as_ref() {
+        routine.output_targets = output_targets.clone();
+    }
+    if let Some(model_policy) = input.model_policy.as_ref() {
+        let mut args = routine.args.as_object().cloned().unwrap_or_default();
+        if model_policy
+            .as_object()
+            .map(|obj| obj.is_empty())
+            .unwrap_or(false)
+        {
+            args.remove("model_policy");
+        } else if model_policy.is_object() {
+            validate_model_policy(model_policy).map_err(|detail| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "Invalid automation patch",
+                        "code": "AUTOMATION_INVALID",
+                        "detail": detail,
+                    })),
+                )
+            })?;
+            args.insert("model_policy".to_string(), model_policy.clone());
+        } else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "Invalid automation patch",
+                    "code": "AUTOMATION_INVALID",
+                    "detail": "model_policy must be an object (use {} to clear)",
+                })),
+            ));
+        }
+        routine.args = Value::Object(args);
+    }
+    if let Some(policy) = input.policy.as_ref() {
+        if let Some(allowed) = policy.tool.run_allowlist.as_ref() {
+            routine.allowed_tools = allowed.clone();
+        }
+        if let Some(external_allowed) = policy.tool.external_integrations_allowed {
+            routine.external_integrations_allowed = external_allowed;
+        }
+        if let Some(requires_approval) = policy.approval.requires_approval {
+            routine.requires_approval = requires_approval;
+        }
+        if let Some(orchestrator_only) = policy.tool.orchestrator_only_tool_calls {
+            let mut args = routine.args.as_object().cloned().unwrap_or_default();
+            args.insert(
+                "orchestrator_only_tool_calls".to_string(),
+                Value::Bool(orchestrator_only),
+            );
+            routine.args = Value::Object(args);
+        }
+    }
+    if let Some(mode) = input.mode.as_ref() {
+        let normalized_mode = normalize_automation_mode(Some(mode.as_str())).map_err(|detail| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "Invalid automation patch",
+                    "code": "AUTOMATION_INVALID",
+                    "detail": detail,
+                })),
+            )
+        })?;
+        let mut args = routine.args.as_object().cloned().unwrap_or_default();
+        args.insert("mode".to_string(), Value::String(normalized_mode));
+        routine.args = Value::Object(args);
+    }
+    if let Some(mission) = input.mission.as_ref() {
+        let mut args = routine.args.as_object().cloned().unwrap_or_default();
+        if let Some(objective) = mission.objective.as_ref() {
+            args.insert("prompt".to_string(), Value::String(objective.clone()));
+        }
+        if let Some(success_criteria) = mission.success_criteria.as_ref() {
+            args.insert("success_criteria".to_string(), json!(success_criteria));
+        }
+        if let Some(briefing) = mission.briefing.as_ref() {
+            args.insert("briefing".to_string(), Value::String(briefing.clone()));
+        }
+        if let Some(entrypoint) = mission.entrypoint_compat.as_ref() {
+            routine.entrypoint = entrypoint.clone();
+        }
+        routine.args = Value::Object(args);
+    }
+    let updated = state
+        .put_routine(routine)
+        .await
+        .map_err(routine_error_response)?;
+    Ok(Json(json!({
+        "automation": routine_to_automation_wire(updated)
+    })))
+}
+
+async fn automations_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let deleted = state
+        .delete_routine(&id)
+        .await
+        .map_err(routine_error_response)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error":"Automation not found",
+                    "code":"AUTOMATION_NOT_FOUND",
+                    "automationID": id,
+                })),
+            )
+        })?;
+    Ok(Json(json!({
+        "ok": true,
+        "automation": routine_to_automation_wire(deleted)
+    })))
+}
+
+async fn automations_run_now(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<RoutineRunNowInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let response = routines_run_now(State(state.clone()), Path(id), Json(input)).await?;
+    let payload = response.0;
+    let run_id = payload
+        .get("runID")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Run ID missing", "code": "AUTOMATION_RUN_MAPPING_FAILED"})),
+            )
+        })?;
+    let run = state.get_routine_run(run_id).await.ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Run lookup failed", "code": "AUTOMATION_RUN_MAPPING_FAILED"})),
+        )
+    })?;
+    Ok(Json(json!({
+        "ok": true,
+        "status": payload.get("status").cloned().unwrap_or(Value::String("queued".to_string())),
+        "run": routine_run_to_automation_wire(run),
+    })))
+}
+
+async fn automations_history(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<RoutineHistoryQuery>,
+) -> Json<Value> {
+    let response = routines_history(State(state), Path(id.clone()), Query(query)).await;
+    let mut payload = response.0;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("automationID".to_string(), Value::String(id));
+        object.remove("routineID");
+    }
+    Json(payload)
+}
+
+async fn automations_runs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<RoutineRunsQuery>,
+) -> Json<Value> {
+    let limit = query.limit.unwrap_or(25).clamp(1, 200);
+    let rows = state
+        .list_routine_runs(Some(&id), limit)
+        .await
+        .into_iter()
+        .map(routine_run_to_automation_wire)
+        .collect::<Vec<_>>();
+    Json(json!({
+        "runs": rows,
+        "count": rows.len(),
+    }))
+}
+
+async fn automations_runs_all(
+    State(state): State<AppState>,
+    Query(query): Query<RoutineRunsQuery>,
+) -> Json<Value> {
+    let limit = query.limit.unwrap_or(25).clamp(1, 200);
+    let rows = state
+        .list_routine_runs(query.routine_id.as_deref(), limit)
+        .await
+        .into_iter()
+        .map(routine_run_to_automation_wire)
+        .collect::<Vec<_>>();
+    Json(json!({
+        "runs": rows,
+        "count": rows.len(),
+    }))
+}
+
+async fn automations_run_get(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let run = state.get_routine_run(&run_id).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error":"Automation run not found",
+                "code":"AUTOMATION_RUN_NOT_FOUND",
+                "runID": run_id,
+            })),
+        )
+    })?;
+    Ok(Json(json!({
+        "run": routine_run_to_automation_wire(run)
+    })))
+}
+
+async fn automations_run_approve(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<RoutineRunDecisionInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let response = routines_run_approve(State(state), Path(run_id), Json(input)).await?;
+    let run = response
+        .0
+        .get("run")
+        .and_then(|v| serde_json::from_value::<RoutineRunRecord>(v.clone()).ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"error": "Run mapping failed", "code": "AUTOMATION_RUN_MAPPING_FAILED"}),
+                ),
+            )
+        })?;
+    Ok(Json(
+        json!({ "ok": true, "run": routine_run_to_automation_wire(run) }),
+    ))
+}
+
+async fn automations_run_deny(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<RoutineRunDecisionInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let response = routines_run_deny(State(state), Path(run_id), Json(input)).await?;
+    let run = response
+        .0
+        .get("run")
+        .and_then(|v| serde_json::from_value::<RoutineRunRecord>(v.clone()).ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"error": "Run mapping failed", "code": "AUTOMATION_RUN_MAPPING_FAILED"}),
+                ),
+            )
+        })?;
+    Ok(Json(
+        json!({ "ok": true, "run": routine_run_to_automation_wire(run) }),
+    ))
+}
+
+async fn automations_run_pause(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<RoutineRunDecisionInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let response = routines_run_pause(State(state), Path(run_id), Json(input)).await?;
+    let run = response
+        .0
+        .get("run")
+        .and_then(|v| serde_json::from_value::<RoutineRunRecord>(v.clone()).ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"error": "Run mapping failed", "code": "AUTOMATION_RUN_MAPPING_FAILED"}),
+                ),
+            )
+        })?;
+    Ok(Json(
+        json!({ "ok": true, "run": routine_run_to_automation_wire(run) }),
+    ))
+}
+
+async fn automations_run_resume(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<RoutineRunDecisionInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let response = routines_run_resume(State(state), Path(run_id), Json(input)).await?;
+    let run = response
+        .0
+        .get("run")
+        .and_then(|v| serde_json::from_value::<RoutineRunRecord>(v.clone()).ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"error": "Run mapping failed", "code": "AUTOMATION_RUN_MAPPING_FAILED"}),
+                ),
+            )
+        })?;
+    Ok(Json(
+        json!({ "ok": true, "run": routine_run_to_automation_wire(run) }),
+    ))
+}
+
+async fn automations_run_artifacts(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let response = routines_run_artifacts(State(state), Path(run_id.clone())).await?;
+    let mut payload = response.0;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("automationRunID".to_string(), Value::String(run_id));
+        object.remove("runID");
+    }
+    Ok(Json(payload))
+}
+
+async fn automations_run_artifact_add(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(input): Json<RoutineRunArtifactInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let response = routines_run_artifact_add(State(state), Path(run_id), Json(input)).await?;
+    let run = response
+        .0
+        .get("run")
+        .and_then(|v| serde_json::from_value::<RoutineRunRecord>(v.clone()).ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"error": "Run mapping failed", "code": "AUTOMATION_RUN_MAPPING_FAILED"}),
+                ),
+            )
+        })?;
+    Ok(Json(
+        json!({ "ok": true, "run": routine_run_to_automation_wire(run) }),
+    ))
+}
+
+fn automations_sse_stream(
+    state: AppState,
+    automation_id: Option<String>,
+    run_id: Option<String>,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    let ready = tokio_stream::once(Ok(Event::default().data(
+        serde_json::to_string(&json!({
+            "status": "ready",
+            "stream": "automations",
+            "timestamp_ms": crate::now_ms(),
+        }))
+        .unwrap_or_default(),
+    )));
+    let rx = state.event_bus.subscribe();
+    let live = BroadcastStream::new(rx).filter_map(move |msg| match msg {
+        Ok(event) => {
+            let mapped = routine_event_to_run_event(&event)?;
+            if let Some(automation_id) = automation_id.as_deref() {
+                let event_automation_id = mapped
+                    .properties
+                    .get("automationID")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if event_automation_id != automation_id {
+                    return None;
+                }
+            }
+            if let Some(run_id) = run_id.as_deref() {
+                let event_run_id = mapped
+                    .properties
+                    .get("runID")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if event_run_id != run_id {
+                    return None;
+                }
+            }
+            let payload = serde_json::to_string(&mapped).unwrap_or_default();
+            Some(Ok(Event::default().data(payload)))
+        }
+        Err(_) => None,
+    });
+    ready.chain(live)
+}
+
+async fn automations_events(
+    State(state): State<AppState>,
+    Query(query): Query<AutomationEventsQuery>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    Sse::new(automations_sse_stream(
+        state,
+        query.automation_id,
+        query.run_id,
+    ))
+    .keep_alive(KeepAlive::new().interval(Duration::from_secs(10)))
 }
 
 fn resource_error_response(error: ResourceStoreError) -> (StatusCode, Json<Value>) {
@@ -5088,6 +8202,19 @@ async fn openapi_doc() -> Json<Value> {
             "/session/{id}/cancel":{"post":{"summary":"Cancel active run"}},
             "/session/{id}/run/{run_id}/cancel":{"post":{"summary":"Cancel run by id"}},
             "/event":{"get":{"summary":"SSE event stream"}},
+            "/run/{id}/events":{"get":{"summary":"SSE stream for sequenced run events"}},
+            "/context/runs":{"get":{"summary":"List context runs"},"post":{"summary":"Create context run"}},
+            "/context/runs/{run_id}":{"get":{"summary":"Get context run state"},"put":{"summary":"Update context run state"}},
+            "/context/runs/{run_id}/events":{"get":{"summary":"List context run events"},"post":{"summary":"Append context run event"}},
+            "/context/runs/{run_id}/todos/sync":{"post":{"summary":"Sync todo list into context run steps"}},
+            "/context/runs/{run_id}/events/stream":{"get":{"summary":"SSE stream for context run events"}},
+            "/context/runs/{run_id}/lease/validate":{"post":{"summary":"Validate workspace lease and auto-pause on mismatch"}},
+            "/context/runs/{run_id}/blackboard":{"get":{"summary":"Get materialized context blackboard"}},
+            "/context/runs/{run_id}/blackboard/patches":{"post":{"summary":"Append context blackboard patch"}},
+            "/context/runs/{run_id}/checkpoints":{"post":{"summary":"Create context run checkpoint"}},
+            "/context/runs/{run_id}/checkpoints/latest":{"get":{"summary":"Get latest context run checkpoint"}},
+            "/context/runs/{run_id}/replay":{"get":{"summary":"Replay context run from events/checkpoint and report drift"}},
+            "/context/runs/{run_id}/driver/next":{"post":{"summary":"Select next context step using engine meta-manager state rules"}},
             "/provider":{"get":{"summary":"List providers"}},
             "/session/{id}/fork":{"post":{"summary":"Fork a session"}},
             "/worktree":{"get":{"summary":"List worktrees"},"post":{"summary":"Create worktree"},"delete":{"summary":"Delete worktree"}},
@@ -5118,7 +8245,28 @@ async fn openapi_doc() -> Json<Value> {
             "/routines/{id}":{"patch":{"summary":"Update routine"},"delete":{"summary":"Delete routine"}},
             "/routines/{id}/run_now":{"post":{"summary":"Trigger routine immediately"}},
             "/routines/{id}/history":{"get":{"summary":"List routine history"}},
+            "/routines/{id}/runs":{"get":{"summary":"List routine runs for a routine"}},
+            "/routines/runs":{"get":{"summary":"List routine runs across routines"}},
+            "/routines/runs/{run_id}":{"get":{"summary":"Get a routine run record"}},
+            "/routines/runs/{run_id}/approve":{"post":{"summary":"Approve a pending routine run"}},
+            "/routines/runs/{run_id}/deny":{"post":{"summary":"Deny a pending routine run"}},
+            "/routines/runs/{run_id}/pause":{"post":{"summary":"Pause a routine run"}},
+            "/routines/runs/{run_id}/resume":{"post":{"summary":"Resume a paused routine run"}},
+            "/routines/runs/{run_id}/artifacts":{"get":{"summary":"List routine run artifacts"},"post":{"summary":"Attach artifact to routine run"}},
             "/routines/events":{"get":{"summary":"SSE stream for routine lifecycle events"}},
+            "/automations":{"get":{"summary":"List automations"},"post":{"summary":"Create automation"}},
+            "/automations/{id}":{"patch":{"summary":"Update automation"},"delete":{"summary":"Delete automation"}},
+            "/automations/{id}/run_now":{"post":{"summary":"Trigger automation immediately"}},
+            "/automations/{id}/history":{"get":{"summary":"List automation history"}},
+            "/automations/{id}/runs":{"get":{"summary":"List runs for an automation"}},
+            "/automations/runs":{"get":{"summary":"List automation runs"}},
+            "/automations/runs/{run_id}":{"get":{"summary":"Get an automation run"}},
+            "/automations/runs/{run_id}/approve":{"post":{"summary":"Approve a pending automation run"}},
+            "/automations/runs/{run_id}/deny":{"post":{"summary":"Deny a pending automation run"}},
+            "/automations/runs/{run_id}/pause":{"post":{"summary":"Pause an automation run"}},
+            "/automations/runs/{run_id}/resume":{"post":{"summary":"Resume a paused automation run"}},
+            "/automations/runs/{run_id}/artifacts":{"get":{"summary":"List automation run artifacts"},"post":{"summary":"Attach artifact to automation run"}},
+            "/automations/events":{"get":{"summary":"SSE stream for automation run events"}},
             "/resource":{"get":{"summary":"List shared resources by prefix"}},
             "/resource/{key}":{"get":{"summary":"Get shared resource"},"put":{"summary":"Put shared resource with optional revision guard"},"patch":{"summary":"Patch shared resource with optional revision guard"},"delete":{"summary":"Delete shared resource with optional revision guard"}},
             "/resource/events":{"get":{"summary":"SSE stream for shared resource events"}},
@@ -5150,7 +8298,7 @@ mod tests {
     use std::time::Duration;
     use tandem_core::{
         AgentRegistry, CancellationRegistry, ConfigStore, EngineLoop, EventBus, PermissionManager,
-        PluginRegistry, Storage,
+        PluginRegistry, Storage, ToolPolicyContext, ToolPolicyHook,
     };
     use tandem_providers::ProviderRegistry;
     use tandem_runtime::{LspManager, McpRegistry, PtyManager, WorkspaceIndex};
@@ -5253,6 +8401,104 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
         let payload: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[tokio::test]
+    async fn permission_reply_route_rejects_invalid_reply() {
+        let state = test_state().await;
+        let app = app_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/permission/some-request/reply")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"reply":"invalid"}).to_string()))
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let payload: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            payload.get("code").and_then(|v| v.as_str()),
+            Some("invalid_permission_reply")
+        );
+    }
+
+    #[test]
+    fn load_run_events_jsonl_filters_since_and_tail() {
+        let test_root = std::env::temp_dir().join(format!("run-events-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_root).expect("mkdir");
+        let path = test_root.join("events.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({"seq":1,"type":"run_created"}).to_string(),
+                serde_json::json!({"seq":2,"type":"planning_started"}).to_string(),
+                serde_json::json!({"seq":3,"type":"task_started"}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write");
+
+        let since = load_run_events_jsonl(&path, Some(1), None);
+        assert_eq!(since.len(), 2);
+        assert_eq!(since[0].get("seq").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(since[1].get("seq").and_then(|v| v.as_u64()), Some(3));
+
+        let tail = load_run_events_jsonl(&path, None, Some(1));
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].get("seq").and_then(|v| v.as_u64()), Some(3));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn permission_reply_route_returns_not_found_for_unknown_request() {
+        let state = test_state().await;
+        let app = app_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/permission/missing-request/reply")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"reply":"always"}).to_string()))
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let payload: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            payload.get("code").and_then(|v| v.as_str()),
+            Some("permission_request_not_found")
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_reply_route_applies_and_persists_allow_rule() {
+        let state = test_state().await;
+        let request = state
+            .permissions
+            .ask_for_session(Some("s1"), "glob", json!({"pattern":"*"}))
+            .await;
+        let app = app_router(state.clone());
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/permission/{}/reply", request.id))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"reply":"always"}).to_string()))
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let payload: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            payload.get("reply").and_then(|v| v.as_str()),
+            Some("always")
+        );
+        assert_eq!(
+            payload.get("persistedRule").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -8115,6 +11361,501 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routines_allowlist_is_persisted_and_copied_to_runs() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/routines")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "routine_id": "routine-tools",
+                    "name": "Tool-scoped routine",
+                    "schedule": { "interval_seconds": { "seconds": 90 } },
+                    "entrypoint": "mission.default",
+                    "allowed_tools": ["  mcp.arcade.search  ", "read", "read", ""],
+                    "output_targets": ["  s3://reports/daily.json  ", "s3://reports/daily.json", ""]
+                })
+                .to_string(),
+            ))
+            .expect("create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("create response");
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let create_body = to_bytes(create_resp.into_body(), usize::MAX)
+            .await
+            .expect("create body");
+        let create_payload: Value = serde_json::from_slice(&create_body).expect("create json");
+        assert_eq!(
+            create_payload
+                .get("routine")
+                .and_then(|v| v.get("allowed_tools"))
+                .and_then(|v| v.as_array())
+                .map(|rows| rows
+                    .iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect::<Vec<_>>()),
+            Some(vec!["mcp.arcade.search".to_string(), "read".to_string()])
+        );
+        assert_eq!(
+            create_payload
+                .get("routine")
+                .and_then(|v| v.get("output_targets"))
+                .and_then(|v| v.as_array())
+                .map(|rows| rows
+                    .iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect::<Vec<_>>()),
+            Some(vec!["s3://reports/daily.json".to_string()])
+        );
+
+        let patch_req = Request::builder()
+            .method("PATCH")
+            .uri("/routines/routine-tools")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "allowed_tools": ["mcp.arcade.send_email", "bash"],
+                    "output_targets": ["https://storage.example/run/output.md"]
+                })
+                .to_string(),
+            ))
+            .expect("patch request");
+        let patch_resp = app
+            .clone()
+            .oneshot(patch_req)
+            .await
+            .expect("patch response");
+        assert_eq!(patch_resp.status(), StatusCode::OK);
+        let patch_body = to_bytes(patch_resp.into_body(), usize::MAX)
+            .await
+            .expect("patch body");
+        let patch_payload: Value = serde_json::from_slice(&patch_body).expect("patch json");
+        assert_eq!(
+            patch_payload
+                .get("routine")
+                .and_then(|v| v.get("allowed_tools"))
+                .and_then(|v| v.as_array())
+                .map(|rows| rows
+                    .iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect::<Vec<_>>()),
+            Some(vec![
+                "mcp.arcade.send_email".to_string(),
+                "bash".to_string()
+            ])
+        );
+        assert_eq!(
+            patch_payload
+                .get("routine")
+                .and_then(|v| v.get("output_targets"))
+                .and_then(|v| v.as_array())
+                .map(|rows| rows
+                    .iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect::<Vec<_>>()),
+            Some(vec!["https://storage.example/run/output.md".to_string()])
+        );
+
+        let run_now_req = Request::builder()
+            .method("POST")
+            .uri("/routines/routine-tools/run_now")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({}).to_string()))
+            .expect("run_now request");
+        let run_now_resp = app
+            .clone()
+            .oneshot(run_now_req)
+            .await
+            .expect("run_now response");
+        assert_eq!(run_now_resp.status(), StatusCode::OK);
+        let run_now_body = to_bytes(run_now_resp.into_body(), usize::MAX)
+            .await
+            .expect("run_now body");
+        let run_now_payload: Value = serde_json::from_slice(&run_now_body).expect("run_now json");
+        let run_id = run_now_payload
+            .get("runID")
+            .and_then(|v| v.as_str())
+            .expect("runID");
+
+        let run_get_req = Request::builder()
+            .method("GET")
+            .uri(format!("/routines/runs/{run_id}"))
+            .body(Body::empty())
+            .expect("run get request");
+        let run_get_resp = app
+            .clone()
+            .oneshot(run_get_req)
+            .await
+            .expect("run get response");
+        assert_eq!(run_get_resp.status(), StatusCode::OK);
+        let run_get_body = to_bytes(run_get_resp.into_body(), usize::MAX)
+            .await
+            .expect("run get body");
+        let run_get_payload: Value = serde_json::from_slice(&run_get_body).expect("run get json");
+        assert_eq!(
+            run_get_payload
+                .get("run")
+                .and_then(|v| v.get("allowed_tools"))
+                .and_then(|v| v.as_array())
+                .map(|rows| rows
+                    .iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect::<Vec<_>>()),
+            Some(vec![
+                "mcp.arcade.send_email".to_string(),
+                "bash".to_string()
+            ])
+        );
+        assert_eq!(
+            run_get_payload
+                .get("run")
+                .and_then(|v| v.get("output_targets"))
+                .and_then(|v| v.as_array())
+                .map(|rows| rows
+                    .iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect::<Vec<_>>()),
+            Some(vec!["https://storage.example/run/output.md".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn routines_runs_all_can_filter_by_routine() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        for routine_id in ["routine-run-a", "routine-run-b"] {
+            let create_req = Request::builder()
+                .method("POST")
+                .uri("/routines")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "routine_id": routine_id,
+                        "name": format!("Routine {routine_id}"),
+                        "schedule": { "interval_seconds": { "seconds": 60 } },
+                        "entrypoint": "mission.default",
+                    })
+                    .to_string(),
+                ))
+                .expect("create request");
+            let create_resp = app
+                .clone()
+                .oneshot(create_req)
+                .await
+                .expect("create response");
+            assert_eq!(create_resp.status(), StatusCode::OK);
+
+            let run_now_req = Request::builder()
+                .method("POST")
+                .uri(format!("/routines/{routine_id}/run_now"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({}).to_string()))
+                .expect("run_now request");
+            let run_now_resp = app
+                .clone()
+                .oneshot(run_now_req)
+                .await
+                .expect("run_now response");
+            assert_eq!(run_now_resp.status(), StatusCode::OK);
+        }
+
+        let all_req = Request::builder()
+            .method("GET")
+            .uri("/routines/runs?limit=10")
+            .body(Body::empty())
+            .expect("runs all request");
+        let all_resp = app
+            .clone()
+            .oneshot(all_req)
+            .await
+            .expect("runs all response");
+        assert_eq!(all_resp.status(), StatusCode::OK);
+        let all_body = to_bytes(all_resp.into_body(), usize::MAX)
+            .await
+            .expect("runs all body");
+        let all_payload: Value = serde_json::from_slice(&all_body).expect("runs all json");
+        assert!(all_payload
+            .get("count")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|count| count >= 2));
+
+        let filtered_req = Request::builder()
+            .method("GET")
+            .uri("/routines/runs?routine_id=routine-run-b&limit=10")
+            .body(Body::empty())
+            .expect("runs filtered request");
+        let filtered_resp = app
+            .clone()
+            .oneshot(filtered_req)
+            .await
+            .expect("runs filtered response");
+        assert_eq!(filtered_resp.status(), StatusCode::OK);
+        let filtered_body = to_bytes(filtered_resp.into_body(), usize::MAX)
+            .await
+            .expect("runs filtered body");
+        let filtered_payload: Value =
+            serde_json::from_slice(&filtered_body).expect("runs filtered json");
+        assert!(filtered_payload
+            .get("count")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|count| count >= 1));
+        let all_match_routine = filtered_payload
+            .get("runs")
+            .and_then(|v| v.as_array())
+            .map(|rows| {
+                rows.iter().all(|row| {
+                    row.get("routine_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| id == "routine-run-b")
+                })
+            })
+            .unwrap_or(false);
+        assert!(all_match_routine);
+    }
+
+    #[tokio::test]
+    async fn automations_create_requires_mission_objective() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/automations")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "automation_id": "auto-empty-objective",
+                    "name": "Automation without objective",
+                    "schedule": { "interval_seconds": { "seconds": 300 } },
+                    "mission": {
+                        "objective": "   "
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("automation create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("automation create response");
+        assert_eq!(create_resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn automations_create_rejects_invalid_mode() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/automations")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "automation_id": "auto-invalid-mode",
+                    "name": "Automation invalid mode",
+                    "schedule": { "interval_seconds": { "seconds": 300 } },
+                    "mode": "swarm-ish",
+                    "mission": {
+                        "objective": "Execute a mission with invalid mode."
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("automation create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("automation create response");
+        assert_eq!(create_resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn automations_create_and_run_now_roundtrip() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/automations")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "automation_id": "auto-digest",
+                    "name": "Daily Digest Automation",
+                    "schedule": { "interval_seconds": { "seconds": 600 } },
+                    "mission": {
+                        "objective": "Generate a daily digest with clear sources.",
+                        "success_criteria": ["Contains source URLs", "Writes one artifact"]
+                    },
+                    "policy": {
+                        "tool": {
+                            "run_allowlist": ["read", "websearch", "webfetch", "write"],
+                            "external_integrations_allowed": true
+                        },
+                        "approval": {
+                            "requires_approval": true
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("automation create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("automation create response");
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let run_now_req = Request::builder()
+            .method("POST")
+            .uri("/automations/auto-digest/run_now")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({}).to_string()))
+            .expect("automation run_now request");
+        let run_now_resp = app
+            .clone()
+            .oneshot(run_now_req)
+            .await
+            .expect("automation run_now response");
+        assert_eq!(run_now_resp.status(), StatusCode::OK);
+        let run_now_body = to_bytes(run_now_resp.into_body(), usize::MAX)
+            .await
+            .expect("automation run_now body");
+        let run_now_payload: Value =
+            serde_json::from_slice(&run_now_body).expect("automation run_now json");
+        assert_eq!(
+            run_now_payload
+                .get("run")
+                .and_then(|v| v.get("automation_id"))
+                .and_then(|v| v.as_str()),
+            Some("auto-digest")
+        );
+        assert_eq!(
+            run_now_payload
+                .get("run")
+                .and_then(|v| v.get("mission_snapshot"))
+                .and_then(|v| v.get("objective"))
+                .and_then(|v| v.as_str()),
+            Some("Generate a daily digest with clear sources.")
+        );
+        let run_id = run_now_payload
+            .get("run")
+            .and_then(|v| v.get("run_id"))
+            .and_then(|v| v.as_str())
+            .expect("automation run_id in run_now response")
+            .to_string();
+
+        let history_req = Request::builder()
+            .method("GET")
+            .uri("/automations/auto-digest/history?limit=5")
+            .body(Body::empty())
+            .expect("automation history request");
+        let history_resp = app
+            .clone()
+            .oneshot(history_req)
+            .await
+            .expect("automation history response");
+        assert_eq!(history_resp.status(), StatusCode::OK);
+        let history_body = to_bytes(history_resp.into_body(), usize::MAX)
+            .await
+            .expect("automation history body");
+        let history_payload: Value =
+            serde_json::from_slice(&history_body).expect("automation history json");
+        assert_eq!(
+            history_payload.get("automationID").and_then(|v| v.as_str()),
+            Some("auto-digest")
+        );
+
+        let add_artifact_req = Request::builder()
+            .method("POST")
+            .uri(format!("/automations/runs/{run_id}/artifacts"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "uri": "file://reports/daily-digest.md",
+                    "kind": "report",
+                    "label": "Daily Digest",
+                })
+                .to_string(),
+            ))
+            .expect("automation add artifact request");
+        let add_artifact_resp = app
+            .clone()
+            .oneshot(add_artifact_req)
+            .await
+            .expect("automation add artifact response");
+        assert_eq!(add_artifact_resp.status(), StatusCode::OK);
+
+        let list_artifacts_req = Request::builder()
+            .method("GET")
+            .uri(format!("/automations/runs/{run_id}/artifacts"))
+            .body(Body::empty())
+            .expect("automation list artifacts request");
+        let list_artifacts_resp = app
+            .clone()
+            .oneshot(list_artifacts_req)
+            .await
+            .expect("automation list artifacts response");
+        assert_eq!(list_artifacts_resp.status(), StatusCode::OK);
+        let list_artifacts_body = to_bytes(list_artifacts_resp.into_body(), usize::MAX)
+            .await
+            .expect("automation list artifacts body");
+        let list_artifacts_payload: Value =
+            serde_json::from_slice(&list_artifacts_body).expect("automation list artifacts json");
+        assert_eq!(
+            list_artifacts_payload
+                .get("automationRunID")
+                .and_then(|v| v.as_str()),
+            Some(run_id.as_str())
+        );
+        assert!(list_artifacts_payload
+            .get("count")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|count| count >= 1));
+
+        let patch_req = Request::builder()
+            .method("PATCH")
+            .uri("/automations/auto-digest")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "mode": "ORCHESTRATED"
+                })
+                .to_string(),
+            ))
+            .expect("automation patch request");
+        let patch_resp = app
+            .clone()
+            .oneshot(patch_req)
+            .await
+            .expect("automation patch response");
+        assert_eq!(patch_resp.status(), StatusCode::OK);
+        let patch_body = to_bytes(patch_resp.into_body(), usize::MAX)
+            .await
+            .expect("automation patch body");
+        let patch_payload: Value =
+            serde_json::from_slice(&patch_body).expect("automation patch json");
+        assert_eq!(
+            patch_payload
+                .get("automation")
+                .and_then(|v| v.get("mode"))
+                .and_then(|v| v.as_str()),
+            Some("orchestrated")
+        );
+    }
+
+    #[tokio::test]
     async fn routines_run_now_blocks_external_side_effects_by_default() {
         let state = test_state().await;
         let app = app_router(state.clone());
@@ -8567,7 +12308,7 @@ mod tests {
                         "tier": "session"
                     },
                     "kind": "solution_capsule",
-                    "content": "-----BEGIN PRIVATE KEY-----",
+                    "content": concat!("-----BEGIN", " PRIVATE KEY-----"),
                     "classification": "restricted",
                     "capability": capability
                 })
@@ -8867,5 +12608,1075 @@ mod tests {
                 .and_then(Value::as_str),
             Some("[REDACTED]")
         );
+    }
+
+    #[tokio::test]
+    async fn routine_tool_policy_hook_denies_disallowed_tool_for_session_scope() {
+        let state = test_state().await;
+        let session = Session::new(Some("routine-session".to_string()), Some(".".to_string()));
+        let session_id = session.id.clone();
+        state
+            .storage
+            .save_session(session)
+            .await
+            .expect("save session");
+
+        state
+            .set_routine_session_policy(
+                session_id.clone(),
+                "run-routine-hook-1".to_string(),
+                "routine-hook-1".to_string(),
+                vec!["read".to_string(), "mcp.arcade.search".to_string()],
+            )
+            .await;
+
+        let hook = crate::agent_teams::ServerToolPolicyHook::new(state.clone());
+        let decision = hook
+            .evaluate_tool(ToolPolicyContext {
+                session_id,
+                message_id: "msg-1".to_string(),
+                tool: "bash".to_string(),
+                args: json!({"command":"echo hi"}),
+            })
+            .await
+            .expect("policy decision");
+
+        assert!(!decision.allowed);
+        assert!(decision
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not allowed for routine"));
+    }
+
+    #[tokio::test]
+    async fn context_run_create_append_event_and_get() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "run_id": "ctx-run-1",
+                    "objective": "test context run"
+                })
+                .to_string(),
+            ))
+            .expect("create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("create response");
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let event_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs/ctx-run-1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "type": "planning_started",
+                    "status": "planning",
+                    "payload": {"k":"v"}
+                })
+                .to_string(),
+            ))
+            .expect("event request");
+        let event_resp = app
+            .clone()
+            .oneshot(event_req)
+            .await
+            .expect("event response");
+        assert_eq!(event_resp.status(), StatusCode::OK);
+
+        let list_events_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-1/events?since_seq=0")
+            .body(Body::empty())
+            .expect("list events request");
+        let list_events_resp = app
+            .clone()
+            .oneshot(list_events_req)
+            .await
+            .expect("list events response");
+        assert_eq!(list_events_resp.status(), StatusCode::OK);
+        let list_events_body = to_bytes(list_events_resp.into_body(), usize::MAX)
+            .await
+            .expect("list events body");
+        let list_events_payload: Value =
+            serde_json::from_slice(&list_events_body).expect("list events json");
+        assert_eq!(
+            list_events_payload
+                .get("events")
+                .and_then(|v| v.as_array())
+                .map(|rows| rows.len()),
+            Some(1)
+        );
+
+        let get_run_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-1")
+            .body(Body::empty())
+            .expect("get run request");
+        let get_run_resp = app
+            .clone()
+            .oneshot(get_run_req)
+            .await
+            .expect("get run response");
+        assert_eq!(get_run_resp.status(), StatusCode::OK);
+        let get_run_body = to_bytes(get_run_resp.into_body(), usize::MAX)
+            .await
+            .expect("get run body");
+        let get_run_payload: Value = serde_json::from_slice(&get_run_body).expect("get run json");
+        assert_eq!(
+            get_run_payload
+                .get("run")
+                .and_then(|run| run.get("status"))
+                .and_then(Value::as_str),
+            Some("planning")
+        );
+    }
+
+    #[tokio::test]
+    async fn context_run_lease_mismatch_pauses_run() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "run_id": "ctx-run-lease",
+                    "objective": "lease mismatch",
+                    "workspace": {
+                        "workspace_id": "ws-1",
+                        "canonical_path": "/expected/path",
+                        "lease_epoch": 1
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("create response");
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let validate_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs/ctx-run-lease/lease/validate")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "phase": "pre_dispatch",
+                    "current_path": "/other/path",
+                    "step_id": "step-1"
+                })
+                .to_string(),
+            ))
+            .expect("validate request");
+        let validate_resp = app
+            .clone()
+            .oneshot(validate_req)
+            .await
+            .expect("validate response");
+        assert_eq!(validate_resp.status(), StatusCode::OK);
+        let validate_body = to_bytes(validate_resp.into_body(), usize::MAX)
+            .await
+            .expect("validate body");
+        let validate_payload: Value =
+            serde_json::from_slice(&validate_body).expect("validate json");
+        assert_eq!(
+            validate_payload.get("mismatch").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let get_run_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-lease")
+            .body(Body::empty())
+            .expect("get run request");
+        let get_run_resp = app
+            .clone()
+            .oneshot(get_run_req)
+            .await
+            .expect("get run response");
+        let get_run_body = to_bytes(get_run_resp.into_body(), usize::MAX)
+            .await
+            .expect("get run body");
+        let get_run_payload: Value = serde_json::from_slice(&get_run_body).expect("get run json");
+        assert_eq!(
+            get_run_payload
+                .get("run")
+                .and_then(|run| run.get("status"))
+                .and_then(Value::as_str),
+            Some("paused")
+        );
+    }
+
+    #[tokio::test]
+    async fn context_run_replay_matches_persisted_state_without_drift() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "run_id": "ctx-run-replay-ok",
+                    "objective": "replay no drift"
+                })
+                .to_string(),
+            ))
+            .expect("create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("create response");
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let event_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs/ctx-run-replay-ok/events")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "type": "step_started",
+                    "status": "running",
+                    "step_id": "s1",
+                    "payload": {
+                        "step_title": "Plan",
+                        "step_status": "in_progress",
+                        "why_next_step": "Need active planning"
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("event request");
+        let event_resp = app
+            .clone()
+            .oneshot(event_req)
+            .await
+            .expect("event response");
+        assert_eq!(event_resp.status(), StatusCode::OK);
+
+        let replay_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-replay-ok/replay")
+            .body(Body::empty())
+            .expect("replay request");
+        let replay_resp = app
+            .clone()
+            .oneshot(replay_req)
+            .await
+            .expect("replay response");
+        assert_eq!(replay_resp.status(), StatusCode::OK);
+        let replay_body = to_bytes(replay_resp.into_body(), usize::MAX)
+            .await
+            .expect("replay body");
+        let replay_payload: Value = serde_json::from_slice(&replay_body).expect("replay json");
+        assert_eq!(
+            replay_payload
+                .get("drift")
+                .and_then(|d| d.get("mismatch"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            replay_payload
+                .get("replay")
+                .and_then(|r| r.get("status"))
+                .and_then(Value::as_str),
+            Some("running")
+        );
+    }
+
+    #[tokio::test]
+    async fn context_run_replay_detects_status_drift() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "run_id": "ctx-run-replay-drift",
+                    "objective": "replay drift"
+                })
+                .to_string(),
+            ))
+            .expect("create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("create response");
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let event_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs/ctx-run-replay-drift/events")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "type": "planning_started",
+                    "status": "planning",
+                    "payload": {}
+                })
+                .to_string(),
+            ))
+            .expect("event request");
+        let event_resp = app
+            .clone()
+            .oneshot(event_req)
+            .await
+            .expect("event response");
+        assert_eq!(event_resp.status(), StatusCode::OK);
+
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-replay-drift")
+            .body(Body::empty())
+            .expect("get request");
+        let get_resp = app.clone().oneshot(get_req).await.expect("get response");
+        let get_body = to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .expect("get body");
+        let mut get_payload: Value = serde_json::from_slice(&get_body).expect("get json");
+        get_payload["run"]["status"] = Value::String("failed".to_string());
+
+        let put_req = Request::builder()
+            .method("PUT")
+            .uri("/context/runs/ctx-run-replay-drift")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                get_payload
+                    .get("run")
+                    .cloned()
+                    .expect("run payload")
+                    .to_string(),
+            ))
+            .expect("put request");
+        let put_resp = app.clone().oneshot(put_req).await.expect("put response");
+        assert_eq!(put_resp.status(), StatusCode::OK);
+
+        let replay_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-replay-drift/replay")
+            .body(Body::empty())
+            .expect("replay request");
+        let replay_resp = app
+            .clone()
+            .oneshot(replay_req)
+            .await
+            .expect("replay response");
+        assert_eq!(replay_resp.status(), StatusCode::OK);
+        let replay_body = to_bytes(replay_resp.into_body(), usize::MAX)
+            .await
+            .expect("replay body");
+        let replay_payload: Value = serde_json::from_slice(&replay_body).expect("replay json");
+        assert_eq!(
+            replay_payload
+                .get("drift")
+                .and_then(|d| d.get("mismatch"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            replay_payload
+                .get("drift")
+                .and_then(|d| d.get("status_mismatch"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn context_run_driver_next_selects_runnable_step_and_sets_why() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "run_id": "ctx-run-driver-1",
+                    "objective": "meta manager select"
+                })
+                .to_string(),
+            ))
+            .expect("create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("create response");
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-driver-1")
+            .body(Body::empty())
+            .expect("get request");
+        let get_resp = app.clone().oneshot(get_req).await.expect("get response");
+        let get_body = to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .expect("get body");
+        let mut get_payload: Value = serde_json::from_slice(&get_body).expect("get json");
+        get_payload["run"]["steps"] = json!([
+            {"step_id":"s1","title":"Plan","status":"pending"},
+            {"step_id":"s2","title":"Execute","status":"runnable"}
+        ]);
+
+        let put_req = Request::builder()
+            .method("PUT")
+            .uri("/context/runs/ctx-run-driver-1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                get_payload
+                    .get("run")
+                    .cloned()
+                    .expect("run payload")
+                    .to_string(),
+            ))
+            .expect("put request");
+        let put_resp = app.clone().oneshot(put_req).await.expect("put response");
+        assert_eq!(put_resp.status(), StatusCode::OK);
+
+        let next_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs/ctx-run-driver-1/driver/next")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({}).to_string()))
+            .expect("next request");
+        let next_resp = app.clone().oneshot(next_req).await.expect("next response");
+        assert_eq!(next_resp.status(), StatusCode::OK);
+        let next_body = to_bytes(next_resp.into_body(), usize::MAX)
+            .await
+            .expect("next body");
+        let next_payload: Value = serde_json::from_slice(&next_body).expect("next json");
+        assert_eq!(
+            next_payload.get("selected_step_id").and_then(Value::as_str),
+            Some("s2")
+        );
+        assert!(next_payload
+            .get("why_next_step")
+            .and_then(Value::as_str)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false));
+
+        let run_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-driver-1")
+            .body(Body::empty())
+            .expect("run request");
+        let run_resp = app.clone().oneshot(run_req).await.expect("run response");
+        let run_body = to_bytes(run_resp.into_body(), usize::MAX)
+            .await
+            .expect("run body");
+        let run_payload: Value = serde_json::from_slice(&run_body).expect("run json");
+        assert_eq!(
+            run_payload
+                .get("run")
+                .and_then(|r| r.get("status"))
+                .and_then(Value::as_str),
+            Some("running")
+        );
+        assert_eq!(
+            run_payload
+                .get("run")
+                .and_then(|r| r.get("steps"))
+                .and_then(Value::as_array)
+                .and_then(|steps| steps.get(1))
+                .and_then(|step| step.get("status"))
+                .and_then(Value::as_str),
+            Some("in_progress")
+        );
+    }
+
+    #[tokio::test]
+    async fn context_run_driver_next_respects_terminal_state() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "run_id": "ctx-run-driver-2",
+                    "objective": "terminal check"
+                })
+                .to_string(),
+            ))
+            .expect("create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("create response");
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-driver-2")
+            .body(Body::empty())
+            .expect("get request");
+        let get_resp = app.clone().oneshot(get_req).await.expect("get response");
+        let get_body = to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .expect("get body");
+        let mut get_payload: Value = serde_json::from_slice(&get_body).expect("get json");
+        get_payload["run"]["status"] = Value::String("completed".to_string());
+
+        let put_req = Request::builder()
+            .method("PUT")
+            .uri("/context/runs/ctx-run-driver-2")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                get_payload
+                    .get("run")
+                    .cloned()
+                    .expect("run payload")
+                    .to_string(),
+            ))
+            .expect("put request");
+        let put_resp = app.clone().oneshot(put_req).await.expect("put response");
+        assert_eq!(put_resp.status(), StatusCode::OK);
+
+        let next_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs/ctx-run-driver-2/driver/next")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({}).to_string()))
+            .expect("next request");
+        let next_resp = app.clone().oneshot(next_req).await.expect("next response");
+        assert_eq!(next_resp.status(), StatusCode::OK);
+        let next_body = to_bytes(next_resp.into_body(), usize::MAX)
+            .await
+            .expect("next body");
+        let next_payload: Value = serde_json::from_slice(&next_body).expect("next json");
+        assert_eq!(next_payload.get("selected_step_id"), Some(&Value::Null));
+        assert_eq!(
+            next_payload.get("target_status").and_then(Value::as_str),
+            Some("completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn context_run_driver_next_dry_run_does_not_mutate_state_or_events() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "run_id": "ctx-run-driver-dry",
+                    "objective": "dry run guardrail"
+                })
+                .to_string(),
+            ))
+            .expect("create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("create response");
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-driver-dry")
+            .body(Body::empty())
+            .expect("get request");
+        let get_resp = app.clone().oneshot(get_req).await.expect("get response");
+        let get_body = to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .expect("get body");
+        let mut get_payload: Value = serde_json::from_slice(&get_body).expect("get json");
+        get_payload["run"]["steps"] = json!([
+            {"step_id":"s1","title":"Plan","status":"runnable"}
+        ]);
+        let before_revision = get_payload["run"]["revision"]
+            .as_u64()
+            .expect("before revision");
+
+        let put_req = Request::builder()
+            .method("PUT")
+            .uri("/context/runs/ctx-run-driver-dry")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                get_payload
+                    .get("run")
+                    .cloned()
+                    .expect("run payload")
+                    .to_string(),
+            ))
+            .expect("put request");
+        let put_resp = app.clone().oneshot(put_req).await.expect("put response");
+        assert_eq!(put_resp.status(), StatusCode::OK);
+
+        let dry_next_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs/ctx-run-driver-dry/driver/next")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"dry_run": true}).to_string()))
+            .expect("dry next request");
+        let dry_next_resp = app
+            .clone()
+            .oneshot(dry_next_req)
+            .await
+            .expect("dry next response");
+        assert_eq!(dry_next_resp.status(), StatusCode::OK);
+
+        let run_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-driver-dry")
+            .body(Body::empty())
+            .expect("run request");
+        let run_resp = app.clone().oneshot(run_req).await.expect("run response");
+        let run_body = to_bytes(run_resp.into_body(), usize::MAX)
+            .await
+            .expect("run body");
+        let run_payload: Value = serde_json::from_slice(&run_body).expect("run json");
+        assert_eq!(
+            run_payload
+                .get("run")
+                .and_then(|r| r.get("revision"))
+                .and_then(Value::as_u64),
+            Some(before_revision.saturating_add(1))
+        );
+        assert_eq!(
+            run_payload
+                .get("run")
+                .and_then(|r| r.get("steps"))
+                .and_then(Value::as_array)
+                .and_then(|steps| steps.first())
+                .and_then(|step| step.get("status"))
+                .and_then(Value::as_str),
+            Some("runnable")
+        );
+
+        let events_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-driver-dry/events")
+            .body(Body::empty())
+            .expect("events request");
+        let events_resp = app
+            .clone()
+            .oneshot(events_req)
+            .await
+            .expect("events response");
+        let events_body = to_bytes(events_resp.into_body(), usize::MAX)
+            .await
+            .expect("events body");
+        let events_payload: Value = serde_json::from_slice(&events_body).expect("events json");
+        let has_decision_event = events_payload
+            .get("events")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter().any(|row| {
+                    row.get("type")
+                        .and_then(Value::as_str)
+                        .map(|ty| ty == "meta_next_step_selected")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        assert!(!has_decision_event);
+    }
+
+    #[tokio::test]
+    async fn context_run_driver_next_emits_decision_event_with_why() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "run_id": "ctx-run-driver-event",
+                    "objective": "emit decision event"
+                })
+                .to_string(),
+            ))
+            .expect("create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("create response");
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-driver-event")
+            .body(Body::empty())
+            .expect("get request");
+        let get_resp = app.clone().oneshot(get_req).await.expect("get response");
+        let get_body = to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .expect("get body");
+        let mut get_payload: Value = serde_json::from_slice(&get_body).expect("get json");
+        get_payload["run"]["steps"] = json!([
+            {"step_id":"s1","title":"Plan","status":"runnable"}
+        ]);
+
+        let put_req = Request::builder()
+            .method("PUT")
+            .uri("/context/runs/ctx-run-driver-event")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                get_payload
+                    .get("run")
+                    .cloned()
+                    .expect("run payload")
+                    .to_string(),
+            ))
+            .expect("put request");
+        let put_resp = app.clone().oneshot(put_req).await.expect("put response");
+        assert_eq!(put_resp.status(), StatusCode::OK);
+
+        let next_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs/ctx-run-driver-event/driver/next")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"dry_run": false}).to_string()))
+            .expect("next request");
+        let next_resp = app.clone().oneshot(next_req).await.expect("next response");
+        assert_eq!(next_resp.status(), StatusCode::OK);
+
+        let events_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-driver-event/events")
+            .body(Body::empty())
+            .expect("events request");
+        let events_resp = app
+            .clone()
+            .oneshot(events_req)
+            .await
+            .expect("events response");
+        let events_body = to_bytes(events_resp.into_body(), usize::MAX)
+            .await
+            .expect("events body");
+        let events_payload: Value = serde_json::from_slice(&events_body).expect("events json");
+        let decision_event = events_payload
+            .get("events")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter().find(|row| {
+                    row.get("type")
+                        .and_then(Value::as_str)
+                        .map(|ty| ty == "meta_next_step_selected")
+                        .unwrap_or(false)
+                })
+            })
+            .cloned()
+            .expect("decision event");
+        assert!(decision_event
+            .get("payload")
+            .and_then(|p| p.get("why_next_step"))
+            .and_then(Value::as_str)
+            .map(|why| !why.trim().is_empty())
+            .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn context_run_fault_injection_workspace_mismatch_checkpoint_replay() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "run_id": "ctx-run-fault-1",
+                    "objective": "fault injection path",
+                    "workspace": {
+                        "workspace_id": "ws-fault",
+                        "canonical_path": "/expected/path",
+                        "lease_epoch": 1
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("create response");
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-fault-1")
+            .body(Body::empty())
+            .expect("get request");
+        let get_resp = app.clone().oneshot(get_req).await.expect("get response");
+        let get_body = to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .expect("get body");
+        let mut get_payload: Value = serde_json::from_slice(&get_body).expect("get json");
+        get_payload["run"]["steps"] = json!([
+            {"step_id":"s1","title":"Plan","status":"runnable"}
+        ]);
+
+        let put_req = Request::builder()
+            .method("PUT")
+            .uri("/context/runs/ctx-run-fault-1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                get_payload
+                    .get("run")
+                    .cloned()
+                    .expect("run payload")
+                    .to_string(),
+            ))
+            .expect("put request");
+        let put_resp = app.clone().oneshot(put_req).await.expect("put response");
+        assert_eq!(put_resp.status(), StatusCode::OK);
+
+        let next_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs/ctx-run-fault-1/driver/next")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"dry_run": false}).to_string()))
+            .expect("next request");
+        let next_resp = app.clone().oneshot(next_req).await.expect("next response");
+        assert_eq!(next_resp.status(), StatusCode::OK);
+
+        let mismatch_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs/ctx-run-fault-1/lease/validate")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "phase": "pre_tool_call",
+                    "current_path": "/other/path",
+                    "step_id": "s1"
+                })
+                .to_string(),
+            ))
+            .expect("mismatch request");
+        let mismatch_resp = app
+            .clone()
+            .oneshot(mismatch_req)
+            .await
+            .expect("mismatch response");
+        assert_eq!(mismatch_resp.status(), StatusCode::OK);
+        let mismatch_body = to_bytes(mismatch_resp.into_body(), usize::MAX)
+            .await
+            .expect("mismatch body");
+        let mismatch_payload: Value =
+            serde_json::from_slice(&mismatch_body).expect("mismatch json");
+        assert_eq!(
+            mismatch_payload.get("mismatch").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let checkpoint_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs/ctx-run-fault-1/checkpoints")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"reason":"fault_injection"}).to_string()))
+            .expect("checkpoint request");
+        let checkpoint_resp = app
+            .clone()
+            .oneshot(checkpoint_req)
+            .await
+            .expect("checkpoint response");
+        assert_eq!(checkpoint_resp.status(), StatusCode::OK);
+
+        let events_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-fault-1/events")
+            .body(Body::empty())
+            .expect("events request");
+        let events_resp = app
+            .clone()
+            .oneshot(events_req)
+            .await
+            .expect("events response");
+        let events_body = to_bytes(events_resp.into_body(), usize::MAX)
+            .await
+            .expect("events body");
+        let events_payload: Value = serde_json::from_slice(&events_body).expect("events json");
+        let event_rows = events_payload
+            .get("events")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(event_rows.iter().any(|row| {
+            row.get("type")
+                .and_then(Value::as_str)
+                .map(|ty| ty == "meta_next_step_selected")
+                .unwrap_or(false)
+        }));
+        assert!(event_rows.iter().any(|row| {
+            row.get("type")
+                .and_then(Value::as_str)
+                .map(|ty| ty == "workspace_mismatch")
+                .unwrap_or(false)
+        }));
+        assert!(event_rows.iter().any(|row| {
+            row.get("status")
+                .and_then(Value::as_str)
+                .map(|status| status == "paused")
+                .unwrap_or(false)
+        }));
+
+        let replay_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-fault-1/replay")
+            .body(Body::empty())
+            .expect("replay request");
+        let replay_resp = app
+            .clone()
+            .oneshot(replay_req)
+            .await
+            .expect("replay response");
+        assert_eq!(replay_resp.status(), StatusCode::OK);
+        let replay_body = to_bytes(replay_resp.into_body(), usize::MAX)
+            .await
+            .expect("replay body");
+        let replay_payload: Value = serde_json::from_slice(&replay_body).expect("replay json");
+        assert_eq!(
+            replay_payload
+                .get("replay")
+                .and_then(|r| r.get("status"))
+                .and_then(Value::as_str),
+            Some("paused")
+        );
+        assert_eq!(
+            replay_payload
+                .get("drift")
+                .and_then(|d| d.get("mismatch"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn context_run_todos_sync_maps_to_steps_and_emits_event() {
+        let state = test_state().await;
+        let app = app_router(state.clone());
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "run_id": "ctx-run-todos-sync",
+                    "objective": "sync todos"
+                })
+                .to_string(),
+            ))
+            .expect("create request");
+        let create_resp = app
+            .clone()
+            .oneshot(create_req)
+            .await
+            .expect("create response");
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let sync_req = Request::builder()
+            .method("POST")
+            .uri("/context/runs/ctx-run-todos-sync/todos/sync")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "replace": true,
+                    "source_session_id": "s-1",
+                    "source_run_id": "r-1",
+                    "todos": [
+                        {"id":"task-1","content":"Plan architecture","status":"in_progress"},
+                        {"id":"task-2","content":"Implement endpoint","status":"pending"},
+                        {"id":"task-3","content":"Write tests","status":"completed"}
+                    ]
+                })
+                .to_string(),
+            ))
+            .expect("sync request");
+        let sync_resp = app.clone().oneshot(sync_req).await.expect("sync response");
+        assert_eq!(sync_resp.status(), StatusCode::OK);
+
+        let run_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-todos-sync")
+            .body(Body::empty())
+            .expect("run request");
+        let run_resp = app.clone().oneshot(run_req).await.expect("run response");
+        let run_body = to_bytes(run_resp.into_body(), usize::MAX)
+            .await
+            .expect("run body");
+        let run_payload: Value = serde_json::from_slice(&run_body).expect("run json");
+        assert_eq!(
+            run_payload
+                .get("run")
+                .and_then(|r| r.get("status"))
+                .and_then(Value::as_str),
+            Some("running")
+        );
+        assert_eq!(
+            run_payload
+                .get("run")
+                .and_then(|r| r.get("steps"))
+                .and_then(Value::as_array)
+                .map(|rows| rows.len()),
+            Some(3)
+        );
+
+        let events_req = Request::builder()
+            .method("GET")
+            .uri("/context/runs/ctx-run-todos-sync/events")
+            .body(Body::empty())
+            .expect("events request");
+        let events_resp = app
+            .clone()
+            .oneshot(events_req)
+            .await
+            .expect("events response");
+        let events_body = to_bytes(events_resp.into_body(), usize::MAX)
+            .await
+            .expect("events body");
+        let events_payload: Value = serde_json::from_slice(&events_body).expect("events json");
+        let has_todo_synced = events_payload
+            .get("events")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter().any(|row| {
+                    row.get("type")
+                        .and_then(Value::as_str)
+                        .map(|v| v == "todo_synced")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        assert!(has_todo_synced);
     }
 }

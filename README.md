@@ -12,6 +12,12 @@
 
 A local-first, privacy-focused AI workspace. Your AI coworker that runs entirely on your machine.
 
+## Language Options
+
+- English: [README.md](README.md)
+- 简体中文: [README.zh-CN.md](README.zh-CN.md)
+- Translations (contribution guide): [docs/README_TRANSLATIONS.md](docs/README_TRANSLATIONS.md)
+
 <div align="center">
   <img src=".github/assets/app.png" alt="Tandem AI Workspace" width="90%">
 </div>
@@ -28,7 +34,7 @@ Inspired by early AI coworking research previews, but open source and provider-a
 
 **🌐 True Cross-Platform**: Native apps for Windows, macOS (Intel & Apple Silicon), and Linux. No Electron bloat - built on Tauri for fast, lightweight performance.
 
-**📖 Open Source**: MIT licensed. Review the code, contribute features, or fork it for your needs.
+**📖 Open Source**: Open source with permissive licensing. Rust crates are dual-licensed under MIT OR Apache-2.0.
 
 **🛠️ Modern Stack**: Built with **Rust**, **Tauri**, **React**, and **sqlite-vec** — designed for high performance and low memory footprint on consumer hardware.
 
@@ -83,7 +89,7 @@ Tandem supports multiple specialized agent modes powered by the native Tandem en
 
 ### 🎼 Multi-Agent Orchestration
 
-**New in v0.2.0**: Tandem now features a powerful Orchestration Mode that coordinates specialized sub-agents to solve complex problems.
+Tandem includes a powerful Orchestration Mode that coordinates specialized sub-agents to solve complex problems.
 
 <div align="center">
   <img src=".github/assets/app11.png" alt="Tandem Orchestration Mode" width="90%">
@@ -96,6 +102,13 @@ Instead of a single AI trying to do everything, Tandem builds a dependency graph
 - **Validator**: Verify the results
 
 This supervised loop ensures complex features are implemented correctly with human-in-the-loop approval at every critical step.
+
+### 🤖 Agent Automation + MCP Connectors
+
+- **Agent Automation** - Create scheduled automations with explicit `allowed_tools`, run history, and artifact outputs
+- **MCP Connectors** - Register/connect MCP servers, auto-discover tools, and use namespaced tool IDs like `mcp.arcade.search`
+- **Automation Policy Gates** - Control external side effects with `requires_approval` and `external_integrations_allowed`
+- **Headless Ready** - Full HTTP + SSE runtime with examples under `examples/headless/`
 
 ### Project Management
 
@@ -115,7 +128,7 @@ This supervised loop ensures complex features are implemented correctly with hum
 ### Prerequisites
 
 - [Node.js](https://nodejs.org/) 20+
-- [Rust](https://rustup.rs/) 1.75+
+- [Rust](https://rustup.rs/) 1.75+ (includes `cargo`; install via `rustup`)
 - [pnpm](https://pnpm.io/) (recommended) or npm
 
 **Platform-specific:**
@@ -125,6 +138,9 @@ This supervised loop ensures complex features are implemented correctly with hum
 | Windows  | [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/)                   |
 | macOS    | Xcode Command Line Tools: `xcode-select --install`                                               |
 | Linux    | `libwebkit2gtk-4.1-dev`, `libappindicator3-dev`, `librsvg2-dev`, `build-essential`, `pkg-config` |
+
+> Note: The Linux packages above are required for desktop/Tauri builds.  
+> They do not install Rust/Cargo; install Rust separately via `rustup`.
 
 ### Installation
 
@@ -409,9 +425,14 @@ If Tandem saves you time or helps you keep your data private while using AI, con
 
 [❤️ Become a Sponsor](https://github.com/sponsors/frumu-ai)
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=frumu-ai/tandem&type=date&logscale&legend=top-left)](https://www.star-history.com/#frumu-ai/tandem&type=date&logscale&legend=top-left)
+
 ## License
 
-[MIT](LICENSE) - Use it however you want.
+- Repository license text: [MIT](LICENSE)
+- Rust crates (`crates/*`): `MIT OR Apache-2.0` (see [LICENSE](LICENSE) and [LICENSE-APACHE](LICENSE-APACHE))
 
 ## Acknowledgments
 

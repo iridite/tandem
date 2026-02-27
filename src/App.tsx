@@ -13,6 +13,7 @@ import { FilePreview } from "@/components/files/FilePreview";
 import { GitInitDialog } from "@/components/dialogs/GitInitDialog";
 import { OrchestratorPanel } from "@/components/orchestrate/OrchestratorPanel";
 import { CommandCenterPage } from "@/components/command-center/CommandCenterPage";
+import { AgentAutomationPage } from "@/components/agent-automation/AgentAutomationPage";
 import { type RunSummary } from "@/components/orchestrate/types";
 import { PacksPanel } from "@/components/packs";
 import { AppUpdateOverlay } from "@/components/updates/AppUpdateOverlay";
@@ -65,6 +66,7 @@ import {
 import { type FileAttachment } from "@/components/chat/ChatInput";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   Settings as SettingsIcon,
   MessageSquare,
@@ -77,17 +79,24 @@ import {
   Palette,
   Sparkles,
   Rocket,
+  Bot,
   Blocks,
   Loader2,
 } from "lucide-react";
-import whatsNewMarkdown from "../docs/WHATS_NEW_v0.3.0.md?raw";
+const RELEASES_BASE_URL = "https://github.com/frumu-ai/tandem/releases";
 
-const WHATS_NEW_VERSION = "v0.3.0-beta";
 const WHATS_NEW_SEEN_KEY = "tandem_whats_new_seen_version";
+
+function normalizeVersionTag(version: string): string {
+  const trimmed = version.trim();
+  if (!trimmed) return "v0.0.0";
+  return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
+}
 
 type View =
   | "chat"
   | "command-center"
+  | "agent-automation"
   | "extensions"
   | "settings"
   | "about"
@@ -243,22 +252,69 @@ function App() {
   );
   const [migrationResult, setMigrationResult] = useState<StorageMigrationRunResult | null>(null);
   const [showWhatsNew, setShowWhatsNew] = useState(false);
+  const [whatsNewVersion, setWhatsNewVersion] = useState<string | null>(null);
+  const [whatsNewMarkdown, setWhatsNewMarkdown] = useState<string>("");
+  const [whatsNewReleaseUrl, setWhatsNewReleaseUrl] = useState<string>(RELEASES_BASE_URL);
   const migrationCheckedRef = useRef(false);
   const engineLeaseIdRef = useRef<string | null>(null);
   const engineLeaseTimerRef = useRef<ReturnType<typeof globalThis.setInterval> | null>(null);
 
   useEffect(() => {
+    const loadReleaseNotes = async (versionTag: string) => {
+      const fallbackUrl = `${RELEASES_BASE_URL}/latest`;
+      try {
+        const response = await globalThis.fetch(
+          `https://api.github.com/repos/frumu-ai/tandem/releases/tags/${encodeURIComponent(versionTag)}`,
+          {
+            headers: {
+              Accept: "application/vnd.github+json",
+            },
+          }
+        );
+        if (!response.ok) {
+          setWhatsNewMarkdown("");
+          setWhatsNewReleaseUrl(fallbackUrl);
+          return;
+        }
+        const payload = (await response.json()) as Record<string, unknown>;
+        const body = typeof payload.body === "string" ? payload.body.trim() : "";
+        const htmlUrl = typeof payload.html_url === "string" ? payload.html_url : fallbackUrl;
+        setWhatsNewReleaseUrl(htmlUrl);
+        setWhatsNewMarkdown(body);
+      } catch {
+        setWhatsNewMarkdown("");
+        setWhatsNewReleaseUrl(fallbackUrl);
+      }
+    };
+
+    void getVersion()
+      .then((version) => {
+        const normalized = normalizeVersionTag(version);
+        setWhatsNewVersion(normalized);
+        void loadReleaseNotes(normalized);
+      })
+      .catch(() => {
+        const fallback = "v0.0.0";
+        setWhatsNewVersion(fallback);
+        setWhatsNewMarkdown("");
+        setWhatsNewReleaseUrl(`${RELEASES_BASE_URL}/latest`);
+      });
+  }, []);
+
+  useEffect(() => {
     if (!vaultUnlocked) return;
+    if (!whatsNewVersion) return;
     const seenVersion = localStorage.getItem(WHATS_NEW_SEEN_KEY);
-    if (seenVersion !== WHATS_NEW_VERSION) {
+    if (seenVersion !== whatsNewVersion) {
       setShowWhatsNew(true);
     }
-  }, [vaultUnlocked]);
+  }, [vaultUnlocked, whatsNewVersion]);
 
   const dismissWhatsNew = useCallback(() => {
-    localStorage.setItem(WHATS_NEW_SEEN_KEY, WHATS_NEW_VERSION);
+    if (!whatsNewVersion) return;
+    localStorage.setItem(WHATS_NEW_SEEN_KEY, whatsNewVersion);
     setShowWhatsNew(false);
-  }, []);
+  }, [whatsNewVersion]);
 
   // Auto-index workspace files when a project becomes active (if enabled in settings).
   useEffect(() => {
@@ -528,6 +584,10 @@ function App() {
 
   // Todos for task sidebar
   const todosData = useTodos(currentSessionId);
+  const pendingTodos = useMemo(
+    () => todosData.todos.filter((todo) => todo.status === "pending"),
+    [todosData.todos]
+  );
 
   // Start with sidecar setup, then onboarding if no workspace, otherwise chat
   const [view, setView] = useState<View>(() => "sidecar-setup");
@@ -615,7 +675,8 @@ function App() {
             view !== "about" &&
             view !== "packs" &&
             view !== "extensions" &&
-            view !== "command-center"
+            view !== "command-center" &&
+            view !== "agent-automation"
           ? "onboarding"
           : view;
 
@@ -1413,7 +1474,10 @@ function App() {
 
   const activeOrchestrationCount = useMemo(
     () =>
-      orchestratorRuns.filter((run) => run.status === "planning" || run.status === "executing")
+      orchestratorRuns.filter(
+        (run) =>
+          run.status === "queued" || run.status === "planning" || run.status === "running"
+      )
         .length,
     [orchestratorRuns]
   );
@@ -1487,6 +1551,17 @@ function App() {
                 title="Command Center (beta)"
               >
                 <Rocket className="h-5 w-5" />
+              </button>
+              <button
+                onClick={() => setView("agent-automation")}
+                className={`flex h-10 w-10 items-center justify-center rounded-lg transition-colors ${
+                  effectiveView === "agent-automation"
+                    ? "bg-primary/20 text-primary"
+                    : "text-text-muted hover:bg-surface-elevated hover:text-text"
+                }`}
+                title={t("navigation.agentAutomation", { ns: "common" })}
+              >
+                <Bot className="h-5 w-5" />
               </button>
               <button
                 onClick={handleOpenPacks}
@@ -1799,6 +1874,28 @@ function App() {
                 </AnimatePresence>
               </div>
             </motion.div>
+          ) : effectiveView === "agent-automation" ? (
+            <motion.div
+              key="agent-automation"
+              className="h-full w-full app-background"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
+            >
+              <AgentAutomationPage
+                userProjects={userProjects}
+                activeProject={activeProject}
+                onSwitchProject={handleSwitchProject}
+                onAddProject={handleAddProject}
+                onManageProjects={handleManageProjects}
+                projectSwitcherLoading={projectSwitcherLoading}
+                onOpenMcpExtensions={() => {
+                  setExtensionsInitialTab("mcp");
+                  setView("extensions");
+                }}
+              />
+            </motion.div>
           ) : (
             <>
               {/* Chat Area */}
@@ -1834,7 +1931,7 @@ function App() {
                     onToggleTaskSidebar={() => setTaskSidebarOpen(!taskSidebarOpen)}
                     executePendingTasksTrigger={executePendingTrigger}
                     onGeneratingChange={setIsExecutingTasks}
-                    pendingTasks={todosData.todos}
+                    pendingTasks={pendingTodos}
                     fileToAttach={fileToAttach || undefined}
                     onFileAttached={() => setFileToAttach(null)}
                     selectedAgent={selectedAgent}
@@ -1909,8 +2006,9 @@ function App() {
         <AppUpdateOverlay />
         <WhatsNewOverlay
           open={shouldShowWhatsNew}
-          version={WHATS_NEW_VERSION}
+          version={whatsNewVersion ?? "v0.0.0"}
           markdown={whatsNewMarkdown}
+          releaseUrl={whatsNewReleaseUrl}
           onClose={dismissWhatsNew}
         />
         <StorageMigrationOverlay

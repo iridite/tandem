@@ -1,0 +1,503 @@
+---
+title: MCP Automated Agents
+---
+
+Set up scheduled agents that can use MCP connector tools with explicit per-agent tool allowlists.
+
+## What You Get
+
+- MCP connector lifecycle: add, enable/disable, connect, refresh
+- Auto MCP tool discovery on connect (`initialize` + `tools/list`)
+- Namespaced MCP tools in the global tool registry (for example `mcp.arcade.search`)
+- Routine-level `allowed_tools` policy for scheduled bots
+- Agent Automation visibility for connector status and scheduled runs
+
+## 1) Configure MCP Connector
+
+Add an MCP server:
+
+```bash
+curl -sS -X POST http://127.0.0.1:39731/mcp \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "arcade",
+    "transport": "https://your-mcp-server.example/mcp",
+    "enabled": true,
+    "headers": {
+      "Authorization": "Bearer YOUR_TOKEN"
+    }
+  }'
+```
+
+Connect it (this performs discovery and caches tools):
+
+```bash
+curl -sS -X POST http://127.0.0.1:39731/mcp/arcade/connect
+```
+
+Refresh cached tools later:
+
+```bash
+curl -sS -X POST http://127.0.0.1:39731/mcp/arcade/refresh
+```
+
+List connector tools:
+
+```bash
+curl -sS http://127.0.0.1:39731/mcp/tools
+```
+
+List all tool IDs (built-ins + MCP):
+
+```bash
+curl -sS http://127.0.0.1:39731/tool/ids
+```
+
+### Provider Notes: Arcade
+
+Arcade MCP Gateways are ideal when you want to curate a smaller, safer tool set for a specific bot.
+
+Recommended flow:
+
+1. In Arcade, create an MCP Gateway for your bot mission.
+2. Select only the tools needed for that mission (avoid sending dozens of tools to one agent).
+3. Use the gateway URL in Tandem as the MCP `transport`.
+4. If using Arcade headers auth mode, pass required headers in Tandem (`Authorization`, and user ID header if your setup requires it).
+
+Then in Tandem:
+
+```bash
+curl -sS -X POST http://127.0.0.1:39731/mcp \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "arcade",
+    "transport": "https://api.arcade.dev/mcp/YOUR-GATEWAY-SLUG",
+    "enabled": true,
+    "headers": {
+      "Authorization": "Bearer YOUR_ARCADE_KEY"
+    }
+  }'
+curl -sS -X POST http://127.0.0.1:39731/mcp/arcade/connect
+```
+
+### Provider Notes: Composio
+
+For Composio MCP URLs, make sure your project's MCP URL security requirements are satisfied.
+
+Important dates from Composio changelog:
+
+- Since **December 15, 2025**, new projects require `x-api-key` on MCP URL requests.
+- After **April 15, 2026**, requests without `x-api-key` are rejected.
+
+Then in Tandem:
+
+```bash
+curl -sS -X POST http://127.0.0.1:39731/mcp \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "composio",
+    "transport": "https://mcp.composio.dev/YOUR_MCP_PATH",
+    "enabled": true,
+    "headers": {
+      "x-api-key": "YOUR_COMPOSIO_API_KEY"
+    }
+  }'
+curl -sS -X POST http://127.0.0.1:39731/mcp/composio/connect
+```
+
+## 2) Create a Scheduled Agent With Tool Allowlist
+
+### What The Bot Actually Does On Each Run
+
+Each scheduled run executes this loop:
+
+1. Load automation definition: mission, mode, tool policy, model policy, outputs.
+2. Build run prompt from objective and success criteria.
+3. Enforce policy gates (`allowed_tools`, approval flags, external side-effect settings).
+4. Execute and stream run events over SSE.
+5. Persist run status/history and attach output artifacts.
+
+Mission quality is the primary control lever. If the mission objective is vague, run behavior will be vague.
+
+Create an automation that only allows selected tools (`routines/*` remains compatible):
+
+```bash
+curl -sS -X POST http://127.0.0.1:39731/automations \
+  -H "content-type: application/json" \
+  -d '{
+    "routine_id": "daily-mcp-research",
+    "name": "Daily MCP Research",
+    "schedule": { "interval_seconds": { "seconds": 86400 } },
+    "entrypoint": "mission.default",
+    "allowed_tools": ["mcp.arcade.search", "read"],
+    "output_targets": ["file://reports/daily-mcp-research.json"],
+    "requires_approval": true,
+    "external_integrations_allowed": true
+  }'
+```
+
+Trigger immediately:
+
+```bash
+curl -sS -X POST http://127.0.0.1:39731/automations/daily-mcp-research/run_now \
+  -H "content-type: application/json" \
+  -d '{}'
+```
+
+Check run records:
+
+```bash
+curl -sS "http://127.0.0.1:39731/automations/runs?routine_id=daily-mcp-research&limit=10"
+```
+
+Each run record includes `allowed_tools` so you can verify tool scope at execution time.
+
+## 2.5) Which Tools Should You Start With?
+
+For autonomous bots, start narrow and expand only when runs are stable.
+
+### Recommended Starter Bundle (Most Teams)
+
+Use one read channel + one write channel + one source-of-truth system:
+
+- `mcp.<provider>.search/list/get` tools for discovery and context
+- One ticketing/project write tool (create/update comment/status)
+- One messaging output tool (post update to Slack/Teams/Discord)
+
+### Good First Mission Patterns
+
+1. Triage bot:
+   - read inbox/issues
+   - classify
+   - post summary + suggested next steps
+2. Status reporter:
+   - read project state + CI/test signals
+   - publish daily report artifact + message channel post
+3. Change assistant (with approval):
+   - prepare updates/comments/PR drafts
+   - require approval for any external side-effect tools
+
+### Avoid Early
+
+- Huge tool surfaces in one agent (harder model routing, more mistakes)
+- Destructive tools without approval gates
+- Multi-system write actions in the same first rollout
+
+### Practical Rule
+
+Start with **3-8 allowed tools** max per routine. Increase only after you get predictable run history.
+
+## 2.6) Ready-Made Routine Templates (Copy/Paste)
+
+Replace MCP tool IDs with your connector namespaces (for example `mcp.arcade.search` or `mcp.composio.github_issues_list`).
+
+### Template A: Daily Research Digest
+
+```bash
+curl -sS -X POST http://127.0.0.1:39731/routines \
+  -H "content-type: application/json" \
+  -d '{
+    "routine_id": "daily-research-digest",
+    "name": "Daily Research Digest",
+    "schedule": { "interval_seconds": { "seconds": 86400 } },
+    "entrypoint": "mission.default",
+    "allowed_tools": [
+      "websearch",
+      "webfetch",
+      "read",
+      "write",
+      "mcp.arcade.search"
+    ],
+    "output_targets": ["file://reports/daily-research-digest.md"],
+    "requires_approval": true,
+    "external_integrations_allowed": true
+  }'
+```
+
+### Template B: 15-Min Issue Triage
+
+```bash
+curl -sS -X POST http://127.0.0.1:39731/routines \
+  -H "content-type: application/json" \
+  -d '{
+    "routine_id": "issue-triage-bot",
+    "name": "Issue Triage Bot",
+    "schedule": { "interval_seconds": { "seconds": 900 } },
+    "entrypoint": "mission.default",
+    "allowed_tools": [
+      "read",
+      "write",
+      "websearch",
+      "webfetch",
+      "mcp.composio.github_issues_list",
+      "mcp.composio.github_issue_comment_create"
+    ],
+    "output_targets": ["file://reports/issue-triage.json"],
+    "requires_approval": true,
+    "external_integrations_allowed": true
+  }'
+```
+
+### Template C: Hourly Release Reporter (Unattended)
+
+```bash
+curl -sS -X POST http://127.0.0.1:39731/routines \
+  -H "content-type: application/json" \
+  -d '{
+    "routine_id": "hourly-release-reporter",
+    "name": "Hourly Release Reporter",
+    "schedule": { "interval_seconds": { "seconds": 3600 } },
+    "entrypoint": "mission.default",
+    "allowed_tools": [
+      "read",
+      "websearch",
+      "webfetch",
+      "write",
+      "mcp.arcade.search"
+    ],
+    "output_targets": ["file://reports/release-status.md"],
+    "requires_approval": false,
+    "external_integrations_allowed": true
+  }'
+```
+
+## 3) Desktop Flow (Agent Automation)
+
+From desktop:
+
+1. Open `Extensions -> MCP` and add/connect connector servers.
+2. Open `Agent Automation` (robot icon in the left nav) and use `Automated Bots`.
+3. Create a scheduled bot:
+   - choose interval (seconds)
+   - set a clear mission objective (required)
+   - optionally use Mission Workshop to generate objective + success criteria
+   - choose entrypoint (for example `mcp.arcade.search`)
+   - choose `allowed_tools` from MCP and built-ins
+4. Use `Configured Routines` actions to pause/resume routines.
+5. Use `Scheduled Bots` run actions (`Approve`, `Deny`, `Pause`, `Resume`) for gated runs.
+6. In `Scheduled Bots`, inspect tool scope shown on each run card.
+7. Watch the per-run event rail chips (`Plan`, `Do`, `Verify`, `Approval`, `Blocked`, `Failed`) for live execution state.
+8. Click `Details` on a run to inspect latest event type/note, timestamps, output targets, and artifacts.
+9. Use run filters (`All`, `Pending`, `Blocked`, `Failed`) to quickly triage execution issues.
+
+### Mission Workshop (Desktop)
+
+`Agent Automation -> Automated Bots -> Mission Workshop` provides a chat-style drafting helper.
+
+Use it to:
+
+- describe what the bot should achieve in plain language
+- generate a mission objective + success criteria
+- apply the draft into the automation form before saving
+
+The resulting mission is stored in routine args (`prompt` + `success_criteria`) and is what the run executes.
+
+### Mission Modes (Desktop + Headless)
+
+- `standalone`: one agent executes the mission directly.
+- `orchestrated`: run prompt uses a `Plan -> Do -> Verify -> Notify` contract and expects orchestrator-style behavior.
+
+For orchestrated mode with stricter tool discipline, set:
+
+- `mode: "orchestrated"`
+- `orchestrator_only_tool_calls: true`
+
+Desktop mapping:
+
+- In `Agent Automation`, choose `Mode = orchestrated`
+- Enable `Orchestrator-only tool calls` in the form
+
+### Model Provider + Model Selection (Desktop + Headless)
+
+Each automation can now carry a model routing policy in `args.model_policy`:
+
+- `default_model`: used by standalone runs and as fallback for orchestrated runs
+- `role_models.orchestrator`: preferred model for orchestrated mode today
+- `role_models.planner|worker|verifier|notifier`: stored now for upcoming deeper role routing
+
+Desktop mapping:
+
+- In `Agent Automation`, use `Model Routing`
+- Pick provider/model directly or apply a preset
+
+Example policy payload:
+
+```json
+{
+  "model_policy": {
+    "default_model": {
+      "provider_id": "openrouter",
+      "model_id": "openai/gpt-4.1-mini"
+    },
+    "role_models": {
+      "orchestrator": {
+        "provider_id": "openrouter",
+        "model_id": "anthropic/claude-3.5-sonnet"
+      },
+      "verifier": {
+        "provider_id": "openrouter",
+        "model_id": "anthropic/claude-3.5-sonnet"
+      }
+    }
+  }
+}
+```
+
+Recommended starting examples:
+
+- OpenRouter (balanced): `openrouter/openai/gpt-4.1-mini`
+- OpenRouter (orchestrator+verifier): `openrouter/anthropic/claude-3.5-sonnet`
+- OpenCode Zen fast profile: `opencode_zen/zen/fast`
+- OpenCode Zen quality profile: `opencode_zen/zen/pro`
+
+To clear model policy on a patch/update, send an empty object:
+
+```json
+{
+  "model_policy": {}
+}
+```
+
+## 4) SSE Visibility
+
+Watch automation stream:
+
+```bash
+curl -N http://127.0.0.1:39731/automations/events
+```
+
+Relevant events include:
+
+- `mcp.server.connected`
+- `mcp.tools.updated`
+- `run.started`
+- `approval.required`
+- `run.failed`
+
+## 5) End-to-End Headless Example Scripts
+
+Use the included scripts:
+
+- `examples/headless/mcp_tools_allowlist/flow.sh`
+- `examples/headless/mcp_tools_allowlist/flow.ps1`
+
+They automate:
+
+1. MCP add/connect
+2. MCP + global tool listing
+3. Automation creation with `allowed_tools` + `output_targets`
+4. Run trigger + run record/artifact verification
+
+## 6) Headless "Just Run" Setup
+
+Use this when you want unattended operation without opening desktop.
+
+### A) Start engine headless
+
+```bash
+cargo run -p tandem-ai --bin tandem-engine -- serve --host 127.0.0.1 --port 39731
+```
+
+### B) Register MCP and automation once
+
+Use Sections 1 and 2 above (or run the included script):
+
+- `examples/headless/mcp_tools_allowlist/flow.sh`
+- `examples/headless/mcp_tools_allowlist/flow.ps1`
+
+### C) Make it autonomous
+
+For no human intervention:
+
+- set `requires_approval: false` on automations you trust
+- keep `allowed_tools` explicit and small
+- keep `output_targets` configured so every run leaves artifacts
+
+### D) Observe continuously
+
+```bash
+curl -N http://127.0.0.1:39731/automations/events
+```
+
+Watch for:
+
+- `run.started`
+- `run.failed`
+- `approval.required`
+- `mcp.tools.updated`
+
+### E) Production tip
+
+Run `tandem-engine serve` under a process supervisor (systemd, PM2, container orchestrator, or Windows Task Scheduler/service wrapper) so it auto-restarts after reboots/crashes.
+
+### F) Benchmark mission/automation cold start
+
+If someone asks "how fast is mission startup?" benchmark exactly this:
+
+1. Engine launch to `ready=true`
+2. `run_now` API ack latency
+3. Time until run record is visible
+
+Scripts:
+
+- `examples/headless/mcp_tools_allowlist/benchmark_cold_start.ps1`
+- `examples/headless/mcp_tools_allowlist/benchmark_cold_start.sh`
+
+PowerShell:
+
+```powershell
+cd examples/headless/mcp_tools_allowlist
+$env:BENCH_RUNS = "10"
+.\benchmark_cold_start.ps1
+```
+
+Bash:
+
+```bash
+cd examples/headless/mcp_tools_allowlist
+chmod +x benchmark_cold_start.sh
+BENCH_RUNS=10 ./benchmark_cold_start.sh
+```
+
+Both scripts output p50/p95 summary and write per-trial data to:
+
+- `examples/headless/mcp_tools_allowlist/cold_start_results.json`
+
+## 7) App Testing Checklist (Release Readiness)
+
+Use this checklist before shipping:
+
+1. MCP connectors:
+   - add, enable/disable, connect/disconnect, refresh
+   - verify `mcp.tools.updated` events appear
+2. Automation creation:
+   - create standalone + orchestrated bots
+   - verify interval is interpreted as seconds
+   - verify `webfetch` appears in allowed tools (and `webfetch_html` when raw HTML fallback is needed)
+3. Model routing:
+   - apply a preset (OpenRouter/OpenCode Zen)
+   - verify selected provider/model appears in routine/run cards
+   - verify run emits model selection event (`routine.run.model_selected`)
+4. Approval flow:
+   - verify pending approval run can be approved/denied
+   - verify blocked/failed filters surface problem runs
+5. Run details:
+   - verify timeline chips, timestamps, reason text, outputs, artifacts
+6. Headless:
+   - run `examples/headless/mcp_tools_allowlist/flow.sh` or `.ps1`
+   - confirm runs execute and artifacts are produced without desktop UI
+
+## Safety Notes
+
+- Keep connector secrets in headers/env, not logs.
+- Default external side-effects are policy-gated (`requires_approval` and `external_integrations_allowed`).
+- Prefer explicit `allowed_tools` for production automated agents.
+
+## See Also
+
+- [Headless Service](./headless-service/)
+- [Agent Command Center](./agent-command-center/)
+- [WebMCP for Agents](./webmcp-for-agents/)
+- [Engine Commands](./reference/engine-commands/)
+- [Tools Reference](./reference/tools/)
+

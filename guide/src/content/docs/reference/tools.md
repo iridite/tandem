@@ -31,10 +31,10 @@ The Tandem Engine tool registry currently exposes the following tools.
 
 ## Web
 
-- **`webfetch`**: Fetch raw URL text.
-  - Input: `url` (string)
-- **`webfetch_document`**: Fetch URL and return structured Markdown.
-  - Input: `url` (string)
+- **`webfetch`**: Fetch URL and return structured Markdown/JSON output.
+  - Input: `url` (string), optional `mode`, `return`, `max_bytes`, `timeout_ms`, `max_redirects`
+- **`webfetch_html`**: Fetch URL and return raw HTML text.
+  - Input: `url` (string), optional `max_bytes`, `timeout_ms`, `max_redirects`
 
 ## System
 
@@ -47,6 +47,16 @@ The Tandem Engine tool registry currently exposes the following tools.
 - **`question`**: Ask a structured question to the user and wait for input.
 - **`spawn_agent`**: Spawn an agent-team worker instance (runtime/policy gated).
   - Input: mission/spawn payload (e.g., `missionID`, `role`, `templateID`, `source`)
+- **`teamcreate`**: Create/register an agent-team context for coordinated teammate tasks.
+  - Input: team metadata (e.g., `team_name`, `description`, `agent_type`)
+- **`taskcreate`**: Create teammate task records in a team context.
+  - Input: task payload (e.g., `team_name`, `name`, `description`)
+- **`taskupdate`**: Update teammate task status/notes/progress in a team context.
+  - Input: task update payload (e.g., `team_name`, `task_id`, `status`, `notes`)
+- **`tasklist`**: List tasks for a team context.
+  - Input: optional filters (e.g., `team_name`, status filter)
+- **`sendmessage`**: Send mailbox-style message/task prompt to one or more teammates.
+  - Input: message payload (e.g., `team_name`, `to`, `content`, `summary`)
 
 ## Specialized
 

@@ -1,5 +1,6 @@
-import React, { createContext, useContext, useState, useEffect } from "react";
-import { api } from "./api";
+/* eslint-disable react-refresh/only-export-components */
+import React, { createContext, useContext, useState, useEffect, useCallback } from "react";
+import { api, PORTAL_AUTH_EXPIRED_EVENT } from "./api";
 
 interface AuthContextType {
   token: string | null;
@@ -24,10 +25,14 @@ const AuthContext = createContext<AuthContextType>({
 export const useAuth = () => useContext(AuthContext);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [token, setToken] = useState<string | null>(null);
+  const [token, setToken] = useState<string | null>(() => {
+    return localStorage.getItem("tandem_portal_token");
+  });
   const [isLoading, setIsLoading] = useState(true);
   const [providerConfigured, setProviderConfigured] = useState(false);
-  const [providerLoading, setProviderLoading] = useState(false);
+  const [providerLoading, setProviderLoading] = useState(() => {
+    return !!localStorage.getItem("tandem_portal_token");
+  });
 
   const checkProviderConfigured = async (): Promise<boolean> => {
     try {
@@ -57,18 +62,35 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setProviderLoading(false);
   };
 
+  const logout = useCallback(() => {
+    localStorage.removeItem("tandem_portal_token");
+    api.setToken("");
+    setToken(null);
+    setProviderConfigured(false);
+    setProviderLoading(false);
+  }, []);
+
   useEffect(() => {
     const storedToken = localStorage.getItem("tandem_portal_token");
     if (storedToken) {
       api.setToken(storedToken);
-      setToken(storedToken);
-      setProviderLoading(true);
       checkProviderConfigured()
         .then(setProviderConfigured)
         .finally(() => setProviderLoading(false));
     }
+    // eslint-disable-next-line
     setIsLoading(false);
   }, []);
+
+  useEffect(() => {
+    const handleAuthExpired = () => {
+      logout();
+    };
+    window.addEventListener(PORTAL_AUTH_EXPIRED_EVENT, handleAuthExpired);
+    return () => {
+      window.removeEventListener(PORTAL_AUTH_EXPIRED_EVENT, handleAuthExpired);
+    };
+  }, [logout]);
 
   const login = async (newToken: string) => {
     try {
@@ -85,13 +107,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       api.setToken(""); // clear bad token
       return false;
     }
-  };
-
-  const logout = () => {
-    localStorage.removeItem("tandem_portal_token");
-    api.setToken("");
-    setToken(null);
-    setProviderConfigured(false);
   };
 
   return (

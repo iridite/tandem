@@ -4,6 +4,27 @@ title: Agent Teams
 
 Agent Teams add policy-gated multi-agent spawning to `tandem-engine`.
 
+## TUI Workflow (Agent Fanout)
+
+For terminal-native team execution, use TUI fanout:
+
+```text
+/agent fanout 4 Build and ship the VPS web portal stress-lab improvements
+```
+
+What this does:
+
+- Ensures `n` agents exist in the current chat.
+- Switches the layout to Grid mode.
+- Bootstraps a coordinated team run (`TeamCreate` + delegated `task` routing).
+- If current mode is `plan`, TUI auto-switches to `orchestrate` before delegation.
+
+Notes:
+
+- Fanout without a goal (`/agent fanout 4`) only prepares panes/layout.
+- With a goal, the lead agent dispatches worker assignments and tracks progress.
+- Local team runtime state is written under `.tandem/agent-teams/` (members/session bindings, mailbox files, and session-team context).
+
 ## What Is Implemented
 
 - Server-side spawn gate (`SpawnPolicy`) shared by all spawn callers.
@@ -23,8 +44,8 @@ Agent Teams add policy-gated multi-agent spawning to `tandem-engine`.
   - `POST /agent-team/approvals/spawn/{id}/deny`
   - `POST /agent-team/instance/{id}/cancel`
   - `POST /agent-team/mission/{id}/cancel`
-- Desktop command center surface:
-  - Orchestrator panel now includes an `Agent Command Center` section for spawn, approvals, and mission/instance control.
+- Desktop operator surface:
+  - `Agent Automation` page includes an `Agent Ops` tab for spawn, approvals, and mission/instance control.
 - Structured events:
   - `agent_team.spawn.requested`
   - `agent_team.spawn.denied`
@@ -62,5 +83,6 @@ See:
 - [Spawn Policy Reference](./reference/spawn-policy/)
 - [Agent Team API](./reference/agent-team-api/)
 - [Agent Team Events](./reference/agent-team-events/)
+- [TUI Commands](./reference/tui-commands/)
 - [Agent Command Center](./agent-command-center/)
 - [Agent Teams Rollout Plan](./agent-teams-rollout/)

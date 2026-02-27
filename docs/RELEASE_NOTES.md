@@ -1,4 +1,178 @@
-# Tandem v0.3.8 Release Notes (Unreleased)
+# Tandem v0.3.22 Release Notes (Unreleased)
+
+### Highlights
+
+- **Engine-first context-driving runtime expansion**:
+  - Extended context-run wiring used by Desktop + TUI for sequenced event consumption, replay/checkpoint visibility, deterministic next-step selection, and todo->step synchronization.
+  - Preserves the engine-as-source-of-truth contract for run status/progress/decision context.
+- **Premium Blackboard UX (Orchestrator + Command Center parity)**:
+  - Added shared Blackboard panel behaviors across both operator surfaces with docked/expanded/fullscreen modes.
+  - Added decision spine + lineage rail views for clear decision history and attached context visibility.
+  - Added deterministic follow behavior (decision-driven auto-focus only; manual exploration pauses follow).
+  - Added drift details drawer with mismatch flags, checkpoint/event sequence markers, and copyable debug bundle payload.
+  - Added keyboard controls (`E`, `F`, `Space`, `/`, `Esc`) and fullscreen focus-handling baseline.
+- **Refresh/perf/test hardening**:
+  - Blackboard materialization refresh now uses relevant event-family gating + debounce + refresh-sequence watermarking to reduce redundant fetches.
+  - Added blackboard-focused test target (`pnpm test:blackboard`) covering projection/filtering, follow state invariants, refresh policy, and drift drawer state contracts.
+- **Orchestrator execution reliability + continuity**:
+  - Planning now uses a two-pass flow (analysis -> planner) to improve task decomposition quality for complex objectives.
+  - Builder prompts now include continuation context from context-pack summaries, helping retries/resumes continue from prior rationale.
+  - Failed-task retry now preserves task session context by default; run load/restart restores task session bindings from checkpoint snapshots.
+  - Budget token usage now records prompt + response estimates across planner analysis, planner, builder, and validator calls.
+  - Added explicit fail-fast checks when file-modifying tasks complete recovery with no tools, or only read-only tools.
+  - Resume now preserves per-task failure rationale in prompt context to reduce fresh-start retries.
+- **Blackboard parity improvements (Orchestrator + Command Center)**:
+  - Blackboard projection/refresh now recognizes orchestrator runtime event families (for example `context_pack_built`, planning/task lifecycle, and run failure events), not only context-run `meta_next_step_selected`.
+  - Improves live blackboard context visibility during active engine-owned orchestrator runs.
+  - Added `task_trace` projection/refresh/filtering support so stage details like `FIRST_TOOL_CALL: glob` are surfaced in blackboard rails.
+- **Filesystem/tool-path reliability hardening**:
+  - File-path normalization now rejects synthetic placeholders (`files/directories`, `tool/policy`) and recognizes document extensions (`.pdf/.docx/.pptx/.xlsx/.rtf`) for path recovery.
+  - `read` now returns explicit failure categories (`path_not_found`, `path_is_directory`, `read_text_failed`) instead of empty output on failure.
+  - Sandbox-denied path responses now include actionable diagnostics (`workspace_root`, `effective_cwd`, and suggested in-workspace path).
+  - Windows verbatim paths (`\\?\...`) are accepted when they remain in-workspace, reducing false sandbox denials.
+
+---
+
+# Tandem v0.3.20 Release Notes (Unreleased)
+
+### Highlights
+
+- **Tandem TUI reliability + UX upgrade**:
+  - Small pastes (1-2 lines) now insert directly without `[Pasted ...]` markers; CRLF payloads are normalized to avoid line-overlap rendering artifacts.
+  - Fixed multiline composer height growth for explicit newlines, preventing second-line overlap/cropping in the input box.
+  - `/agent fanout` now auto-switches mode from `plan` to `orchestrate` before delegation to reduce plan-mode approval/clarification blockers during team runs.
+  - Expanded agent-team fanout integration: coordinated `TeamCreate` + delegated `task` routing, local mailbox/session binding, and teammate alias normalization (`A2`/`a2`/`agent-2`).
+
+---
+
+# Tandem v0.3.19 Release Notes (Released)
+
+### Highlights
+
+- **Stress benchmark parity and accuracy uplift (VPS portal)**:
+  - Server-side Stress Lab prompt scenarios now execute async runs and wait for completion, so latency reflects true end-to-end provider/tool execution.
+  - Server-side stress runner now resolves and passes explicit provider/model payloads for prompt runs, preventing accidental non-LLM timing paths.
+  - Stress chart rendering was hardened for empty/all-zero samples to avoid NaN polyline failures in browser.
+- **Tandem vs OpenCode comparison surface (portal)**:
+  - Added OpenCode benchmark read integration for:
+    - `GET /results/latest`
+    - `GET /results/history?days=30`
+    - `GET /results/by-date/{yyyy-mm-dd}`
+    - `GET /health` (with compatibility handling)
+  - Added scenario-mapped comparison panel showing Tandem vs OpenCode avg/p95 deltas and recent error context.
+- **Engine performance diagnostics improvements**:
+  - Added request-latency instrumentation for core server routes under load:
+    - `session.command`
+    - `session.get`
+    - `session.list`
+  - Improves bottleneck visibility for providerless and mixed endpoint soak analysis.
+- **Tandem TUI reliability + UX upgrade**:
+  - Upgraded TUI terminal stack to `ratatui 0.30` and `crossterm 0.29`, with local spinner rendering replacing third-party throbber dependency.
+  - Added safer Windows paste semantics using paste-token placeholders to avoid line-by-line replay/auto-submit failures on large clipboard input.
+  - Fixed plan-mode request/question handoff loops that could repeatedly trigger `409 session has active run` conflicts by queueing busy-run follow-ups safely.
+  - Improved question request handling (selection/confirm behavior) and added explicit confirmation output that shows submitted answers.
+  - Restored plan task-pane persistence when reopening historical sessions by broadening tool-call history parsing (`tool`, `tool_call`, `tool_use`).
+  - Added sessions-list delete shortcut (`d`/`Delete`) and `/agent fanout [n]` command for explicit multi-agent grid fanout (default 4).
+
+---
+
+# Tandem v0.3.18 Release Notes (Unreleased)
+
+### Highlights
+
+- **OpenRouter model persistence hotfix**:
+  - Fixed env-layer provider bootstrap so `OPENROUTER_API_KEY` no longer forces `openai/gpt-4o-mini` as the effective default model.
+  - Preserves saved/configured OpenRouter model selections (for example `z-ai/glm-5`) in web/VPS deployments.
+  - Env-driven model override is now explicit-only (requires a model env var), preventing silent model drift.
+
+---
+
+# Tandem v0.3.17 Release Notes (Unreleased)
+
+### Highlights
+
+- **Channel runtime reliability updates**:
+  - Channel-created sessions now start with practical default permission rules to avoid hidden permission deadlocks in connector workflows.
+  - Channel dispatcher now attaches SSE at session scope and parses `message.part.updated` text deltas plus additional terminal run lifecycle variants.
+  - Improves reply reliability for Telegram/Discord/Slack message handling in long-lived sessions.
+- **Telegram production diagnostics improvements**:
+  - Telegram poll failures now emit richer diagnostics (`{e:?}` transport context and non-success status/body preview) to reduce blind debugging.
+- **Portal debugging/observability uplift (minimal UX scope)**:
+  - Added global pending-approval visibility/action in portal shell.
+  - Improved run watchdog trace messaging and session-level SSE attach behavior for web examples to reduce `connected/ready but no deltas` confusion.
+
+---
+
+# Tandem v0.3.16 Release Notes (Unreleased)
+
+### Highlights
+
+- **What's New release-note alignment hotfix**:
+  - The desktop What's New overlay now fetches release notes for the installed app tag from GitHub at runtime.
+  - If release-note fetch fails or the matched release has no body text, the overlay avoids stale local note content and links users to the latest release page.
+- **Plan execution task-state integrity**:
+  - `Execute Pending Tasks` now requires real todo state transitions (`todowrite`) before Tandem considers execution complete.
+  - Assistant-only completion claims no longer mark execution as successful when todo statuses remain pending.
+  - Execution now targets pending-only tasks, keeping prompt payloads in sync with the Tasks sidebar.
+
+---
+
+# Tandem v0.3.15 Release Notes
+
+### Highlights
+
+- **Breaking web tool migration**:
+  - Removed `webfetch_document`.
+  - `webfetch` now returns structured markdown-first JSON output by default.
+  - Added `webfetch_html` for explicit raw HTML fallback.
+  - Migration examples:
+    - Old: `{"tool":"webfetch_document","args":{"url":"https://example.com","return":"both","mode":"auto"}}`
+    - New: `{"tool":"webfetch","args":{"url":"https://example.com","return":"both","mode":"auto"}}`
+- **Custom provider + llama-swap reliability uplift**:
+  - Fixed custom provider runtime registration so enabled custom endpoint/model selections are persisted into engine provider config (`providers.custom`) and selected consistently.
+  - Hardened OpenAI-compatible endpoint normalization for custom providers (handles trailing `/v1`, duplicated `/v1/v1`, and accidental full-path endpoints like `/v1/chat/completions`).
+  - Added engine support for custom/non-built-in provider IDs from config, preventing `configured providers: local` fallback when custom is selected.
+  - Added short retry behavior on transient connection/timeout failures for OpenAI-compatible provider calls.
+  - Improved provider error diagnostics to include endpoint + failure category (`connection error` / `timeout`) for faster local-gateway troubleshooting.
+- **Provider settings UX improvements**:
+  - Saving **Custom Provider** now surfaces explicit success/error feedback in Settings.
+  - Anthropic/OpenAI settings now use text-input-first model selection with refreshed current model suggestions and clearer provider-specific placeholders.
+
+---
+
+# Tandem v0.3.14 Release Notes
+
+### Highlights
+
+- **Endless update prompt/version skew hotfix**:
+  - Desktop now prefers bundled engine binaries when AppData sidecar binaries are stale, preventing false old-version update prompts after app upgrade.
+  - Update overlay engine version labels are normalized to avoid duplicated `v` prefixes.
+
+---
+
+# Tandem v0.3.12 Release Notes
+
+### Highlights
+
+- **MCP runtime compatibility hotfix**:
+  - Desktop now falls back to MCP server `tool_cache` from `GET /mcp` when `GET /mcp/tools` is unavailable (404) on mixed-version engines.
+  - Prevents Extensions MCP tab runtime-load failures during app/engine version skew.
+- **Registry publish workflow hotfix**:
+  - Corrected crate publish ordering and dependency coverage for tandem workspace crates (`tandem-providers` before `tandem-memory`, plus `tandem-document` before `tandem-tools`).
+
+### Highlights
+
+- **Issue #14 fix (custom providers + live model lists)**:
+  - Fixed `custom` provider routing so custom endpoint/model selections are honored for chat/automation dispatch.
+  - Provider settings now prefer engine-catalog model IDs (OpenAI/Anthropic/OpenCode Zen) when available, instead of static-only dropdown content.
+- **Update + release metadata reliability**:
+  - Settings release notes now fall back to updater `latest.json` when GitHub Releases API fetches fail.
+  - Desktop CSP now allows GitHub release metadata hosts used by updater/release notes fetch paths.
+  - Sidecar updater status now reports bundled-engine version from app metadata to avoid stale beta-version prompts.
+
+---
+
+# Tandem v0.3.9 Release Notes
 
 ### Highlights
 
@@ -19,6 +193,7 @@
   - `GET /memory`
   - `DELETE /memory/{id}`
 - **Agent Command Center (Desktop)**: Added an orchestrator-embedded command center surface for Agent Teams with live mission/instance/approval visibility.
+- **Agent Automation IA split (Desktop)**: Added a dedicated `Agent Automation` page (robot icon) for MCP connector operations, scheduled bot wiring, and routine run monitoring; `Command Center` now stays focused on swarm/orchestrator runs.
 - **Agent-Team spawn approval decisions**: Added dedicated decision endpoints:
   - `POST /agent-team/approvals/spawn/{id}/approve`
   - `POST /agent-team/approvals/spawn/{id}/deny`
@@ -32,6 +207,10 @@
 - **Command Center retry-loop fix (Windows/path failures)**: Added strict `read`/`write` argument validation (`JSON object` + non-empty `path`) with fail-fast `INVALID_TOOL_ARGS` handling to stop endless task retries.
 - **Structured orchestrator error taxonomy**: Replaced generic `os error 3` workspace mismatch messaging with explicit categories (`WORKSPACE_NOT_FOUND`, path-not-found fail-fast, timeout codes).
 - **Workspace pinning + preflight**: Child task sessions now pin to the orchestrator workspace and validate workspace existence before session creation.
+- **Workspace propagation correctness (CC-001)**: Orchestrator runs now persist canonical `workspace_root`, and tool calls execute with explicit `workspace_root`/`effective_cwd` context to keep all filesystem actions rooted to the selected workspace.
+- **Workspace switch hot-switch hardening (CC-001)**: Active-project switches now invalidate stale in-memory orchestrator engines tied to old workspace roots, preventing cross-workspace bleed.
+- **Selected Run prompt UX (CC-002)**: Added inline objective line-clamp with `Show more` / `Show less` toggle in the Command Center Selected Run panel.
+- **Runs status visibility (CC-003)**: Command Center run list now shows status badges, started/ended timestamps, and failed-run error snippets.
 - **Tool-history correlation integrity**: Tool execution IDs now include session/message/part context to prevent cross-session `part_id` collision overwrite.
 - **File-tool timeout tuning**: Increased `read`/`write` timeout budget to reduce premature synthetic timeout terminal events.
 - **Autonomous swarm approvals**: Command Center/orchestrator sessions now auto-allow shell permissions in autonomous mode instead of repeatedly prompting.
@@ -51,6 +230,20 @@
 - **OS mismatch diagnostics and loop suppression**: Added `OS_MISMATCH` error classification and retry suppression for repeated identical shell mismatch patterns.
 - **Docs and examples refresh**: Added engine CLI examples for memory write/list/global flows and documented global-memory startup configuration.
 - **Safety and coverage**: Added/updated tests to enforce explicit global-memory gating and avoid accidental unrestricted global recall.
+- **MCP Automated Agents (Desktop IA)**: Added a dedicated `Agent Automation` page (robot icon) for scheduled bots and MCP connector operations, separate from Command Center swarm workflows.
+- **Mission Workshop + templates**: Added mission drafting helper and ready templates (Daily Research, Issue Triage, Release Reporter) with default `webfetch_document`-first workflows.
+- **Automation run triage UX**: Added run event rail, run filters (`All`, `Pending`, `Blocked`, `Failed`), and run details panel with reason/timeline/output/artifact visibility.
+- **Automations API compatibility**: Desktop sidecar now falls back to legacy `/routines` endpoints when `/automations` is unavailable, reducing mixed-version 404 failures.
+- **Automation model routing**: Added provider/model routing controls and presets (OpenRouter/OpenCode Zen examples), plus orchestrated role model hints.
+- **Model selection observability**: Runs now emit `routine.run.model_selected` events so selected provider/model and source are visible in event streams.
+- **Server model policy hardening**: Added strict `model_policy` validation in automation create/patch handlers and explicit clear semantics (`model_policy: {}`).
+- **Docs rollout for automated agents**: Expanded MCP automated agent guide with headless setup, provider onboarding (Arcade/Composio), mission quality guidance, model-policy examples, and release test checklist.
+
+### Contributor Thanks
+
+- Thanks to [@iridite](https://github.com/iridite) for:
+  - **PR #12**: Provider settings i18n namespace fix (`ProviderCard` translation resolution).
+  - **PR #11**: [`feat: enhance ReadTool to support document formats`](https://github.com/frumu-ai/tandem/pull/11), moving document/file-reading extraction toward shared engine-side crate usage (`tandem-document`).
 
 ### Orchestrator Routing Migration Notes
 
@@ -61,7 +254,7 @@
   - `template_id` (optional hint)
   - `gate` (`review` or `test`, optional)
 
-### Complete Feature List - tandem-channels v0.3.8
+### Complete Feature List - tandem-channels v0.3.9
 
 #### New Crate: `tandem-channels`
 

@@ -1063,6 +1063,10 @@ pub struct RoutineSpec {
     pub entrypoint: String,
     #[serde(default)]
     pub args: serde_json::Value,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub output_targets: Vec<String>,
     pub creator_type: String,
     pub creator_id: String,
     pub requires_approval: bool,
@@ -1084,6 +1088,66 @@ pub struct RoutineHistoryEvent {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpToolCacheEntry {
+    pub tool_name: String,
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+    pub fetched_at_ms: u64,
+    pub schema_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpServerRecord {
+    pub name: String,
+    pub transport: String,
+    #[serde(default)]
+    pub enabled: bool,
+    pub connected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub tool_cache: Vec<McpToolCacheEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_fetched_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpRemoteTool {
+    pub server_name: String,
+    pub tool_name: String,
+    pub namespaced_name: String,
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+    pub fetched_at_ms: u64,
+    pub schema_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpAddRequest {
+    pub name: String,
+    pub transport: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpActionResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutineCreateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1097,6 +1161,10 @@ pub struct RoutineCreateRequest {
     pub entrypoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_targets: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creator_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1126,6 +1194,10 @@ pub struct RoutinePatchRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_targets: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_approval: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_integrations_allowed: Option<bool>,
@@ -1153,6 +1225,83 @@ pub struct RoutineRunNowResponse {
     pub fired_at_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineRunStatus {
+    Queued,
+    PendingApproval,
+    Running,
+    Paused,
+    BlockedPolicy,
+    Denied,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutineRunArtifact {
+    pub artifact_id: String,
+    pub uri: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub created_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutineRunRecord {
+    pub run_id: String,
+    pub routine_id: String,
+    pub trigger_type: String,
+    pub run_count: u32,
+    pub status: RoutineRunStatus,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fired_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
+    pub requires_approval: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub entrypoint: String,
+    #[serde(default)]
+    pub args: serde_json::Value,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub output_targets: Vec<String>,
+    #[serde(default)]
+    pub artifacts: Vec<RoutineRunArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RoutineRunDecisionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutineRunArtifactAddRequest {
+    pub uri: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RoutineListResponse {
     routines: Vec<RoutineSpec>,
@@ -1171,6 +1320,572 @@ struct RoutineDeleteResponse {
 #[derive(Debug, Deserialize)]
 struct RoutineHistoryResponse {
     events: Vec<RoutineHistoryEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutineRunsResponse {
+    runs: Vec<RoutineRunRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutineRunResponse {
+    run: RoutineRunRecord,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutineRunArtifactsResponse {
+    artifacts: Vec<RoutineRunArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AutomationMission {
+    objective: String,
+    #[serde(default)]
+    success_criteria: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    briefing: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entrypoint_compat: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AutomationToolPolicy {
+    #[serde(default)]
+    run_allowlist: Vec<String>,
+    #[serde(default)]
+    external_integrations_allowed: bool,
+    #[serde(default)]
+    orchestrator_only_tool_calls: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AutomationApprovalPolicy {
+    #[serde(default)]
+    requires_approval: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AutomationPolicy {
+    #[serde(default)]
+    tool: AutomationToolPolicy,
+    #[serde(default)]
+    approval: AutomationApprovalPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AutomationSpec {
+    automation_id: String,
+    name: String,
+    status: RoutineStatus,
+    schedule: RoutineSchedule,
+    timezone: String,
+    misfire_policy: RoutineMisfirePolicy,
+    #[serde(default)]
+    mode: String,
+    mission: AutomationMission,
+    #[serde(default)]
+    policy: AutomationPolicy,
+    #[serde(default)]
+    output_targets: Vec<String>,
+    creator_type: String,
+    creator_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_fire_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_fired_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AutomationMissionSnapshot {
+    objective: String,
+    #[serde(default)]
+    success_criteria: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entrypoint_compat: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AutomationPolicySnapshot {
+    #[serde(default)]
+    tool: AutomationToolPolicy,
+    #[serde(default)]
+    approval: AutomationApprovalPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AutomationRunRecord {
+    run_id: String,
+    automation_id: String,
+    trigger_type: String,
+    run_count: u32,
+    status: RoutineRunStatus,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fired_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finished_at_ms: Option<u64>,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    mission_snapshot: AutomationMissionSnapshot,
+    #[serde(default)]
+    policy_snapshot: AutomationPolicySnapshot,
+    #[serde(default)]
+    requires_approval: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approval_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    denial_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paused_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(default)]
+    output_targets: Vec<String>,
+    #[serde(default)]
+    artifacts: Vec<RoutineRunArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutomationListResponse {
+    automations: Vec<AutomationSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutomationRecordResponse {
+    automation: AutomationSpec,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutomationRunsResponse {
+    runs: Vec<AutomationRunRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutomationRunResponse {
+    run: AutomationRunRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextRunStatus {
+    Queued,
+    Planning,
+    Running,
+    AwaitingApproval,
+    Paused,
+    Blocked,
+    Failed,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextStepStatus {
+    #[default]
+    Pending,
+    Runnable,
+    InProgress,
+    Blocked,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextWorkspaceLease {
+    #[serde(default)]
+    pub workspace_id: String,
+    #[serde(default)]
+    pub canonical_path: String,
+    #[serde(default)]
+    pub lease_epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextRunStep {
+    pub step_id: String,
+    pub title: String,
+    pub status: ContextStepStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextRunState {
+    pub run_id: String,
+    pub run_type: String,
+    pub status: ContextRunStatus,
+    pub objective: String,
+    pub workspace: ContextWorkspaceLease,
+    #[serde(default)]
+    pub steps: Vec<ContextRunStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why_next_step: Option<String>,
+    pub revision: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextRunCreateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<ContextWorkspaceLease>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextRunEventRecord {
+    pub event_id: String,
+    pub run_id: String,
+    pub seq: u64,
+    pub ts_ms: u64,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub status: ContextRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextRunEventAppendRequest {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub status: ContextRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextBlackboardItem {
+    pub id: String,
+    pub ts_ms: u64,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextBlackboardArtifact {
+    pub id: String,
+    pub ts_ms: u64,
+    pub path: String,
+    pub artifact_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextBlackboardSummaries {
+    #[serde(default)]
+    pub rolling: String,
+    #[serde(default)]
+    pub latest_context_pack: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextBlackboardState {
+    #[serde(default)]
+    pub facts: Vec<ContextBlackboardItem>,
+    #[serde(default)]
+    pub decisions: Vec<ContextBlackboardItem>,
+    #[serde(default)]
+    pub open_questions: Vec<ContextBlackboardItem>,
+    #[serde(default)]
+    pub artifacts: Vec<ContextBlackboardArtifact>,
+    #[serde(default)]
+    pub summaries: ContextBlackboardSummaries,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextRunRecordResponse {
+    run: ContextRunState,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextRunListResponse {
+    runs: Vec<ContextRunState>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextRunEventsResponse {
+    events: Vec<ContextRunEventRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextBlackboardResponse {
+    blackboard: ContextBlackboardState,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextCheckpointResponse {
+    #[serde(default)]
+    checkpoint: Option<ContextCheckpointRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextCheckpointRecord {
+    pub checkpoint_id: String,
+    pub run_id: String,
+    pub seq: u64,
+    pub ts_ms: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextReplayDrift {
+    #[serde(default)]
+    pub mismatch: bool,
+    #[serde(default)]
+    pub status_mismatch: bool,
+    #[serde(default)]
+    pub why_next_step_mismatch: bool,
+    #[serde(default)]
+    pub step_count_mismatch: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextReplayResponse {
+    pub ok: bool,
+    pub run_id: String,
+    #[serde(default)]
+    pub from_checkpoint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_seq: Option<u64>,
+    #[serde(default)]
+    pub events_applied: usize,
+    pub drift: ContextReplayDrift,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutomationRunNowResponse {
+    ok: bool,
+    status: String,
+    run: AutomationRunRecord,
+}
+
+fn routine_request_to_automation_create(request: RoutineCreateRequest) -> serde_json::Value {
+    let mission_objective = request
+        .args
+        .as_ref()
+        .and_then(|args| args.get("prompt"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("Execute scheduled automation.")
+        .to_string();
+    let mission_success = request
+        .args
+        .as_ref()
+        .and_then(|args| args.get("success_criteria"))
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_str())
+                .map(str::trim)
+                .filter(|row| !row.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mode = request
+        .args
+        .as_ref()
+        .and_then(|args| args.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("standalone");
+    let orchestrator_only_tool_calls = request
+        .args
+        .as_ref()
+        .and_then(|args| args.get("orchestrator_only_tool_calls"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    serde_json::json!({
+        "automation_id": request.routine_id,
+        "name": request.name,
+        "schedule": request.schedule,
+        "timezone": request.timezone,
+        "misfire_policy": request.misfire_policy,
+        "mode": mode,
+        "mission": {
+            "objective": mission_objective,
+            "success_criteria": mission_success,
+            "briefing": request
+                .args
+                .as_ref()
+                .and_then(|args| args.get("briefing"))
+                .cloned(),
+            "entrypoint_compat": request.entrypoint,
+        },
+        "policy": {
+            "tool": {
+                "run_allowlist": request.allowed_tools.unwrap_or_default(),
+                "external_integrations_allowed": request.external_integrations_allowed.unwrap_or(false),
+                "orchestrator_only_tool_calls": orchestrator_only_tool_calls,
+            },
+            "approval": {
+                "requires_approval": request.requires_approval.unwrap_or(true),
+            }
+        },
+        "output_targets": request.output_targets.unwrap_or_default(),
+        "creator_type": request.creator_type,
+        "creator_id": request.creator_id,
+        "next_fire_at_ms": request.next_fire_at_ms,
+    })
+}
+
+fn routine_patch_to_automation_patch(request: RoutinePatchRequest) -> serde_json::Value {
+    let mission = if request.args.is_some() || request.entrypoint.is_some() {
+        Some(serde_json::json!({
+            "objective": request
+                .args
+                .as_ref()
+                .and_then(|args| args.get("prompt"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            "success_criteria": request
+                .args
+                .as_ref()
+                .and_then(|args| args.get("success_criteria"))
+                .cloned(),
+            "briefing": request
+                .args
+                .as_ref()
+                .and_then(|args| args.get("briefing"))
+                .cloned(),
+            "entrypoint_compat": request.entrypoint,
+        }))
+    } else {
+        None
+    };
+    serde_json::json!({
+        "name": request.name,
+        "status": request.status,
+        "schedule": request.schedule,
+        "timezone": request.timezone,
+        "misfire_policy": request.misfire_policy,
+        "mode": request
+            .args
+            .as_ref()
+            .and_then(|args| args.get("mode"))
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        "mission": mission,
+        "policy": {
+            "tool": {
+                "run_allowlist": request.allowed_tools,
+                "external_integrations_allowed": request.external_integrations_allowed,
+                "orchestrator_only_tool_calls": request
+                    .args
+                    .as_ref()
+                    .and_then(|args| args.get("orchestrator_only_tool_calls"))
+                    .and_then(|v| v.as_bool()),
+            },
+            "approval": {
+                "requires_approval": request.requires_approval,
+            }
+        },
+        "output_targets": request.output_targets,
+        "next_fire_at_ms": request.next_fire_at_ms,
+    })
+}
+
+fn automation_to_routine(spec: AutomationSpec) -> RoutineSpec {
+    let mut args_obj = serde_json::Map::new();
+    args_obj.insert(
+        "prompt".to_string(),
+        serde_json::Value::String(spec.mission.objective),
+    );
+    args_obj.insert(
+        "success_criteria".to_string(),
+        serde_json::json!(spec.mission.success_criteria),
+    );
+    args_obj.insert("mode".to_string(), serde_json::Value::String(spec.mode));
+    if let Some(briefing) = spec.mission.briefing {
+        args_obj.insert("briefing".to_string(), serde_json::Value::String(briefing));
+    }
+    args_obj.insert(
+        "orchestrator_only_tool_calls".to_string(),
+        serde_json::Value::Bool(spec.policy.tool.orchestrator_only_tool_calls),
+    );
+    RoutineSpec {
+        routine_id: spec.automation_id,
+        name: spec.name,
+        status: spec.status,
+        schedule: spec.schedule,
+        timezone: spec.timezone,
+        misfire_policy: spec.misfire_policy,
+        entrypoint: spec
+            .mission
+            .entrypoint_compat
+            .unwrap_or_else(|| "mission.default".to_string()),
+        args: serde_json::Value::Object(args_obj),
+        allowed_tools: spec.policy.tool.run_allowlist,
+        output_targets: spec.output_targets,
+        creator_type: spec.creator_type,
+        creator_id: spec.creator_id,
+        requires_approval: spec.policy.approval.requires_approval,
+        external_integrations_allowed: spec.policy.tool.external_integrations_allowed,
+        next_fire_at_ms: spec.next_fire_at_ms,
+        last_fired_at_ms: spec.last_fired_at_ms,
+    }
+}
+
+fn automation_run_to_routine_run(run: AutomationRunRecord) -> RoutineRunRecord {
+    let mut args_obj = serde_json::Map::new();
+    args_obj.insert(
+        "prompt".to_string(),
+        serde_json::Value::String(run.mission_snapshot.objective),
+    );
+    args_obj.insert(
+        "success_criteria".to_string(),
+        serde_json::json!(run.mission_snapshot.success_criteria),
+    );
+    args_obj.insert("mode".to_string(), serde_json::Value::String(run.mode));
+    args_obj.insert(
+        "orchestrator_only_tool_calls".to_string(),
+        serde_json::Value::Bool(run.policy_snapshot.tool.orchestrator_only_tool_calls),
+    );
+    RoutineRunRecord {
+        run_id: run.run_id,
+        routine_id: run.automation_id,
+        trigger_type: run.trigger_type,
+        run_count: run.run_count,
+        status: run.status,
+        created_at_ms: run.created_at_ms,
+        updated_at_ms: run.updated_at_ms,
+        fired_at_ms: run.fired_at_ms,
+        started_at_ms: run.started_at_ms,
+        finished_at_ms: run.finished_at_ms,
+        requires_approval: run.policy_snapshot.approval.requires_approval || run.requires_approval,
+        approval_reason: run.approval_reason,
+        denial_reason: run.denial_reason,
+        paused_reason: run.paused_reason,
+        detail: run.detail,
+        entrypoint: run
+            .mission_snapshot
+            .entrypoint_compat
+            .unwrap_or_else(|| "mission.default".to_string()),
+        args: serde_json::Value::Object(args_obj),
+        allowed_tools: run.policy_snapshot.tool.run_allowlist,
+        output_targets: run.output_targets,
+        artifacts: run.artifacts,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2928,6 +3643,9 @@ impl SidecarManager {
 
         const ENGINE_STARTUP_RETRIES: usize = 10;
         const ENGINE_STARTUP_RETRY_MS: u64 = 450;
+        const RUN_CONFLICT_RETRIES: usize = 20;
+        const MAX_PROMPT_ASYNC_RETRIES: usize = RUN_CONFLICT_RETRIES;
+        const RUN_CONFLICT_STALE_THRESHOLD: usize = 6;
 
         let is_engine_starting = |text: &str| {
             text.contains("ENGINE_STARTING")
@@ -2938,7 +3656,7 @@ impl SidecarManager {
         // Phase 1: append message. Retry transient startup failures before surfacing error.
         let mut append_ok = false;
         let mut last_append_error = String::new();
-        for attempt in 0..=ENGINE_STARTUP_RETRIES {
+        for attempt in 0..=MAX_PROMPT_ASYNC_RETRIES {
             let mut append_builder = self.http_client.post(&append_url);
             if let Some(cid) = correlation_id {
                 append_builder = append_builder
@@ -3008,7 +3726,9 @@ impl SidecarManager {
 
         // Phase 2: start run. Retry ENGINE_STARTING responses; do not append again.
         let mut last_send_error: Option<String> = None;
-        for attempt in 0..=ENGINE_STARTUP_RETRIES {
+        let mut run_conflict_streak: usize = 0;
+        let mut run_conflict_active_run: Option<String> = None;
+        for attempt in 0..=MAX_PROMPT_ASYNC_RETRIES {
             let mut request_builder = self.http_client.post(&url);
             if let Some(cid) = correlation_id {
                 request_builder = request_builder
@@ -3057,6 +3777,93 @@ impl SidecarManager {
                             ENGINE_STARTUP_RETRY_MS
                         );
                         tokio::time::sleep(Duration::from_millis(ENGINE_STARTUP_RETRY_MS)).await;
+                        last_send_error = Some(err);
+                        continue;
+                    }
+                    if err.starts_with("run_conflict") && attempt < RUN_CONFLICT_RETRIES {
+                        let retry_after_ms = parse_run_conflict_retry_after_ms(&err)
+                            .unwrap_or(ENGINE_STARTUP_RETRY_MS);
+                        let active_run_id = parse_run_conflict_active_run_id(&err);
+                        if active_run_id.is_some() && active_run_id == run_conflict_active_run {
+                            run_conflict_streak = run_conflict_streak.saturating_add(1);
+                        } else {
+                            run_conflict_streak = 1;
+                            run_conflict_active_run = active_run_id.clone();
+                        }
+                        tracing::warn!(
+                            "prompt_async run conflict for session {} (attempt {}/{}). Waiting {}ms then retrying. streak={} {}",
+                            session_id,
+                            attempt + 1,
+                            RUN_CONFLICT_RETRIES + 1,
+                            retry_after_ms,
+                            run_conflict_streak,
+                            err
+                        );
+                        if run_conflict_streak >= RUN_CONFLICT_STALE_THRESHOLD {
+                            if let Some(active) = active_run_id.as_deref() {
+                                match self.get_active_run(session_id).await {
+                                    Ok(Some(run_status)) if run_status.run_id == active => {
+                                        tracing::warn!(
+                                            "run_conflict streak indicates stale active run session={} run_id={}; attempting cancel-by-id",
+                                            session_id,
+                                            active
+                                        );
+                                        match self.cancel_run_by_id(session_id, active).await {
+                                            Ok(true) => {
+                                                tracing::warn!(
+                                                    "cancelled stale active run session={} run_id={}, retrying prompt_async",
+                                                    session_id,
+                                                    active
+                                                );
+                                                run_conflict_streak = 0;
+                                                run_conflict_active_run = None;
+                                                tokio::time::sleep(Duration::from_millis(250))
+                                                    .await;
+                                                continue;
+                                            }
+                                            Ok(false) => {
+                                                tracing::warn!(
+                                                    "cancel stale run returned cancelled=false session={} run_id={}",
+                                                    session_id,
+                                                    active
+                                                );
+                                            }
+                                            Err(cancel_err) => {
+                                                tracing::warn!(
+                                                    "failed to cancel stale run session={} run_id={}: {}",
+                                                    session_id,
+                                                    active,
+                                                    cancel_err
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Ok(Some(run_status)) => {
+                                        tracing::debug!(
+                                            "run_conflict active run changed from {} to {}, keeping retry loop",
+                                            active,
+                                            run_status.run_id
+                                        );
+                                        run_conflict_streak = 1;
+                                        run_conflict_active_run = Some(run_status.run_id);
+                                    }
+                                    Ok(None) => {
+                                        tracing::debug!(
+                                            "run_conflict probe found no active run for session {}, keeping retry loop",
+                                            session_id
+                                        );
+                                    }
+                                    Err(probe_err) => {
+                                        tracing::warn!(
+                                            "run_conflict probe failed for session {}: {}",
+                                            session_id,
+                                            probe_err
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(retry_after_ms)).await;
                         last_send_error = Some(err);
                         continue;
                     }
@@ -3404,34 +4211,209 @@ impl SidecarManager {
     }
 
     // ========================================================================
-    // Routines
+    // MCP
     // ========================================================================
 
-    pub async fn routines_create(&self, request: RoutineCreateRequest) -> Result<RoutineSpec> {
+    pub async fn mcp_list_servers(&self) -> Result<Vec<McpServerRecord>> {
         self.check_circuit_breaker().await?;
-        let url = format!("{}/routines", self.base_url().await?);
+        let url = format!("{}/mcp", self.base_url().await?);
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to list MCP servers: {}", e)))?;
+        let payload: HashMap<String, McpServerRecord> = self.handle_response(response).await?;
+        let mut rows = payload.into_values().collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(rows)
+    }
+
+    pub async fn mcp_add_server(&self, request: McpAddRequest) -> Result<McpActionResponse> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/mcp", self.base_url().await?);
         let response = self
             .http_client
             .post(&url)
             .json(&request)
             .send()
             .await
-            .map_err(|e| TandemError::Sidecar(format!("Failed to create routine: {}", e)))?;
-        let payload: RoutineRecordResponse = self.handle_response(response).await?;
-        Ok(payload.routine)
+            .map_err(|e| TandemError::Sidecar(format!("Failed to upsert MCP server: {}", e)))?;
+        self.handle_response(response).await
     }
 
-    pub async fn routines_list(&self) -> Result<Vec<RoutineSpec>> {
+    pub async fn mcp_set_enabled(&self, name: &str, enabled: bool) -> Result<McpActionResponse> {
         self.check_circuit_breaker().await?;
-        let url = format!("{}/routines", self.base_url().await?);
+        let url = format!("{}/mcp/{}", self.base_url().await?, name);
+        let response = self
+            .http_client
+            .patch(&url)
+            .json(&serde_json::json!({ "enabled": enabled }))
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to toggle MCP server: {}", e)))?;
+        self.handle_response(response).await
+    }
+
+    pub async fn mcp_connect(&self, name: &str) -> Result<McpActionResponse> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/mcp/{}/connect", self.base_url().await?, name);
+        let response =
+            self.http_client.post(&url).send().await.map_err(|e| {
+                TandemError::Sidecar(format!("Failed to connect MCP server: {}", e))
+            })?;
+        self.handle_response(response).await
+    }
+
+    pub async fn mcp_disconnect(&self, name: &str) -> Result<McpActionResponse> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/mcp/{}/disconnect", self.base_url().await?, name);
+        let response =
+            self.http_client.post(&url).send().await.map_err(|e| {
+                TandemError::Sidecar(format!("Failed to disconnect MCP server: {}", e))
+            })?;
+        self.handle_response(response).await
+    }
+
+    pub async fn mcp_refresh(&self, name: &str) -> Result<McpActionResponse> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/mcp/{}/refresh", self.base_url().await?, name);
+        let response = self
+            .http_client
+            .post(&url)
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to refresh MCP tools: {}", e)))?;
+        self.handle_response(response).await
+    }
+
+    pub async fn mcp_list_tools(&self) -> Result<Vec<McpRemoteTool>> {
+        self.check_circuit_breaker().await?;
+        let base = self.base_url().await?;
+        let url = format!("{}/mcp/tools", base);
         let response = self
             .http_client
             .get(&url)
             .send()
             .await
-            .map_err(|e| TandemError::Sidecar(format!("Failed to list routines: {}", e)))?;
-        let payload: RoutineListResponse = self.handle_response(response).await?;
-        Ok(payload.routines)
+            .map_err(|e| TandemError::Sidecar(format!("Failed to list MCP tools: {}", e)))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            tracing::warn!(
+                "MCP tools endpoint unavailable (404) at {}. Falling back to /mcp tool_cache.",
+                url
+            );
+            let fallback_url = format!("{}/mcp", base);
+            let fallback = self
+                .http_client
+                .get(&fallback_url)
+                .send()
+                .await
+                .map_err(|e| {
+                    TandemError::Sidecar(format!(
+                        "Failed to list MCP servers for tools fallback: {}",
+                        e
+                    ))
+                })?;
+            let payload: HashMap<String, McpServerRecord> = self.handle_response(fallback).await?;
+            let mut servers = payload.into_values().collect::<Vec<_>>();
+            servers.sort_by(|a, b| a.name.cmp(&b.name));
+            let mut out = Vec::new();
+            for server in servers {
+                let server_slug = mcp_slug_segment(&server.name);
+                let mut tools = server.tool_cache.clone();
+                tools.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
+                for tool in tools {
+                    let tool_slug = mcp_slug_segment(&tool.tool_name);
+                    out.push(McpRemoteTool {
+                        server_name: server.name.clone(),
+                        tool_name: tool.tool_name,
+                        namespaced_name: format!("mcp.{server_slug}.{tool_slug}"),
+                        description: tool.description,
+                        input_schema: tool.input_schema,
+                        fetched_at_ms: tool.fetched_at_ms,
+                        schema_hash: tool.schema_hash,
+                    });
+                }
+            }
+            return Ok(out);
+        }
+        self.handle_response(response).await
+    }
+
+    pub async fn tool_ids(&self) -> Result<Vec<String>> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/tool/ids", self.base_url().await?);
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to list tool ids: {}", e)))?;
+        self.handle_response(response).await
+    }
+
+    // ========================================================================
+    // Routines
+    // ========================================================================
+
+    pub async fn routines_create(&self, request: RoutineCreateRequest) -> Result<RoutineSpec> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/automations", self.base_url().await?);
+        let legacy_request = request.clone();
+        let body = routine_request_to_automation_create(request);
+        let mut response = self
+            .http_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to create automation: {}", e)))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            let legacy_url = format!("{}/routines", self.base_url().await?);
+            response = self
+                .http_client
+                .post(&legacy_url)
+                .json(&legacy_request)
+                .send()
+                .await
+                .map_err(|e| {
+                    TandemError::Sidecar(format!("Failed to create legacy routine: {}", e))
+                })?;
+            let payload: RoutineRecordResponse = self.handle_response(response).await?;
+            return Ok(payload.routine);
+        }
+        let payload: AutomationRecordResponse = self.handle_response(response).await?;
+        Ok(automation_to_routine(payload.automation))
+    }
+
+    pub async fn routines_list(&self) -> Result<Vec<RoutineSpec>> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/automations", self.base_url().await?);
+        let mut response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to list automations: {}", e)))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            let legacy_url = format!("{}/routines", self.base_url().await?);
+            response = self
+                .http_client
+                .get(&legacy_url)
+                .send()
+                .await
+                .map_err(|e| {
+                    TandemError::Sidecar(format!("Failed to list legacy routines: {}", e))
+                })?;
+            let payload: RoutineListResponse = self.handle_response(response).await?;
+            return Ok(payload.routines);
+        }
+        let payload: AutomationListResponse = self.handle_response(response).await?;
+        Ok(payload
+            .automations
+            .into_iter()
+            .map(automation_to_routine)
+            .collect::<Vec<_>>())
     }
 
     pub async fn routines_patch(
@@ -3440,29 +4422,34 @@ impl SidecarManager {
         request: RoutinePatchRequest,
     ) -> Result<RoutineSpec> {
         self.check_circuit_breaker().await?;
-        let url = format!("{}/routines/{}", self.base_url().await?, routine_id);
+        let url = format!("{}/automations/{}", self.base_url().await?, routine_id);
+        let body = routine_patch_to_automation_patch(request);
         let response = self
             .http_client
             .patch(&url)
-            .json(&request)
+            .json(&body)
             .send()
             .await
-            .map_err(|e| TandemError::Sidecar(format!("Failed to patch routine: {}", e)))?;
-        let payload: RoutineRecordResponse = self.handle_response(response).await?;
-        Ok(payload.routine)
+            .map_err(|e| TandemError::Sidecar(format!("Failed to patch automation: {}", e)))?;
+        let payload: AutomationRecordResponse = self.handle_response(response).await?;
+        Ok(automation_to_routine(payload.automation))
     }
 
     pub async fn routines_delete(&self, routine_id: &str) -> Result<bool> {
         self.check_circuit_breaker().await?;
-        let url = format!("{}/routines/{}", self.base_url().await?, routine_id);
+        let url = format!("{}/automations/{}", self.base_url().await?, routine_id);
         let response = self
             .http_client
             .delete(&url)
             .send()
             .await
-            .map_err(|e| TandemError::Sidecar(format!("Failed to delete routine: {}", e)))?;
-        let payload: RoutineDeleteResponse = self.handle_response(response).await?;
-        Ok(payload.deleted)
+            .map_err(|e| TandemError::Sidecar(format!("Failed to delete automation: {}", e)))?;
+        let payload: serde_json::Value = self.handle_response(response).await?;
+        Ok(payload
+            .get("ok")
+            .and_then(|v| v.as_bool())
+            .or_else(|| payload.get("deleted").and_then(|v| v.as_bool()))
+            .unwrap_or(false))
     }
 
     pub async fn routines_run_now(
@@ -3471,15 +4458,26 @@ impl SidecarManager {
         request: RoutineRunNowRequest,
     ) -> Result<RoutineRunNowResponse> {
         self.check_circuit_breaker().await?;
-        let url = format!("{}/routines/{}/run_now", self.base_url().await?, routine_id);
+        let url = format!(
+            "{}/automations/{}/run_now",
+            self.base_url().await?,
+            routine_id
+        );
         let response = self
             .http_client
             .post(&url)
             .json(&request)
             .send()
             .await
-            .map_err(|e| TandemError::Sidecar(format!("Failed to trigger routine: {}", e)))?;
-        self.handle_response(response).await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to trigger automation: {}", e)))?;
+        let payload: AutomationRunNowResponse = self.handle_response(response).await?;
+        Ok(RoutineRunNowResponse {
+            ok: payload.ok,
+            status: payload.status,
+            routine_id: payload.run.automation_id,
+            run_count: payload.run.run_count,
+            fired_at_ms: payload.run.fired_at_ms,
+        })
     }
 
     pub async fn routines_history(
@@ -3488,7 +4486,11 @@ impl SidecarManager {
         limit: Option<usize>,
     ) -> Result<Vec<RoutineHistoryEvent>> {
         self.check_circuit_breaker().await?;
-        let url = format!("{}/routines/{}/history", self.base_url().await?, routine_id);
+        let url = format!(
+            "{}/automations/{}/history",
+            self.base_url().await?,
+            routine_id
+        );
         let mut request = self.http_client.get(&url);
         if let Some(limit) = limit {
             request = request.query(&[("limit", limit)]);
@@ -3499,6 +4501,349 @@ impl SidecarManager {
             .map_err(|e| TandemError::Sidecar(format!("Failed to load routine history: {}", e)))?;
         let payload: RoutineHistoryResponse = self.handle_response(response).await?;
         Ok(payload.events)
+    }
+
+    pub async fn routines_runs(
+        &self,
+        routine_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<RoutineRunRecord>> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/automations/{}/runs", self.base_url().await?, routine_id);
+        let mut request = self.http_client.get(&url);
+        if let Some(limit) = limit {
+            request = request.query(&[("limit", limit)]);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to load automation runs: {}", e)))?;
+        let payload: AutomationRunsResponse = self.handle_response(response).await?;
+        Ok(payload
+            .runs
+            .into_iter()
+            .map(automation_run_to_routine_run)
+            .collect::<Vec<_>>())
+    }
+
+    pub async fn routines_runs_all(
+        &self,
+        routine_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<RoutineRunRecord>> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/automations/runs", self.base_url().await?);
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(id) = routine_id {
+            query.push(("routine_id", id.to_string()));
+        }
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        let mut response = self
+            .http_client
+            .get(&url)
+            .query(&query)
+            .send()
+            .await
+            .map_err(|e| {
+                TandemError::Sidecar(format!("Failed to load all automation runs: {}", e))
+            })?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            let legacy_url = format!("{}/routines/runs", self.base_url().await?);
+            response = self
+                .http_client
+                .get(&legacy_url)
+                .query(&query)
+                .send()
+                .await
+                .map_err(|e| {
+                    TandemError::Sidecar(format!("Failed to load all legacy routine runs: {}", e))
+                })?;
+            let payload: RoutineRunsResponse = self.handle_response(response).await?;
+            return Ok(payload.runs);
+        }
+        let payload: AutomationRunsResponse = self.handle_response(response).await?;
+        Ok(payload
+            .runs
+            .into_iter()
+            .map(automation_run_to_routine_run)
+            .collect::<Vec<_>>())
+    }
+
+    pub async fn routines_run_get(&self, run_id: &str) -> Result<RoutineRunRecord> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/automations/runs/{}", self.base_url().await?, run_id);
+        let response =
+            self.http_client.get(&url).send().await.map_err(|e| {
+                TandemError::Sidecar(format!("Failed to load automation run: {}", e))
+            })?;
+        let payload: AutomationRunResponse = self.handle_response(response).await?;
+        Ok(automation_run_to_routine_run(payload.run))
+    }
+
+    async fn routine_run_decision(
+        &self,
+        run_id: &str,
+        action: &str,
+        request: RoutineRunDecisionRequest,
+    ) -> Result<RoutineRunRecord> {
+        self.check_circuit_breaker().await?;
+        let url = format!(
+            "{}/automations/runs/{}/{}",
+            self.base_url().await?,
+            run_id,
+            action
+        );
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                TandemError::Sidecar(format!(
+                    "Failed automation run {} action for {}: {}",
+                    action, run_id, e
+                ))
+            })?;
+        let payload: AutomationRunResponse = self.handle_response(response).await?;
+        Ok(automation_run_to_routine_run(payload.run))
+    }
+
+    pub async fn routines_run_approve(
+        &self,
+        run_id: &str,
+        request: RoutineRunDecisionRequest,
+    ) -> Result<RoutineRunRecord> {
+        self.routine_run_decision(run_id, "approve", request).await
+    }
+
+    pub async fn routines_run_deny(
+        &self,
+        run_id: &str,
+        request: RoutineRunDecisionRequest,
+    ) -> Result<RoutineRunRecord> {
+        self.routine_run_decision(run_id, "deny", request).await
+    }
+
+    pub async fn routines_run_pause(
+        &self,
+        run_id: &str,
+        request: RoutineRunDecisionRequest,
+    ) -> Result<RoutineRunRecord> {
+        self.routine_run_decision(run_id, "pause", request).await
+    }
+
+    pub async fn routines_run_resume(
+        &self,
+        run_id: &str,
+        request: RoutineRunDecisionRequest,
+    ) -> Result<RoutineRunRecord> {
+        self.routine_run_decision(run_id, "resume", request).await
+    }
+
+    pub async fn routines_run_artifacts(&self, run_id: &str) -> Result<Vec<RoutineRunArtifact>> {
+        self.check_circuit_breaker().await?;
+        let url = format!(
+            "{}/automations/runs/{}/artifacts",
+            self.base_url().await?,
+            run_id
+        );
+        let response = self.http_client.get(&url).send().await.map_err(|e| {
+            TandemError::Sidecar(format!("Failed to load routine run artifacts: {}", e))
+        })?;
+        let payload: RoutineRunArtifactsResponse = self.handle_response(response).await?;
+        Ok(payload.artifacts)
+    }
+
+    pub async fn routines_run_add_artifact(
+        &self,
+        run_id: &str,
+        request: RoutineRunArtifactAddRequest,
+    ) -> Result<RoutineRunRecord> {
+        self.check_circuit_breaker().await?;
+        let url = format!(
+            "{}/automations/runs/{}/artifacts",
+            self.base_url().await?,
+            run_id
+        );
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                TandemError::Sidecar(format!("Failed to add routine run artifact: {}", e))
+            })?;
+        let payload: RoutineRunResponse = self.handle_response(response).await?;
+        Ok(payload.run)
+    }
+
+    // ========================================================================
+    // Context Runs (engine source-of-truth)
+    // ========================================================================
+
+    pub async fn context_run_create(
+        &self,
+        request: ContextRunCreateRequest,
+    ) -> Result<ContextRunState> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/context/runs", self.base_url().await?);
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to create context run: {}", e)))?;
+        let payload: ContextRunRecordResponse = self.handle_response(response).await?;
+        Ok(payload.run)
+    }
+
+    pub async fn context_run_list(&self) -> Result<Vec<ContextRunState>> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/context/runs", self.base_url().await?);
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to list context runs: {}", e)))?;
+        let payload: ContextRunListResponse = self.handle_response(response).await?;
+        Ok(payload.runs)
+    }
+
+    pub async fn context_run_get(&self, run_id: &str) -> Result<ContextRunState> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/context/runs/{}", self.base_url().await?, run_id);
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to get context run: {}", e)))?;
+        let payload: ContextRunRecordResponse = self.handle_response(response).await?;
+        Ok(payload.run)
+    }
+
+    pub async fn context_run_put(
+        &self,
+        run_id: &str,
+        run: &ContextRunState,
+    ) -> Result<ContextRunState> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/context/runs/{}", self.base_url().await?, run_id);
+        let response = self
+            .http_client
+            .put(&url)
+            .json(run)
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to update context run: {}", e)))?;
+        let payload: ContextRunRecordResponse = self.handle_response(response).await?;
+        Ok(payload.run)
+    }
+
+    pub async fn context_run_events(
+        &self,
+        run_id: &str,
+        since_seq: Option<u64>,
+        tail: Option<usize>,
+    ) -> Result<Vec<ContextRunEventRecord>> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/context/runs/{}/events", self.base_url().await?, run_id);
+        let mut request = self.http_client.get(&url);
+        if let Some(since) = since_seq {
+            request = request.query(&[("since_seq", since)]);
+        }
+        if let Some(tail_count) = tail {
+            request = request.query(&[("tail", tail_count)]);
+        }
+        let response = request.send().await.map_err(|e| {
+            TandemError::Sidecar(format!("Failed to load context run events: {}", e))
+        })?;
+        let payload: ContextRunEventsResponse = self.handle_response(response).await?;
+        Ok(payload.events)
+    }
+
+    pub async fn context_run_append_event(
+        &self,
+        run_id: &str,
+        request: ContextRunEventAppendRequest,
+    ) -> Result<ContextRunEventRecord> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/context/runs/{}/events", self.base_url().await?, run_id);
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                TandemError::Sidecar(format!("Failed to append context run event: {}", e))
+            })?;
+        let payload: serde_json::Value = self.handle_response(response).await?;
+        let event_value = payload
+            .get("event")
+            .cloned()
+            .ok_or_else(|| TandemError::ParseError("Missing context event payload".to_string()))?;
+        serde_json::from_value(event_value)
+            .map_err(|e| TandemError::ParseError(format!("Invalid context event payload: {}", e)))
+    }
+
+    pub async fn context_run_blackboard(&self, run_id: &str) -> Result<ContextBlackboardState> {
+        self.check_circuit_breaker().await?;
+        let url = format!(
+            "{}/context/runs/{}/blackboard",
+            self.base_url().await?,
+            run_id
+        );
+        let response = self.http_client.get(&url).send().await.map_err(|e| {
+            TandemError::Sidecar(format!("Failed to load context run blackboard: {}", e))
+        })?;
+        let payload: ContextBlackboardResponse = self.handle_response(response).await?;
+        Ok(payload.blackboard)
+    }
+
+    pub async fn context_run_checkpoint_latest(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<ContextCheckpointRecord>> {
+        self.check_circuit_breaker().await?;
+        let url = format!(
+            "{}/context/runs/{}/checkpoints/latest",
+            self.base_url().await?,
+            run_id
+        );
+        let response = self.http_client.get(&url).send().await.map_err(|e| {
+            TandemError::Sidecar(format!("Failed to load context run checkpoint: {}", e))
+        })?;
+        let payload: ContextCheckpointResponse = self.handle_response(response).await?;
+        Ok(payload.checkpoint)
+    }
+
+    pub async fn context_run_replay(
+        &self,
+        run_id: &str,
+        upto_seq: Option<u64>,
+        from_checkpoint: Option<bool>,
+    ) -> Result<ContextReplayResponse> {
+        self.check_circuit_breaker().await?;
+        let url = format!("{}/context/runs/{}/replay", self.base_url().await?, run_id);
+        let mut request = self.http_client.get(&url);
+        if let Some(seq) = upto_seq {
+            request = request.query(&[("upto_seq", seq)]);
+        }
+        if let Some(flag) = from_checkpoint {
+            request = request.query(&[("from_checkpoint", flag)]);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| TandemError::Sidecar(format!("Failed to replay context run: {}", e)))?;
+        self.handle_response(response).await
     }
 
     // ========================================================================
@@ -4193,7 +5538,8 @@ impl SidecarManager {
             .await
             .map_err(|e| TandemError::Sidecar(format!("Failed to reply to question: {}", e)))?;
 
-        let _ok: bool = self.handle_response(response).await?;
+        let ack: serde_json::Value = self.handle_response(response).await?;
+        parse_question_ack_response(&ack)?;
         Ok(())
     }
 
@@ -4215,7 +5561,8 @@ impl SidecarManager {
             .await
             .map_err(|e| TandemError::Sidecar(format!("Failed to reject question: {}", e)))?;
 
-        let _ok: bool = self.handle_response(response).await?;
+        let ack: serde_json::Value = self.handle_response(response).await?;
+        parse_question_ack_response(&ack)?;
         Ok(())
     }
 
@@ -4346,6 +5693,32 @@ impl SidecarManager {
                 status, body
             )))
         }
+    }
+}
+
+fn mcp_slug_segment(raw: &str) -> String {
+    let mut out = String::new();
+    let mut previous_dot = false;
+    for ch in raw.chars() {
+        let normalized = ch.to_ascii_lowercase();
+        if normalized.is_ascii_alphanumeric() || normalized == '_' || normalized == '-' {
+            out.push(normalized);
+            previous_dot = false;
+        } else if !previous_dot {
+            out.push('.');
+            previous_dot = true;
+        }
+    }
+    while out.starts_with('.') {
+        out.remove(0);
+    }
+    while out.ends_with('.') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "server".to_string()
+    } else {
+        out
     }
 }
 
@@ -4526,11 +5899,7 @@ fn convert_opencode_event(event: OpenCodeEvent) -> Option<StreamEvent> {
 
             let session_id = part.get("sessionID").and_then(|s| s.as_str())?.to_string();
             let message_id = part.get("messageID").and_then(|s| s.as_str())?.to_string();
-            let part_id = part
-                .get("id")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
+            let part_id = extract_tool_or_part_id(props, part);
             let part_type = part.get("type").and_then(|s| s.as_str()).unwrap_or("text");
 
             match part_type {
@@ -4591,11 +5960,11 @@ fn convert_opencode_event(event: OpenCodeEvent) -> Option<StreamEvent> {
                 // Ignore reasoning parts to avoid showing "[REDACTED]" in chat
                 //"reasoning" => None,
                 "tool-invocation" | "tool" => {
-                    let tool = part
+                    let raw_tool = part
                         .get("tool")
                         .and_then(|s| s.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+                        .unwrap_or("unknown");
+                    let tool = normalize_stream_tool_name(raw_tool).to_string();
                     let state_value = part.get("state");
                     let explicit_state = state_value
                         .and_then(|s| s.get("status"))
@@ -4605,6 +5974,7 @@ fn convert_opencode_event(event: OpenCodeEvent) -> Option<StreamEvent> {
                         .and_then(|s| s.get("input"))
                         .cloned()
                         .or_else(|| part.get("args").cloned())
+                        .or_else(|| extract_tool_call_preview_args(props))
                         .unwrap_or(serde_json::Value::Null);
                     let args = match normalize_tool_args(&tool, &raw_args) {
                         Ok(value) => value,
@@ -5081,6 +6451,119 @@ fn parse_prompt_async_response(
     }
 
     Err(format!("status={} body={}", status, body))
+}
+
+fn extract_tool_or_part_id(props: &serde_json::Value, part: &serde_json::Value) -> String {
+    // OpenCode can emit tool lifecycle updates with different IDs across event variants
+    // (e.g. `id=part-43` and `callID=call_abcd` for the same logical call). Prefer
+    // stable tool-call IDs when available so start/end can be matched consistently.
+    if let Some(id) = props
+        .get("toolCallDelta")
+        .and_then(|delta| delta.get("id"))
+        .and_then(|v| v.as_str())
+    {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    for key in ["callID", "toolCallID", "tool_call_id", "id"] {
+        if let Some(id) = part.get(key).and_then(|v| v.as_str()) {
+            let trimmed = id.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn parse_run_conflict_retry_after_ms(message: &str) -> Option<u64> {
+    let key = "retryAfterMs=";
+    let start = message.find(key)? + key.len();
+    let tail = &message[start..];
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<u64>().ok()
+    }
+}
+
+fn parse_run_conflict_active_run_id(message: &str) -> Option<String> {
+    let key = "activeRun=";
+    let start = message.find(key)? + key.len();
+    let tail = &message[start..];
+    let value: String = tail
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if value.is_empty() || value == "-" {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn parse_question_ack_response(value: &serde_json::Value) -> Result<()> {
+    if let Some(ok) = value.as_bool() {
+        if ok {
+            return Ok(());
+        }
+        return Err(TandemError::Sidecar(
+            "Question request was rejected by sidecar".to_string(),
+        ));
+    }
+
+    if let Some(ok) = value.get("ok").and_then(|v| v.as_bool()) {
+        if ok {
+            return Ok(());
+        }
+        return Err(TandemError::Sidecar(
+            "Question request was rejected by sidecar".to_string(),
+        ));
+    }
+
+    Err(TandemError::Sidecar(format!(
+        "Unexpected question ack payload: {}",
+        value
+    )))
+}
+
+fn normalize_stream_tool_name(raw: &str) -> String {
+    let lowered = raw
+        .trim()
+        .to_ascii_lowercase()
+        .replace("<arg_key>", " ")
+        .replace("</arg_key>", " ")
+        .replace("<arg_value>", " ")
+        .replace("</arg_value>", " ");
+
+    let first = lowered.split_whitespace().next().unwrap_or("unknown");
+    let candidate = first
+        .trim()
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
+
+    if candidate.is_empty() {
+        "unknown".to_string()
+    } else {
+        candidate.to_string()
+    }
+}
+
+fn extract_tool_call_preview_args(props: &serde_json::Value) -> Option<serde_json::Value> {
+    let delta = props.get("toolCallDelta")?;
+    if let Some(preview) = delta.get("parsedArgsPreview") {
+        return Some(preview.clone());
+    }
+    let args_delta = delta.get("argsDelta").and_then(|v| v.as_str())?;
+    let trimmed = args_delta.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed).ok()
 }
 
 fn extract_error_message(value: &serde_json::Value) -> Option<String> {
@@ -5700,6 +7183,19 @@ mod tests {
             }
             other => panic!("Unexpected end event: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_normalize_stream_tool_name_strips_arg_wrappers() {
+        let raw = "glob pattern</arg_key><arg_value>**/*.md</arg_value>";
+        assert_eq!(normalize_stream_tool_name(raw), "glob");
+    }
+
+    #[test]
+    fn test_parse_question_ack_response_accepts_object_ok() {
+        let payload = serde_json::json!({ "ok": true });
+        let parsed = parse_question_ack_response(&payload);
+        assert!(parsed.is_ok());
     }
 
     #[test]

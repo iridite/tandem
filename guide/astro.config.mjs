@@ -6,8 +6,28 @@ const [owner, repo] = (process.env.GITHUB_REPOSITORY ?? "frumu-ai/tandem").split
 const isCi = process.env.GITHUB_ACTIONS === "true"
 const explicitSite = process.env.DOCS_SITE_URL
 const explicitBase = process.env.DOCS_BASE_PATH
-const site = explicitSite ?? (isCi ? `https://${owner}.github.io/${repo}/` : "http://localhost:4321")
-const base = explicitBase ?? (isCi && !explicitSite ? `/${repo}/` : "/")
+const normalizeSite = (value) => (value ? (value.endsWith("/") ? value : `${value}/`) : value)
+const normalizeBase = (value) => {
+  if (!value || value === "/") return "/"
+  const withLeading = value.startsWith("/") ? value : `/${value}`
+  return withLeading.endsWith("/") ? withLeading : `${withLeading}/`
+}
+const splitSiteAndBase = (value) => {
+  if (!value) return { site: undefined, base: undefined }
+  try {
+    const parsed = new URL(value)
+    const pathname = normalizeBase(parsed.pathname)
+    return {
+      site: `${parsed.origin}/`,
+      base: pathname === "/" ? undefined : pathname,
+    }
+  } catch {
+    return { site: normalizeSite(value), base: undefined }
+  }
+}
+const explicit = splitSiteAndBase(explicitSite)
+const site = normalizeSite(explicit.site ?? (isCi ? `https://${owner}.github.io/${repo}/` : "http://localhost:4321"))
+const base = normalizeBase(explicitBase ?? explicit.base ?? (isCi && !explicitSite ? `/${repo}/` : "/"))
 
 export default defineConfig({
   site,
@@ -34,6 +54,7 @@ export default defineConfig({
             "installation",
             "usage",
             "headless-service",
+            "webmcp-for-agents",
           ],
         },
         {
@@ -44,6 +65,8 @@ export default defineConfig({
             "agents-and-sessions",
             "desktop/headless-deployment",
             "agent-teams",
+            "mcp-automated-agents",
+            "webmcp-for-agents",
             "design-system",
           ],
         },

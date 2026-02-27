@@ -18,12 +18,14 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::fs;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 fn is_sidecar_session_not_found(err: &TandemError) -> bool {
     matches!(err, TandemError::Sidecar(msg) if msg.contains("404 Not Found"))
@@ -82,6 +84,20 @@ struct WorkspaceChangeSummary {
     diff_text: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct AgentCallOutcome {
+    content: String,
+    used_tools: bool,
+    used_write_tools: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SessionWriteSummary {
+    total_write_calls: usize,
+    successful_write_calls: usize,
+    paths: Vec<String>,
+}
+
 // ============================================================================
 // Orchestrator Engine
 // ============================================================================
@@ -110,6 +126,7 @@ pub struct OrchestratorEngine {
     pause_signal: Arc<RwLock<bool>>,
     /// Event sender for UI updates
     event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
+    event_seq: Arc<AtomicU64>,
     task_semaphore: Arc<Semaphore>,
     llm_semaphore: Arc<Semaphore>,
     task_sessions: Arc<RwLock<HashMap<String, String>>>,
@@ -124,7 +141,200 @@ pub struct OrchestratorEngine {
     >,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryFailureClass {
+    RateLimit,
+    QuotaExceeded,
+    AuthFailed,
+    Timeout,
+    WorkspaceNotFound,
+    InvalidToolArgs,
+    PathNotFound,
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+struct FailurePolicy {
+    class: RetryFailureClass,
+    should_pause: bool,
+    task_message: Option<String>,
+    run_message: Option<String>,
+}
+
 impl OrchestratorEngine {
+    const ROLLING_SUMMARY_MAX_CHARS: usize = 900;
+
+    fn classify_failure(error: &str) -> RetryFailureClass {
+        if Self::is_provider_quota_error(error) {
+            return RetryFailureClass::QuotaExceeded;
+        }
+        if Self::is_rate_limit_error(error) {
+            return RetryFailureClass::RateLimit;
+        }
+        if Self::is_auth_error(error) {
+            return RetryFailureClass::AuthFailed;
+        }
+        if Self::is_transient_timeout_error(error) {
+            return RetryFailureClass::Timeout;
+        }
+        if Self::is_workspace_not_found_error(error) {
+            return RetryFailureClass::WorkspaceNotFound;
+        }
+        if Self::is_invalid_tool_args_error(error) {
+            return RetryFailureClass::InvalidToolArgs;
+        }
+        if Self::is_path_not_found_error(error) {
+            return RetryFailureClass::PathNotFound;
+        }
+        RetryFailureClass::Unknown
+    }
+
+    fn failure_policy(error: &str) -> FailurePolicy {
+        let class = Self::classify_failure(error);
+        match class {
+            RetryFailureClass::QuotaExceeded => FailurePolicy {
+                class,
+                should_pause: true,
+                task_message: Some(
+                    "Provider quota/credits exceeded. Switch model/provider and retry.".to_string(),
+                ),
+                run_message: Some(
+                    "Paused: provider quota/credits exceeded. Switch model/provider and retry."
+                        .to_string(),
+                ),
+            },
+            RetryFailureClass::RateLimit => FailurePolicy {
+                class,
+                should_pause: true,
+                task_message: Some("Provider rate-limited. Switch model/provider and retry.".to_string()),
+                run_message: Some(
+                    "Paused: provider rate-limited. Switch model/provider and retry.".to_string(),
+                ),
+            },
+            RetryFailureClass::AuthFailed => FailurePolicy {
+                class,
+                should_pause: true,
+                task_message: Some(
+                    "Provider authentication failed (401/403). Check API key/provider selection and retry."
+                        .to_string(),
+                ),
+                run_message: Some(
+                    "Paused: provider authentication failed (401/403). Check API key/provider selection and continue."
+                        .to_string(),
+                ),
+            },
+            RetryFailureClass::Timeout => FailurePolicy {
+                class,
+                should_pause: true,
+                task_message: Some(
+                    "Tool timeout detected. Run paused so you can resume and continue."
+                        .to_string(),
+                ),
+                run_message: Some(
+                    "Paused: transient tool timeout detected. Resume run to continue.".to_string(),
+                ),
+            },
+            RetryFailureClass::WorkspaceNotFound => FailurePolicy {
+                class,
+                should_pause: true,
+                task_message: Some(
+                    "Workspace root not found. Verify workspace path and continue.".to_string(),
+                ),
+                run_message: Some(
+                    "Paused: workspace root not found. Verify workspace path and continue."
+                        .to_string(),
+                ),
+            },
+            RetryFailureClass::InvalidToolArgs => FailurePolicy {
+                class,
+                should_pause: true,
+                task_message: Some(
+                    "Invalid tool arguments detected (missing/invalid file path). Run paused so you can resume after guardrails."
+                        .to_string(),
+                ),
+                run_message: Some(
+                    "Paused: invalid tool args (missing file path). Resume to retry with strict path guardrails."
+                        .to_string(),
+                ),
+            },
+            RetryFailureClass::PathNotFound => FailurePolicy {
+                class,
+                should_pause: true,
+                task_message: Some(
+                    "Path not found detected (os error 3). Verify workspace/file paths and continue."
+                        .to_string(),
+                ),
+                run_message: Some(
+                    "Paused: path not found (os error 3). Verify workspace/file paths and continue."
+                        .to_string(),
+                ),
+            },
+            RetryFailureClass::Unknown => FailurePolicy {
+                class,
+                should_pause: false,
+                task_message: None,
+                run_message: None,
+            },
+        }
+    }
+
+    fn failure_class_label(class: RetryFailureClass) -> &'static str {
+        match class {
+            RetryFailureClass::RateLimit => "rate_limit",
+            RetryFailureClass::QuotaExceeded => "quota_exceeded",
+            RetryFailureClass::AuthFailed => "auth_failed",
+            RetryFailureClass::Timeout => "timeout",
+            RetryFailureClass::WorkspaceNotFound => "workspace_not_found",
+            RetryFailureClass::InvalidToolArgs => "invalid_tool_args",
+            RetryFailureClass::PathNotFound => "path_not_found",
+            RetryFailureClass::Unknown => "unknown",
+        }
+    }
+
+    fn pinned_constraints() -> Vec<String> {
+        vec![
+            "Engine state is source-of-truth".to_string(),
+            "Only operate within leased workspace".to_string(),
+            "Respect configured tool/policy constraints".to_string(),
+        ]
+    }
+
+    fn compact_rolling_summary(
+        existing_summary: &str,
+        why_next_step: &str,
+        active_step_id: &str,
+        recent_events: &[RunEventRecord],
+        pinned_constraints: &[String],
+    ) -> String {
+        let pinned_line = format!("Pinned: {}", pinned_constraints.join(" | "));
+        let recent_digest = recent_events
+            .iter()
+            .rev()
+            .take(6)
+            .map(|event| format!("{}:{}:{:?}", event.seq, event.event_type, event.status))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut compact = format!(
+            "{}\nActive step: {}\nWhy next: {}\nRecent: {}\nPrior: {}",
+            pinned_line,
+            active_step_id,
+            why_next_step,
+            if recent_digest.is_empty() {
+                "none".to_string()
+            } else {
+                recent_digest
+            },
+            existing_summary.trim()
+        );
+        if compact.len() > Self::ROLLING_SUMMARY_MAX_CHARS {
+            compact = compact
+                .chars()
+                .take(Self::ROLLING_SUMMARY_MAX_CHARS)
+                .collect();
+        }
+        compact
+    }
+
     fn existing_dir_string(path: &Path) -> Option<String> {
         if path.is_dir() {
             Some(path.to_string_lossy().to_string())
@@ -142,6 +352,77 @@ impl OrchestratorEngine {
         Self::existing_dir_string(&path)
     }
 
+    fn normalized_workspace_string(value: &str) -> Option<String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        tandem_core::normalize_workspace_path(trimmed).or_else(|| Some(trimmed.to_string()))
+    }
+
+    fn session_workspace_string(session: &crate::sidecar::Session) -> Option<String> {
+        session
+            .workspace_root
+            .as_deref()
+            .and_then(Self::normalized_workspace_string)
+            .or_else(|| {
+                session
+                    .directory
+                    .as_deref()
+                    .and_then(Self::normalized_workspace_string)
+            })
+    }
+
+    fn session_matches_workspace(session: &crate::sidecar::Session, workspace_path: &Path) -> bool {
+        let Some(expected_raw) = Self::existing_dir_string(workspace_path) else {
+            return true;
+        };
+        let Some(expected) = Self::normalized_workspace_string(&expected_raw) else {
+            return true;
+        };
+        let Some(actual) = Self::session_workspace_string(session) else {
+            return false;
+        };
+        actual == expected
+    }
+
+    async fn resolve_base_run_session(&self) -> Result<crate::sidecar::Session> {
+        let run_session_id = {
+            let run = self.run.read().await;
+            run.session_id.clone()
+        };
+
+        let mut base_session = match self.sidecar.get_session(&run_session_id).await {
+            Ok(session) => session,
+            Err(e) if is_sidecar_session_not_found(&e) => {
+                tracing::warn!(
+                    "Base orchestrator session {} is missing (404). Recreating base session.",
+                    run_session_id
+                );
+                let new_session_id = self.recreate_base_run_session().await?;
+                self.sidecar.get_session(&new_session_id).await?
+            }
+            Err(e) => return Err(e),
+        };
+
+        if !Self::session_matches_workspace(&base_session, &self.workspace_path) {
+            let expected_workspace = Self::existing_dir_string(&self.workspace_path)
+                .unwrap_or_else(|| self.workspace_path.to_string_lossy().to_string());
+            let actual_workspace =
+                Self::session_workspace_string(&base_session).unwrap_or_else(|| "<unset>".into());
+            tracing::warn!(
+                "Base orchestrator session {} workspace drift detected (expected={}, actual={}). Recreating base session.",
+                base_session.id,
+                expected_workspace,
+                actual_workspace
+            );
+            let new_session_id = self.recreate_base_run_session().await?;
+            base_session = self.sidecar.get_session(&new_session_id).await?;
+        }
+
+        Ok(base_session)
+    }
+
     fn role_tool_allowlist(role: AgentRole) -> Vec<&'static str> {
         match role {
             AgentRole::Orchestrator | AgentRole::Planner | AgentRole::Delegator => vec![
@@ -156,7 +437,8 @@ impl OrchestratorEngine {
                 "todo_write",
                 "update_todo_list",
                 "websearch",
-                "webfetch_document",
+                "webfetch",
+                "webfetch_html",
                 "task",
             ],
             AgentRole::Worker | AgentRole::Builder => vec![
@@ -174,7 +456,8 @@ impl OrchestratorEngine {
                 "todo_write",
                 "update_todo_list",
                 "websearch",
-                "webfetch_document",
+                "webfetch",
+                "webfetch_html",
             ],
             AgentRole::Watcher | AgentRole::Researcher => vec![
                 "ls",
@@ -185,7 +468,8 @@ impl OrchestratorEngine {
                 "codesearch",
                 "read",
                 "websearch",
-                "webfetch_document",
+                "webfetch",
+                "webfetch_html",
             ],
             AgentRole::Reviewer | AgentRole::Validator | AgentRole::Tester => vec![
                 "ls",
@@ -196,7 +480,8 @@ impl OrchestratorEngine {
                 "codesearch",
                 "read",
                 "websearch",
-                "webfetch_document",
+                "webfetch",
+                "webfetch_html",
             ],
         }
     }
@@ -217,7 +502,8 @@ impl OrchestratorEngine {
             "todo_write",
             "update_todo_list",
             "websearch",
-            "webfetch_document",
+            "webfetch",
+            "webfetch_html",
             "bash",
             "task",
             "spawn_agent",
@@ -254,7 +540,8 @@ impl OrchestratorEngine {
             "todo_write",
             "update_todo_list",
             "websearch",
-            "webfetch_document",
+            "webfetch",
+            "webfetch_html",
             "task",
         ] {
             if allow_set.contains(permission) {
@@ -330,6 +617,15 @@ impl OrchestratorEngine {
             || e.contains("timed out")
             || e.contains("timeout")
             || e.contains("stream_idle_timeout")
+            || e.contains("interrupted")
+            || e.contains("cancelled")
+            || e.contains("canceled")
+            || e.contains("aborted")
+            || e.contains("internal server error")
+            || e.contains("provider_server_error")
+            || e.contains("provider_request_failed")
+            || e.contains("provider stream chunk error")
+            || e.contains("json error injected into sse stream")
     }
 
     fn is_workspace_not_found_error(error: &str) -> bool {
@@ -383,14 +679,26 @@ impl OrchestratorEngine {
         event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
     ) -> Self {
         let run_id = run.run_id.clone();
+        let latest_seq = store.latest_run_event_seq(&run_id).unwrap_or(0);
         let mut budget_tracker = BudgetTracker::from_budget(run.budget.clone());
         budget_tracker.set_active(matches!(
             run.status,
-            RunStatus::Planning | RunStatus::Executing
+            RunStatus::Planning | RunStatus::Running
         ));
         let max_parallel_tasks = run.config.max_parallel_tasks.max(1) as usize;
         let llm_parallel = run.config.llm_parallel.max(1) as usize;
         let pause_signal = Arc::new(RwLock::new(matches!(run.status, RunStatus::Paused)));
+
+        let restored_task_sessions = run
+            .tasks
+            .iter()
+            .filter_map(|task| {
+                task.session_id
+                    .as_ref()
+                    .filter(|sid| !sid.trim().is_empty())
+                    .map(|sid| (task.id.clone(), sid.clone()))
+            })
+            .collect::<HashMap<_, _>>();
 
         Self {
             run_id,
@@ -404,9 +712,10 @@ impl OrchestratorEngine {
             cancel_token: Arc::new(StdMutex::new(CancellationToken::new())),
             pause_signal,
             event_tx,
+            event_seq: Arc::new(AtomicU64::new(latest_seq)),
             task_semaphore: Arc::new(Semaphore::new(max_parallel_tasks)),
             llm_semaphore: Arc::new(Semaphore::new(llm_parallel)),
-            task_sessions: Arc::new(RwLock::new(HashMap::new())),
+            task_sessions: Arc::new(RwLock::new(restored_task_sessions)),
             contract_metrics: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(test)]
             test_task_executor: None,
@@ -464,7 +773,7 @@ impl OrchestratorEngine {
             let run = self.run.read().await;
             if run.status != RunStatus::AwaitingApproval
                 && run.status != RunStatus::Paused
-                && run.status != RunStatus::Executing
+                && run.status != RunStatus::Running
             {
                 return Err(TandemError::InvalidOperation(
                     "Run is not awaiting approval, paused, or executing".to_string(),
@@ -480,8 +789,8 @@ impl OrchestratorEngine {
         // Update status to Executing if not already
         {
             let mut run = self.run.write().await;
-            if run.status != RunStatus::Executing {
-                run.status = RunStatus::Executing;
+            if run.status != RunStatus::Running {
+                run.status = RunStatus::Running;
             }
         }
         self.budget_tracker.write().await.set_active(true);
@@ -536,24 +845,43 @@ impl OrchestratorEngine {
             run.objective.clone()
         };
 
-        let prompt =
-            AgentPrompts::build_planner_prompt(&objective, &workspace_summary, &constraints);
+        let session_id = self.resolve_base_run_session().await?.id;
 
-        // Call planner via sidecar
-        let session_id = {
-            let run = self.run.read().await;
-            run.session_id.clone()
-        };
+        let analysis_prompt =
+            AgentPrompts::build_planner_analysis_prompt(&objective, &workspace_summary);
+        let analysis_response = self
+            .call_agent(None, &session_id, &analysis_prompt, AgentRole::Orchestrator)
+            .await?;
+        {
+            let mut tracker = self.budget_tracker.write().await;
+            tracker.record_tokens(
+                None,
+                Some(
+                    analysis_prompt
+                        .len()
+                        .saturating_add(analysis_response.len()),
+                ),
+            );
+        }
+
+        let prompt = AgentPrompts::build_planner_prompt(
+            &objective,
+            &workspace_summary,
+            &constraints,
+            Some(analysis_response.as_str()),
+        );
 
         // Send message and wait for response
         let response = self
             .call_agent(None, &session_id, &prompt, AgentRole::Orchestrator)
             .await?;
 
-        // Record tokens (estimate from response length)
+        // Record tokens (estimate from prompt + response length).
+        // This avoids showing 0 tokens in planning when providers emit sparse/empty content
+        // but still consumed input tokens for the planner prompt.
         {
             let mut tracker = self.budget_tracker.write().await;
-            tracker.record_tokens(None, Some(response.len()));
+            tracker.record_tokens(None, Some(prompt.len().saturating_add(response.len())));
         }
 
         if self.cancel_if_requested().await? {
@@ -798,6 +1126,8 @@ impl OrchestratorEngine {
             let mut scheduled_any = false;
 
             for task_id in runnable_task_ids {
+                self.validate_workspace_lease("pre_dispatch", Some(&task_id))
+                    .await?;
                 self.emit_task_trace(
                     &task_id,
                     None,
@@ -815,20 +1145,35 @@ impl OrchestratorEngine {
                     Some("task_semaphore".to_string()),
                 );
 
-                let task = {
+                let (task, why_next_step) = {
                     let mut run = self.run.write().await;
                     if let Some(idx) = run.tasks.iter().position(|t| t.id == task_id) {
-                        if run.tasks[idx].state != TaskState::Pending {
+                        if run.tasks[idx].state != TaskState::Pending
+                            && run.tasks[idx].state != TaskState::Runnable
+                        {
                             continue;
                         }
+                        let why_next_step = format!(
+                            "Dependencies satisfied; task `{}` selected by scheduler.",
+                            task_id
+                        );
+                        run.why_next_step = Some(why_next_step.clone());
+                        run.tasks[idx].state = TaskState::Runnable;
                         run.tasks[idx].state = TaskState::InProgress;
-                        // Clear stale per-task error once a fresh execution attempt starts.
-                        run.tasks[idx].error_message = None;
-                        run.tasks[idx].clone()
+                        (run.tasks[idx].clone(), why_next_step)
                     } else {
                         continue;
                     }
                 };
+                if let Ok(pack) = self.build_context_pack(&task, &why_next_step).await {
+                    self.emit_event(OrchestratorEvent::ContextPackBuilt {
+                        run_id: self.run_id.clone(),
+                        task_id: task_id.clone(),
+                        why_next_step: why_next_step.clone(),
+                        event_count: pack.recent_events.len(),
+                        timestamp: chrono::Utc::now(),
+                    });
+                }
 
                 let engine = self.clone();
                 join_set.spawn(async move {
@@ -979,6 +1324,8 @@ impl OrchestratorEngine {
         // it forever and budgets will "explode").
         let execution_result: Result<(String, bool, Option<ValidationResult>)> = async {
             let execution_role = self.resolve_task_execution_role(&task).await;
+            self.validate_workspace_lease("pre_tool_call", Some(&task_id))
+                .await?;
             let mut session_id = self
                 .get_or_create_task_session_id(&task, execution_role)
                 .await?;
@@ -1007,7 +1354,48 @@ impl OrchestratorEngine {
                     )),
                 );
             }
-            let prompt = AgentPrompts::build_builder_prompt(&task, &file_context, None);
+            let why_next_step = {
+                let run = self.run.read().await;
+                run.why_next_step
+                    .clone()
+                    .unwrap_or_else(|| format!("Executing task `{}`.", task.id))
+            };
+            let context_pack_summary = self
+                .build_context_pack(&task, &why_next_step)
+                .await
+                .ok()
+                .map(|pack| {
+                    let constraints = if pack.pinned_constraints.is_empty() {
+                        "none".to_string()
+                    } else {
+                        pack.pinned_constraints.join("; ")
+                    };
+                    format!(
+                        "Goal: {}\nActive step: {}\nWhy now: {}\nPinned constraints: {}\nRecent summary: {}",
+                        pack.goal,
+                        pack.active_step_id,
+                        why_next_step,
+                        constraints,
+                        pack.rolling_summary
+                    )
+                });
+            let previous_attempt_context = task
+                .validation_result
+                .as_ref()
+                .map(|v| v.feedback.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .or_else(|| {
+                    task.error_message
+                        .as_ref()
+                        .map(|msg| msg.trim().to_string())
+                        .filter(|msg| !msg.is_empty())
+                });
+            let prompt = AgentPrompts::build_builder_prompt(
+                &task,
+                &file_context,
+                context_pack_summary.as_deref(),
+                previous_attempt_context.as_deref(),
+            );
 
             // Record budget
             {
@@ -1015,20 +1403,28 @@ impl OrchestratorEngine {
                 tracker.record_iteration();
             }
 
-            let mut builder_response = self
+            let mut builder_call = self
                 .call_agent_for_task_with_recovery(&task, &mut session_id, &prompt, execution_role)
                 .await?;
+            let mut builder_response = builder_call.content.clone();
+            let mut builder_used_tools = builder_call.used_tools;
+            let mut builder_used_write_tools = builder_call.used_write_tools;
 
             // Record tokens
             {
                 let mut tracker = self.budget_tracker.write().await;
-                tracker.record_tokens(None, Some(builder_response.len()));
+                tracker.record_tokens(
+                    None,
+                    Some(prompt.len().saturating_add(builder_response.len())),
+                );
             }
 
             // Get per-task workspace changes for validation.
             let mut workspace_changes = self
                 .get_recent_changes_since(&workspace_before)
                 .await?;
+            let mut session_write_summary =
+                self.summarize_session_write_activity(&session_id).await;
             let hinted_changes = self
                 .summarize_target_file_changes(&hinted_before, &hinted_targets)
                 .await?;
@@ -1043,7 +1439,12 @@ impl OrchestratorEngine {
                     workspace_changes.diff_text.push_str(line);
                 }
             }
-            if self.task_requires_workspace_changes(&task) && !workspace_changes.has_changes {
+            // Sidecar/session-history reconciliation can occasionally lag or miss a terminal write
+            // while we still observed write-tool usage in the active builder stream. Treat
+            // builder-observed write usage as fallback evidence when disk changes are present.
+            let mut task_scoped_changes_detected = workspace_changes.has_changes
+                && (session_write_summary.successful_write_calls > 0 || builder_used_write_tools);
+            if self.task_requires_workspace_changes(&task) && !task_scoped_changes_detected {
                 // One targeted recovery pass: force explicit file-tool usage with concrete paths.
                 self.emit_task_trace(
                     &task.id,
@@ -1067,11 +1468,12 @@ You MUST perform concrete file edits now.\n\
                     AgentPrompts::build_builder_prompt(
                         &task,
                         &file_context,
+                        context_pack_summary.as_deref(),
                         Some(builder_response.as_str())
                     ),
                     target_hint
                 );
-                builder_response = self
+                builder_call = self
                     .call_agent_for_task_with_recovery(
                         &task,
                         &mut session_id,
@@ -1079,14 +1481,22 @@ You MUST perform concrete file edits now.\n\
                         execution_role,
                     )
                     .await?;
+                builder_response = builder_call.content.clone();
+                builder_used_tools = builder_used_tools || builder_call.used_tools;
+                builder_used_write_tools =
+                    builder_used_write_tools || builder_call.used_write_tools;
                 {
                     let mut tracker = self.budget_tracker.write().await;
-                    tracker.record_tokens(None, Some(builder_response.len()));
+                    tracker.record_tokens(
+                        None,
+                        Some(recovery_prompt.len().saturating_add(builder_response.len())),
+                    );
                 }
 
                 workspace_changes = self
                     .get_recent_changes_since(&workspace_before)
                     .await?;
+                session_write_summary = self.summarize_session_write_activity(&session_id).await;
                 let hinted_changes = self
                     .summarize_target_file_changes(&hinted_before, &hinted_targets)
                     .await?;
@@ -1101,21 +1511,69 @@ You MUST perform concrete file edits now.\n\
                         workspace_changes.diff_text.push_str(line);
                     }
                 }
+                task_scoped_changes_detected = workspace_changes.has_changes
+                    && (session_write_summary.successful_write_calls > 0
+                        || builder_used_write_tools);
 
-                if !workspace_changes.has_changes {
+                if !task_scoped_changes_detected {
+                    if !builder_used_tools {
+                        self.emit_task_trace(
+                            &task.id,
+                            Some(session_id.as_str()),
+                            "NO_TOOL_CALLS_DETECTED",
+                            Some("builder did not invoke tools after recovery prompt".to_string()),
+                        );
+                        return Err(TandemError::Orchestrator(
+                            "Task requires file changes, but builder invoked no tools. Use read/glob to inspect inputs and write/edit/apply_patch to create or modify files before finishing.".to_string(),
+                        ));
+                    }
+                    if !builder_used_write_tools && session_write_summary.total_write_calls == 0 {
+                        self.emit_task_trace(
+                            &task.id,
+                            Some(session_id.as_str()),
+                            "NO_WRITE_TOOL_CALLS_DETECTED",
+                            Some(format!(
+                                "builder write evidence missing (total_write_calls={}, successful_write_calls={})",
+                                session_write_summary.total_write_calls,
+                                session_write_summary.successful_write_calls
+                            )),
+                        );
+                        return Err(TandemError::Orchestrator(
+                            "Task requires file changes, but builder only invoked read-only tools. Use write/edit/apply_patch with a concrete path to produce the required artifact.".to_string(),
+                        ));
+                    }
                     return Err(TandemError::Orchestrator(format!(
                         "Task requires file changes but none were captured. Use write/edit/apply_patch to update {} before completing.",
                         target_hint
                     )));
                 }
             }
-            let changes_diff = workspace_changes.diff_text;
+            let mut changes_diff = workspace_changes.diff_text.clone();
+            if !session_write_summary.paths.is_empty() {
+                if !changes_diff.is_empty() {
+                    changes_diff.push('\n');
+                }
+                changes_diff.push_str("Task-session successful write targets:");
+                for path in session_write_summary.paths.iter().take(20) {
+                    changes_diff.push('\n');
+                    changes_diff.push_str("+ ");
+                    changes_diff.push_str(path);
+                }
+            }
+            let changed_file_evidence = self
+                .collect_validation_file_evidence(&workspace_changes)
+                .await?;
 
             // Build validator prompt
             let validator_prompt = AgentPrompts::build_validator_prompt(
                 &task,
                 &changes_diff,
                 Some(builder_response.as_str()),
+                if changed_file_evidence.trim().is_empty() {
+                    None
+                } else {
+                    Some(changed_file_evidence.as_str())
+                },
             );
 
             // Call validator
@@ -1126,12 +1584,16 @@ You MUST perform concrete file edits now.\n\
                     &validator_prompt,
                     self.resolve_task_validation_role(&task, execution_role),
                 )
-                .await?;
+                .await?
+                .content;
 
             // Record tokens
             {
                 let mut tracker = self.budget_tracker.write().await;
-                tracker.record_tokens(None, Some(validator_response.len()));
+                tracker.record_tokens(
+                    None,
+                    Some(validator_prompt.len().saturating_add(validator_response.len())),
+                );
             }
 
             let contract_config = {
@@ -1289,21 +1751,9 @@ You MUST perform concrete file edits now.\n\
     }
 
     async fn mark_task_error(&self, task_id: &str, error: &str) -> Result<()> {
-        let rate_limited = Self::is_rate_limit_error(error);
-        let quota_exceeded = Self::is_provider_quota_error(error);
-        let auth_failed = Self::is_auth_error(error);
-        let transient_timeout = Self::is_transient_timeout_error(error);
-        let workspace_not_found = Self::is_workspace_not_found_error(error);
-        let invalid_tool_args = Self::is_invalid_tool_args_error(error);
-        let path_not_found = Self::is_path_not_found_error(error);
+        let policy = Self::failure_policy(error);
         let error_code = Self::extract_error_code(error);
-        let path_or_args_issue = invalid_tool_args || path_not_found;
-        let should_pause = rate_limited
-            || quota_exceeded
-            || auth_failed
-            || transient_timeout
-            || workspace_not_found
-            || path_or_args_issue;
+        let should_pause = policy.should_pause;
 
         let session_id = {
             let mut run = self.run.write().await;
@@ -1319,63 +1769,10 @@ You MUST perform concrete file edits now.\n\
                     // Treat provider capacity/quota failures as a "pause and switch model" event,
                     // not a normal task failure that burns retries.
                     t.state = TaskState::Pending;
-                    if quota_exceeded {
-                        t.error_message = Some(
-                            "Provider quota/credits exceeded. Switch model/provider and retry."
-                                .to_string(),
-                        );
-                    } else if rate_limited {
-                        t.error_message = Some(
-                            "Provider rate-limited. Switch model/provider and retry.".to_string(),
-                        );
-                    } else if auth_failed {
-                        t.error_message = Some(
-                            "Provider authentication failed (401/403). Check API key/provider selection and retry."
-                                .to_string(),
-                        );
-                    } else if workspace_not_found {
-                        t.error_message = Some(
-                            "Workspace root not found. Verify workspace path and continue."
-                                .to_string(),
-                        );
-                    } else if invalid_tool_args {
-                        t.error_message = Some(
-                            "Invalid tool arguments detected (missing/invalid file path). Run paused so you can resume after guardrails."
-                                .to_string(),
-                        );
-                    } else if path_not_found {
-                        t.error_message = Some(
-                            "Path not found detected (os error 3). Verify workspace/file paths and continue."
-                                .to_string(),
-                        );
-                    } else if transient_timeout {
-                        t.error_message = Some(
-                            "Tool timeout detected. Run paused so you can resume and continue."
-                                .to_string(),
-                        );
+                    if let Some(msg) = policy.task_message.clone() {
+                        t.error_message = Some(msg);
                     }
-                    run.error_message = Some(if quota_exceeded {
-                        "Paused: provider quota/credits exceeded. Switch model/provider and retry."
-                            .to_string()
-                    } else if auth_failed {
-                        "Paused: provider authentication failed (401/403). Check API key/provider selection and continue."
-                            .to_string()
-                    } else if workspace_not_found {
-                        "Paused: workspace root not found. Verify workspace path and continue."
-                            .to_string()
-                    } else if invalid_tool_args {
-                        "Paused: invalid tool args (missing file path). Resume to retry with strict path guardrails."
-                            .to_string()
-                    } else if path_not_found {
-                        "Paused: path not found (os error 3). Verify workspace/file paths and continue."
-                            .to_string()
-                    } else if transient_timeout {
-                        "Paused: transient tool timeout detected. Resume run to continue."
-                            .to_string()
-                    } else {
-                        "Paused: provider rate-limited. Switch model/provider and retry."
-                            .to_string()
-                    });
+                    run.error_message = policy.run_message.clone();
                 } else {
                     t.retry_count += 1;
                     if t.retry_count >= max_retries {
@@ -1403,6 +1800,25 @@ You MUST perform concrete file edits now.\n\
             passed: false,
             timestamp: chrono::Utc::now(),
         });
+
+        self.emit_task_trace(
+            task_id,
+            session_id.as_deref(),
+            "RETRY_CLASSIFIED",
+            Some(format!(
+                "class={} action={}{}",
+                Self::failure_class_label(policy.class),
+                if should_pause {
+                    "pause"
+                } else {
+                    "retry_or_fail"
+                },
+                error_code
+                    .as_deref()
+                    .map(|code| format!(" code={}", code))
+                    .unwrap_or_default()
+            )),
+        );
 
         self.emit_task_trace(
             task_id,
@@ -1435,23 +1851,25 @@ You MUST perform concrete file edits now.\n\
             return Ok(existing);
         }
 
-        let (run_session_id, config) = {
+        if let Some(existing) = task
+            .session_id
+            .as_ref()
+            .map(|sid| sid.trim().to_string())
+            .filter(|sid| !sid.is_empty())
+        {
+            self.task_sessions
+                .write()
+                .await
+                .insert(task.id.clone(), existing.clone());
+            return Ok(existing);
+        }
+
+        let config = {
             let run = self.run.read().await;
-            (run.session_id.clone(), run.config.clone())
+            run.config.clone()
         };
 
-        let base_session = match self.sidecar.get_session(&run_session_id).await {
-            Ok(session) => session,
-            Err(e) if is_sidecar_session_not_found(&e) => {
-                tracing::warn!(
-                    "Base orchestrator session {} is missing (404). Recreating base session.",
-                    run_session_id
-                );
-                let new_session_id = self.recreate_base_run_session().await?;
-                self.sidecar.get_session(&new_session_id).await?
-            }
-            Err(e) => return Err(e),
-        };
+        let base_session = self.resolve_base_run_session().await?;
 
         let permission = Some(Self::orchestrator_permission_rules(role));
 
@@ -1476,10 +1894,9 @@ You MUST perform concrete file edits now.\n\
             permission,
             // Pin task sessions to the known engine workspace to avoid drift across projects.
             directory: Some(self.workspace_path.to_string_lossy().to_string()),
-            workspace_root: Self::existing_dir_string_from_opt(
-                base_session.workspace_root.as_deref(),
-            )
-            .or_else(|| Some(self.workspace_path.to_string_lossy().to_string())),
+            workspace_root: Self::existing_dir_string(&self.workspace_path).or_else(|| {
+                Self::existing_dir_string_from_opt(base_session.workspace_root.as_deref())
+            }),
         };
 
         let session = self.sidecar.create_session(request).await?;
@@ -1511,7 +1928,7 @@ You MUST perform concrete file edits now.\n\
         session_id: &mut String,
         prompt: &str,
         role: AgentRole,
-    ) -> Result<String> {
+    ) -> Result<AgentCallOutcome> {
         let max_timeout_retries = {
             let run = self.run.read().await;
             run.config.max_timeout_retries_per_task_attempt
@@ -1524,7 +1941,12 @@ You MUST perform concrete file edits now.\n\
 
         loop {
             match self
-                .call_agent(Some(&task.id), session_id.as_str(), &effective_prompt, role)
+                .call_agent_with_outcome(
+                    Some(&task.id),
+                    session_id.as_str(),
+                    &effective_prompt,
+                    role,
+                )
                 .await
             {
                 Ok(response) => return Ok(response),
@@ -1710,7 +2132,21 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
         prompt: &str,
         role: AgentRole,
     ) -> Result<String> {
+        self.call_agent_with_outcome(task_id, session_id, prompt, role)
+            .await
+            .map(|o| o.content)
+    }
+
+    async fn call_agent_with_outcome(
+        &self,
+        task_id: Option<&str>,
+        session_id: &str,
+        prompt: &str,
+        role: AgentRole,
+    ) -> Result<AgentCallOutcome> {
         use crate::sidecar::{ModelSpec, SendMessageRequest, StreamEvent};
+        self.validate_workspace_lease("pre_tool_call", task_id)
+            .await?;
 
         let _llm_permit = self
             .llm_semaphore
@@ -1817,6 +2253,7 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
         let mut content = String::new();
         let mut errors: Vec<String> = Vec::new();
         let mut first_tool_part_id: Option<String> = None;
+        let mut used_write_tools = false;
         let mut first_tool_finished = false;
         let mut stalled_windows: usize = 0;
         const MAX_STALLED_WINDOWS_BEFORE_FAIL: usize = 4;
@@ -1879,6 +2316,20 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
                             tool,
                             ..
                         } => {
+                            let normalized_tool = tool
+                                .split(':')
+                                .next_back()
+                                .unwrap_or(tool.as_str())
+                                .trim()
+                                .to_ascii_lowercase();
+                            if sid == &active_session_id
+                                && matches!(
+                                    normalized_tool.as_str(),
+                                    "write" | "edit" | "apply_patch"
+                                )
+                            {
+                                used_write_tools = true;
+                            }
                             if sid == &active_session_id && first_tool_part_id.is_none() {
                                 first_tool_part_id = Some(part_id.clone());
                                 if let Some(task_id) = task_id {
@@ -1935,6 +2386,29 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
                             error_code,
                         } => {
                             if sid == &active_session_id {
+                                let lowered = error.to_ascii_lowercase();
+                                let interrupted_like = lowered.contains("interrupted")
+                                    || lowered.contains("cancelled")
+                                    || lowered.contains("canceled")
+                                    || lowered.contains("aborted");
+                                if interrupted_like
+                                    && (first_tool_part_id.is_some() || !content.trim().is_empty())
+                                {
+                                    tracing::warn!(
+                                        "Session {} reported interrupt-like error after tool/content activity; recovering from history instead of hard-failing: {}",
+                                        active_session_id,
+                                        error
+                                    );
+                                    if content.trim().is_empty() {
+                                        if let Some(recovered) = self
+                                            .recover_agent_response_from_history(&active_session_id)
+                                            .await
+                                        {
+                                            content = recovered;
+                                        }
+                                    }
+                                    break;
+                                }
                                 tracing::error!("Session {} error: {}", active_session_id, error);
                                 if let Some(code) = error_code {
                                     if error.starts_with('[') {
@@ -2080,7 +2554,11 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
         }
 
         tracing::info!("Agent response received, length: {}", content.len());
-        Ok(content)
+        Ok(AgentCallOutcome {
+            content,
+            used_tools: first_tool_part_id.is_some(),
+            used_write_tools,
+        })
     }
 
     async fn recover_agent_response_from_history(&self, session_id: &str) -> Option<String> {
@@ -2191,9 +2669,74 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
         }
 
         Ok(format!(
-            "Top-level files/directories: {}",
+            "Top-level workspace entries: {}",
             non_meta.into_iter().take(25).collect::<Vec<_>>().join(", ")
         ))
+    }
+
+    async fn build_context_pack(&self, task: &Task, why_next_step: &str) -> Result<ContextPack> {
+        let run = self.run.read().await;
+        let recent_events = self
+            .store
+            .load_run_events(&run.run_id, None, Some(20))
+            .unwrap_or_default();
+        let blackboard = self.store.load_blackboard(&run.run_id).unwrap_or_default();
+        let pinned_constraints = Self::pinned_constraints();
+        let rolling_summary = Self::compact_rolling_summary(
+            &blackboard.summaries.rolling,
+            why_next_step,
+            &task.id,
+            &recent_events,
+            &pinned_constraints,
+        );
+        Ok(ContextPack {
+            goal: run.objective.clone(),
+            pinned_constraints,
+            active_step_id: task.id.clone(),
+            recent_events,
+            rolling_summary,
+        })
+    }
+
+    async fn validate_workspace_lease(&self, phase: &str, task_id: Option<&str>) -> Result<()> {
+        let current = std::fs::canonicalize(&self.workspace_path)
+            .unwrap_or_else(|_| self.workspace_path.clone())
+            .to_string_lossy()
+            .to_string();
+        let mut run = self.run.write().await;
+        if run.workspace_lease.canonical_path.is_empty() {
+            run.workspace_lease.canonical_path = current.clone();
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            run.workspace_lease.canonical_path.hash(&mut hasher);
+            run.workspace_lease.workspace_id = format!("ws-{:x}", hasher.finish());
+            if run.workspace_lease.lease_epoch == 0 {
+                run.workspace_lease.lease_epoch = 1;
+            }
+            return Ok(());
+        }
+        if run.workspace_lease.canonical_path != current {
+            let run_id = run.run_id.clone();
+            let expected = run.workspace_lease.canonical_path.clone();
+            run.status = RunStatus::Paused;
+            run.error_message = Some(format!(
+                "Workspace lease mismatch detected in {}. Expected {}, got {}.",
+                phase, expected, current
+            ));
+            drop(run);
+            self.emit_event(OrchestratorEvent::WorkspaceMismatch {
+                run_id,
+                task_id: task_id.map(|value| value.to_string()),
+                expected_path: expected,
+                actual_path: current,
+                phase: phase.to_string(),
+                timestamp: chrono::Utc::now(),
+            });
+            *self.pause_signal.write().await = true;
+            return Err(TandemError::Orchestrator(
+                "workspace lease mismatch; run paused".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn should_track_workspace_path(rel_path: &str) -> bool {
@@ -2328,6 +2871,69 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
             }
         }
         Ok(changed)
+    }
+
+    async fn collect_validation_file_evidence(
+        &self,
+        changes: &WorkspaceChangeSummary,
+    ) -> Result<String> {
+        let mut candidates = Vec::new();
+        for path in &changes.created {
+            candidates.push(path.clone());
+        }
+        for path in &changes.updated {
+            candidates.push(path.clone());
+        }
+        candidates.sort();
+        candidates.dedup();
+        candidates.truncate(8);
+
+        if candidates.is_empty() {
+            return Ok(String::new());
+        }
+
+        let workspace_root = self.workspace_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut sections = Vec::new();
+            let mut total_chars: usize = 0;
+            const MAX_TOTAL_CHARS: usize = 12_000;
+            const MAX_FILE_CHARS: usize = 2_000;
+
+            for rel in candidates {
+                if total_chars >= MAX_TOTAL_CHARS {
+                    break;
+                }
+
+                let abs = workspace_root.join(&rel);
+                if !abs.is_file() {
+                    continue;
+                }
+
+                let bytes = match std::fs::read(&abs) {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                };
+                if bytes.contains(&0) {
+                    sections.push(format!("### {}\n(binary file omitted)", rel));
+                    continue;
+                }
+
+                let text = String::from_utf8_lossy(&bytes);
+                let mut snippet = text.chars().take(MAX_FILE_CHARS).collect::<String>();
+                if text.chars().count() > MAX_FILE_CHARS {
+                    snippet.push_str("\n...[truncated]...");
+                }
+                snippet = snippet.replace("```", "'''");
+
+                let section = format!("### {}\n```text\n{}\n```", rel, snippet);
+                total_chars = total_chars.saturating_add(section.len());
+                sections.push(section);
+            }
+
+            Ok::<String, TandemError>(sections.join("\n\n"))
+        })
+        .await
+        .map_err(|e| TandemError::Orchestrator(format!("file evidence task failed: {}", e)))?
     }
 
     fn summarize_workspace_changes(
@@ -2538,6 +3144,88 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
         out
     }
 
+    fn normalize_tool_name(raw: &str) -> String {
+        raw.split(':')
+            .next_back()
+            .unwrap_or(raw)
+            .trim()
+            .to_ascii_lowercase()
+    }
+
+    fn extract_write_path_from_part(part: &serde_json::Value) -> Option<String> {
+        let args = part.get("args")?;
+        let path = args.get("path")?.as_str()?.trim();
+        if path.is_empty() {
+            None
+        } else {
+            Some(path.to_string())
+        }
+    }
+
+    fn is_successful_tool_terminal_state(state: &str, has_error: bool) -> bool {
+        let normalized = state.to_ascii_lowercase();
+        if has_error {
+            return false;
+        }
+        matches!(
+            normalized.as_str(),
+            "completed" | "complete" | "done" | "success"
+        ) || normalized.is_empty()
+    }
+
+    async fn summarize_session_write_activity(&self, session_id: &str) -> SessionWriteSummary {
+        let messages = match self.sidecar.get_session_messages(session_id).await {
+            Ok(messages) => messages,
+            Err(_) => return SessionWriteSummary::default(),
+        };
+
+        let mut summary = SessionWriteSummary::default();
+        let mut unique_paths = HashSet::new();
+
+        for message in messages.iter().filter(|m| {
+            m.info.role == "assistant"
+                && !m.info.deleted.unwrap_or(false)
+                && !m.info.reverted.unwrap_or(false)
+        }) {
+            for part in &message.parts {
+                let Some(part_type) = part.get("type").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if part_type != "tool" {
+                    continue;
+                }
+                let tool_name = part
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .map(Self::normalize_tool_name)
+                    .unwrap_or_default();
+                if !matches!(tool_name.as_str(), "write" | "edit" | "apply_patch") {
+                    continue;
+                }
+
+                summary.total_write_calls = summary.total_write_calls.saturating_add(1);
+                let state = part
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let has_error = part.get("error").is_some()
+                    || part.get("state").and_then(|v| v.get("error")).is_some();
+                if Self::is_successful_tool_terminal_state(state, has_error) {
+                    summary.successful_write_calls =
+                        summary.successful_write_calls.saturating_add(1);
+                    if let Some(path) = Self::extract_write_path_from_part(part) {
+                        unique_paths.insert(path);
+                    }
+                }
+            }
+        }
+
+        let mut paths: Vec<String> = unique_paths.into_iter().collect();
+        paths.sort();
+        summary.paths = paths;
+        summary
+    }
+
     // ========================================================================
     // Control Methods
     // ========================================================================
@@ -2609,7 +3297,7 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
                     "Run is not paused".to_string(),
                 ));
             }
-            run.status = RunStatus::Executing;
+            run.status = RunStatus::Running;
             run.ended_at = None;
             if run
                 .error_message
@@ -2618,16 +3306,8 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
             {
                 run.error_message = None;
             }
-            for task in run.tasks.iter_mut() {
-                if task.state == TaskState::Pending
-                    && task
-                        .error_message
-                        .as_deref()
-                        .is_some_and(Self::should_clear_error_on_resume)
-                {
-                    task.error_message = None;
-                }
-            }
+            // Preserve per-task error context on resume so the next attempt prompt can carry
+            // forward concrete failure rationale instead of restarting from zero context.
         }
 
         {
@@ -2666,8 +3346,6 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
             task.retry_count = 0;
             task.error_message = None;
             task.validation_result = None;
-            // Force a fresh child session for the retried task.
-            task.session_id = None;
 
             TaskScheduler::update_blocked_tasks(&mut run.tasks);
 
@@ -2692,8 +3370,19 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
         }
 
         {
-            let mut sessions = self.task_sessions.write().await;
-            sessions.remove(task_id);
+            let task_session_id = {
+                let run = self.run.read().await;
+                run.tasks
+                    .iter()
+                    .find(|task| task.id == task_id)
+                    .and_then(|task| task.session_id.clone())
+            };
+            if let Some(session_id) = task_session_id {
+                self.task_sessions
+                    .write()
+                    .await
+                    .insert(task_id.to_string(), session_id);
+            }
         }
 
         self.save_state().await?;
@@ -2731,7 +3420,7 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
                     "Run is not awaiting approval".to_string(),
                 ));
             }
-            run.status = RunStatus::RevisionRequested;
+            run.status = RunStatus::Blocked;
             run.revision_feedback = Some(feedback.clone());
         }
 
@@ -3083,23 +3772,328 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
         let run = self.run.read().await;
         self.store.save_run(&run)?;
         self.store.save_budget(&run.run_id, &budget)?;
+        drop(run);
+        self.persist_checkpoint("heartbeat", None).await?;
 
         Ok(())
+    }
+
+    async fn persist_checkpoint(&self, reason: &str, seq_override: Option<u64>) -> Result<()> {
+        let run = self.run.read().await.clone();
+        let budget = self.budget_tracker.write().await.snapshot();
+        let task_sessions = self.task_sessions.read().await.clone();
+        let seq = match seq_override {
+            Some(value) => value,
+            None => self.store.latest_run_event_seq(&run.run_id).unwrap_or(0),
+        };
+        let checkpoint_id = format!("cp-{}-{}", run.run_id, seq);
+        let checkpoint = CheckpointSnapshot {
+            checkpoint_id: checkpoint_id.clone(),
+            run_id: run.run_id.clone(),
+            seq,
+            ts_ms: crate::logs::now_ms(),
+            reason: reason.to_string(),
+            run: run.clone(),
+            budget,
+            task_sessions,
+        };
+        self.store.save_checkpoint(&run.run_id, &checkpoint)?;
+        {
+            let mut run_write = self.run.write().await;
+            run_write.current_checkpoint_id = Some(checkpoint_id);
+            self.store.save_run(&run_write)?;
+        }
+        Ok(())
+    }
+
+    fn checkpoint_reason_for_event(event: &OrchestratorEvent) -> Option<&'static str> {
+        match event {
+            OrchestratorEvent::TaskStarted { .. } => Some("step_started"),
+            OrchestratorEvent::TaskCompleted { .. } => Some("step_completed"),
+            OrchestratorEvent::ApprovalRequested { .. } => Some("approval_requested"),
+            OrchestratorEvent::ApprovalGranted { .. } => Some("approval_granted"),
+            OrchestratorEvent::RunPaused { .. } => Some("run_paused"),
+            OrchestratorEvent::RunResumed { .. } => Some("run_resumed"),
+            OrchestratorEvent::RunFailed { .. } => Some("run_failed"),
+            OrchestratorEvent::RunCompleted { .. } => Some("run_completed"),
+            OrchestratorEvent::RevisionRequested { .. } => Some("revision_requested"),
+            _ => None,
+        }
     }
 
     fn emit_event(&self, event: OrchestratorEvent) {
         let run_id = self.run_id.clone();
         let store = self.store.clone();
         let event_for_log = event.clone();
+        let status = self
+            .run
+            .try_read()
+            .map(|run| run.status)
+            .unwrap_or(RunStatus::Queued);
+        let seq = self.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let payload = serde_json::to_value(&event_for_log).unwrap_or_else(|_| json!({}));
+        let record = RunEventRecord {
+            event_id: format!("evt-{}", Uuid::new_v4()),
+            run_id: run_id.clone(),
+            seq,
+            ts_ms: crate::logs::now_ms(),
+            event_type: Self::event_type_name(&event_for_log).to_string(),
+            status,
+            step_id: event_for_log.step_id(),
+            payload,
+        };
+        let blackboard_patches = self.blackboard_patches_for_event(&record, &event_for_log);
+        let checkpoint_reason =
+            Self::checkpoint_reason_for_event(&event_for_log).map(str::to_string);
+        let engine = self.clone();
 
         tokio::task::spawn_blocking(move || {
+            if let Err(e) = store.append_run_event(&run_id, &record) {
+                tracing::error!("Failed to append sequenced orchestrator event: {}", e);
+            }
             if let Err(e) = store.append_event(&run_id, &event_for_log) {
                 tracing::error!("Failed to append orchestrator event: {}", e);
             }
+            for patch in blackboard_patches {
+                if let Err(e) = store.append_blackboard_patch(&run_id, &patch) {
+                    tracing::error!("Failed to append blackboard patch: {}", e);
+                }
+            }
         });
+        if let Some(reason) = checkpoint_reason {
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = engine.persist_checkpoint(&reason, Some(seq)).await {
+                    tracing::error!("Failed to persist orchestrator checkpoint: {}", e);
+                }
+            });
+        }
 
         if let Err(e) = self.event_tx.send(event) {
             tracing::error!("Failed to emit orchestrator event: {}", e);
+        }
+    }
+
+    fn blackboard_patches_for_event(
+        &self,
+        record: &RunEventRecord,
+        event: &OrchestratorEvent,
+    ) -> Vec<BlackboardPatchRecord> {
+        let mut patches: Vec<BlackboardPatchRecord> = Vec::new();
+        let mut patch_seq = record.seq.saturating_mul(100);
+        let mut next_patch_seq = || {
+            patch_seq = patch_seq.saturating_add(1);
+            patch_seq
+        };
+        let mk_item = |text: String, step_id: Option<String>| BlackboardItem {
+            id: format!("bbi-{}", Uuid::new_v4()),
+            ts_ms: record.ts_ms,
+            text,
+            step_id,
+            source_event_id: Some(record.event_id.clone()),
+        };
+
+        match event {
+            OrchestratorEvent::ContextPackBuilt {
+                why_next_step,
+                task_id,
+                ..
+            } => {
+                let prior_summary = self
+                    .store
+                    .load_blackboard(&record.run_id)
+                    .map(|bb| bb.summaries.rolling)
+                    .unwrap_or_default();
+                let recent_events = self
+                    .store
+                    .load_run_events(&record.run_id, None, Some(20))
+                    .unwrap_or_default();
+                let compact_summary = Self::compact_rolling_summary(
+                    &prior_summary,
+                    why_next_step,
+                    task_id,
+                    &recent_events,
+                    &Self::pinned_constraints(),
+                );
+                patches.push(BlackboardPatchRecord {
+                    patch_id: format!("bbp-{}", Uuid::new_v4()),
+                    run_id: record.run_id.clone(),
+                    seq: next_patch_seq(),
+                    ts_ms: record.ts_ms,
+                    op: BlackboardPatchOp::AddDecision,
+                    payload: serde_json::to_value(mk_item(
+                        why_next_step.clone(),
+                        Some(task_id.clone()),
+                    ))
+                    .unwrap_or(json!({})),
+                });
+                patches.push(BlackboardPatchRecord {
+                    patch_id: format!("bbp-{}", Uuid::new_v4()),
+                    run_id: record.run_id.clone(),
+                    seq: next_patch_seq(),
+                    ts_ms: record.ts_ms,
+                    op: BlackboardPatchOp::SetLatestContextPack,
+                    payload: json!(why_next_step),
+                });
+                patches.push(BlackboardPatchRecord {
+                    patch_id: format!("bbp-{}", Uuid::new_v4()),
+                    run_id: record.run_id.clone(),
+                    seq: next_patch_seq(),
+                    ts_ms: record.ts_ms,
+                    op: BlackboardPatchOp::SetRollingSummary,
+                    payload: json!(compact_summary),
+                });
+            }
+            OrchestratorEvent::TaskCompleted {
+                task_id, passed, ..
+            } => {
+                let op = if *passed {
+                    BlackboardPatchOp::AddFact
+                } else {
+                    BlackboardPatchOp::AddOpenQuestion
+                };
+                let text = if *passed {
+                    format!("Task `{}` completed and passed validation.", task_id)
+                } else {
+                    format!("Task `{}` completed but did not pass validation.", task_id)
+                };
+                patches.push(BlackboardPatchRecord {
+                    patch_id: format!("bbp-{}", Uuid::new_v4()),
+                    run_id: record.run_id.clone(),
+                    seq: next_patch_seq(),
+                    ts_ms: record.ts_ms,
+                    op,
+                    payload: serde_json::to_value(mk_item(text, Some(task_id.clone())))
+                        .unwrap_or(json!({})),
+                });
+
+                if let Ok(run) = self.run.try_read() {
+                    if let Some(task) = run.tasks.iter().find(|task| task.id == *task_id) {
+                        for artifact in &task.artifacts {
+                            patches.push(BlackboardPatchRecord {
+                                patch_id: format!("bbp-{}", Uuid::new_v4()),
+                                run_id: record.run_id.clone(),
+                                seq: next_patch_seq(),
+                                ts_ms: record.ts_ms,
+                                op: BlackboardPatchOp::AddArtifact,
+                                payload: serde_json::to_value(BlackboardArtifactRef {
+                                    id: format!("bba-{}", Uuid::new_v4()),
+                                    ts_ms: record.ts_ms,
+                                    path: artifact.path.clone(),
+                                    artifact_type: artifact.artifact_type.clone(),
+                                    step_id: Some(task_id.clone()),
+                                    source_event_id: Some(record.event_id.clone()),
+                                })
+                                .unwrap_or(json!({})),
+                            });
+                        }
+                    }
+                }
+            }
+            OrchestratorEvent::RevisionRequested { feedback, .. } => {
+                patches.push(BlackboardPatchRecord {
+                    patch_id: format!("bbp-{}", Uuid::new_v4()),
+                    run_id: record.run_id.clone(),
+                    seq: next_patch_seq(),
+                    ts_ms: record.ts_ms,
+                    op: BlackboardPatchOp::AddOpenQuestion,
+                    payload: serde_json::to_value(mk_item(
+                        format!("Plan revision requested: {}", feedback),
+                        None,
+                    ))
+                    .unwrap_or(json!({})),
+                });
+            }
+            OrchestratorEvent::WorkspaceMismatch {
+                expected_path,
+                actual_path,
+                phase,
+                task_id,
+                ..
+            } => {
+                patches.push(BlackboardPatchRecord {
+                    patch_id: format!("bbp-{}", Uuid::new_v4()),
+                    run_id: record.run_id.clone(),
+                    seq: next_patch_seq(),
+                    ts_ms: record.ts_ms,
+                    op: BlackboardPatchOp::AddOpenQuestion,
+                    payload: serde_json::to_value(mk_item(
+                        format!(
+                            "Workspace lease mismatch in {}: expected `{}`, got `{}`.",
+                            phase, expected_path, actual_path
+                        ),
+                        task_id.clone(),
+                    ))
+                    .unwrap_or(json!({})),
+                });
+            }
+            OrchestratorEvent::RunFailed { reason, .. } => {
+                patches.push(BlackboardPatchRecord {
+                    patch_id: format!("bbp-{}", Uuid::new_v4()),
+                    run_id: record.run_id.clone(),
+                    seq: next_patch_seq(),
+                    ts_ms: record.ts_ms,
+                    op: BlackboardPatchOp::AddOpenQuestion,
+                    payload: serde_json::to_value(mk_item(format!("Run failed: {}", reason), None))
+                        .unwrap_or(json!({})),
+                });
+                patches.push(BlackboardPatchRecord {
+                    patch_id: format!("bbp-{}", Uuid::new_v4()),
+                    run_id: record.run_id.clone(),
+                    seq: next_patch_seq(),
+                    ts_ms: record.ts_ms,
+                    op: BlackboardPatchOp::SetRollingSummary,
+                    payload: json!(format!("Run failed: {}", reason)),
+                });
+            }
+            OrchestratorEvent::RunCompleted { .. } => {
+                patches.push(BlackboardPatchRecord {
+                    patch_id: format!("bbp-{}", Uuid::new_v4()),
+                    run_id: record.run_id.clone(),
+                    seq: next_patch_seq(),
+                    ts_ms: record.ts_ms,
+                    op: BlackboardPatchOp::SetRollingSummary,
+                    payload: json!("Run completed successfully."),
+                });
+            }
+            OrchestratorEvent::PlanGenerated { task_count, .. } => {
+                patches.push(BlackboardPatchRecord {
+                    patch_id: format!("bbp-{}", Uuid::new_v4()),
+                    run_id: record.run_id.clone(),
+                    seq: next_patch_seq(),
+                    ts_ms: record.ts_ms,
+                    op: BlackboardPatchOp::SetRollingSummary,
+                    payload: json!(format!("Plan generated with {} tasks.", task_count)),
+                });
+            }
+            _ => {}
+        }
+
+        patches
+    }
+
+    fn event_type_name(event: &OrchestratorEvent) -> &'static str {
+        match event {
+            OrchestratorEvent::RunCreated { .. } => "run_created",
+            OrchestratorEvent::PlanningStarted { .. } => "planning_started",
+            OrchestratorEvent::PlanGenerated { .. } => "plan_generated",
+            OrchestratorEvent::PlanApproved { .. } => "plan_approved",
+            OrchestratorEvent::RevisionRequested { .. } => "revision_requested",
+            OrchestratorEvent::TaskStarted { .. } => "task_started",
+            OrchestratorEvent::TaskCompleted { .. } => "task_completed",
+            OrchestratorEvent::TaskTrace { .. } => "task_trace",
+            OrchestratorEvent::ApprovalRequested { .. } => "approval_requested",
+            OrchestratorEvent::ApprovalGranted { .. } => "approval_granted",
+            OrchestratorEvent::BudgetUpdated { .. } => "budget_updated",
+            OrchestratorEvent::RunPaused { .. } => "run_paused",
+            OrchestratorEvent::RunResumed { .. } => "run_resumed",
+            OrchestratorEvent::RunCompleted { .. } => "run_completed",
+            OrchestratorEvent::RunFailed { .. } => "run_failed",
+            OrchestratorEvent::RunCancelled { .. } => "run_cancelled",
+            OrchestratorEvent::ContractWarning { .. } => "contract_warning",
+            OrchestratorEvent::ContractError { .. } => "contract_error",
+            OrchestratorEvent::WorkspaceMismatch { .. } => "workspace_mismatch",
+            OrchestratorEvent::ContextPackBuilt { .. } => "context_pack_built",
         }
     }
 
@@ -3216,6 +4210,10 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
         snapshot
     }
 
+    pub fn workspace_path_string(&self) -> String {
+        self.workspace_path.to_string_lossy().to_string()
+    }
+
     /// Get current budget snapshot
     pub async fn get_budget(&self) -> Budget {
         self.budget_tracker.write().await.snapshot()
@@ -3284,7 +4282,7 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
             let mut run = self.run.write().await;
             let upgraded = Self::upgrade_legacy_limits(&mut run);
             let was_completed = run.status == RunStatus::Completed;
-            run.status = RunStatus::Executing;
+            run.status = RunStatus::Running;
             run.error_message = None;
             run.ended_at = None;
 
@@ -3471,5 +4469,36 @@ When calling `read`/`write`/`edit`, ALWAYS include a non-empty `path` string.\n\
         if let Some(t) = run.tasks.iter_mut().find(|t| t.id == task_id) {
             t.state = state;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_rolling_summary_preserves_pinned_constraints() {
+        let pinned = OrchestratorEngine::pinned_constraints();
+        let events = vec![RunEventRecord {
+            event_id: "evt-1".to_string(),
+            run_id: "run-1".to_string(),
+            seq: 1,
+            ts_ms: 1_000,
+            event_type: "task_started".to_string(),
+            status: RunStatus::Running,
+            step_id: Some("task-1".to_string()),
+            payload: serde_json::json!({}),
+        }];
+        let summary = OrchestratorEngine::compact_rolling_summary(
+            &"x".repeat(4_000),
+            "Dependencies satisfied",
+            "task-1",
+            &events,
+            &pinned,
+        );
+        assert!(summary.starts_with("Pinned: "));
+        assert!(summary.contains("Engine state is source-of-truth"));
+        assert!(summary.contains("Only operate within leased workspace"));
+        assert!(summary.len() <= OrchestratorEngine::ROLLING_SUMMARY_MAX_CHARS);
     }
 }

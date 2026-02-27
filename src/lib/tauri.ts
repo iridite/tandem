@@ -807,6 +807,270 @@ export async function deleteChannelConnectionToken(
   return invoke("delete_channel_connection_token", { channel });
 }
 
+export interface McpToolCacheEntry {
+  tool_name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  fetched_at_ms: number;
+  schema_hash: string;
+}
+
+export interface McpServerRecord {
+  name: string;
+  transport: string;
+  enabled: boolean;
+  connected: boolean;
+  pid?: number | null;
+  last_error?: string | null;
+  headers: Record<string, string>;
+  tool_cache: McpToolCacheEntry[];
+  tools_fetched_at_ms?: number | null;
+}
+
+export interface McpRemoteTool {
+  server_name: string;
+  tool_name: string;
+  namespaced_name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  fetched_at_ms: number;
+  schema_hash: string;
+}
+
+export interface McpAddRequest {
+  name: string;
+  transport: string;
+  headers?: Record<string, string>;
+  enabled?: boolean;
+}
+
+export interface McpActionResponse {
+  ok: boolean;
+  error?: string | null;
+  count?: number | null;
+}
+
+export async function mcpListServers(): Promise<McpServerRecord[]> {
+  return invoke("mcp_list_servers");
+}
+
+export async function mcpAddServer(request: McpAddRequest): Promise<McpActionResponse> {
+  return invoke("mcp_add_server", { request });
+}
+
+export async function mcpSetEnabled(name: string, enabled: boolean): Promise<McpActionResponse> {
+  return invoke("mcp_set_enabled", { name, enabled });
+}
+
+export async function mcpConnect(name: string): Promise<McpActionResponse> {
+  return invoke("mcp_connect", { name });
+}
+
+export async function mcpDisconnect(name: string): Promise<McpActionResponse> {
+  return invoke("mcp_disconnect", { name });
+}
+
+export async function mcpRefresh(name: string): Promise<McpActionResponse> {
+  return invoke("mcp_refresh", { name });
+}
+
+export async function mcpListTools(): Promise<McpRemoteTool[]> {
+  return invoke("mcp_list_tools");
+}
+
+export async function toolIds(): Promise<string[]> {
+  return invoke("tool_ids");
+}
+
+export type RoutineStatus = "active" | "paused";
+
+export type RoutineSchedule =
+  | { interval_seconds: { seconds: number } }
+  | { cron: { expression: string } };
+
+export type RoutineMisfirePolicy =
+  | { type: "skip" }
+  | { type: "run_once" }
+  | { type: "catch_up"; max_runs: number };
+
+export interface RoutineSpec {
+  routine_id: string;
+  name: string;
+  status: RoutineStatus;
+  schedule: RoutineSchedule;
+  timezone: string;
+  misfire_policy: RoutineMisfirePolicy;
+  entrypoint: string;
+  args: Record<string, unknown>;
+  allowed_tools: string[];
+  output_targets: string[];
+  creator_type: string;
+  creator_id: string;
+  requires_approval: boolean;
+  external_integrations_allowed: boolean;
+  next_fire_at_ms?: number | null;
+  last_fired_at_ms?: number | null;
+}
+
+export interface RoutineCreateRequest {
+  routine_id?: string;
+  name: string;
+  schedule: RoutineSchedule;
+  timezone?: string;
+  misfire_policy?: RoutineMisfirePolicy;
+  entrypoint: string;
+  args?: Record<string, unknown>;
+  allowed_tools?: string[];
+  output_targets?: string[];
+  creator_type?: string;
+  creator_id?: string;
+  requires_approval?: boolean;
+  external_integrations_allowed?: boolean;
+  next_fire_at_ms?: number;
+}
+
+export interface RoutinePatchRequest {
+  name?: string;
+  status?: RoutineStatus;
+  schedule?: RoutineSchedule;
+  timezone?: string;
+  misfire_policy?: RoutineMisfirePolicy;
+  entrypoint?: string;
+  args?: Record<string, unknown>;
+  allowed_tools?: string[];
+  output_targets?: string[];
+  requires_approval?: boolean;
+  external_integrations_allowed?: boolean;
+  next_fire_at_ms?: number;
+}
+
+export async function routinesList(): Promise<RoutineSpec[]> {
+  return invoke("routines_list");
+}
+
+export async function routinesCreate(request: RoutineCreateRequest): Promise<RoutineSpec> {
+  return invoke("routines_create", { request });
+}
+
+export async function routinesPatch(
+  routineId: string,
+  request: RoutinePatchRequest
+): Promise<RoutineSpec> {
+  return invoke("routines_patch", { routineId, request });
+}
+
+export async function routinesDelete(routineId: string): Promise<boolean> {
+  return invoke("routines_delete", { routineId });
+}
+
+export type RoutineRunStatus =
+  | "queued"
+  | "pending_approval"
+  | "running"
+  | "paused"
+  | "blocked_policy"
+  | "denied"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface RoutineRunArtifact {
+  artifact_id: string;
+  uri: string;
+  kind: string;
+  label?: string | null;
+  created_at_ms: number;
+  metadata?: Record<string, unknown> | null;
+}
+
+export interface RoutineRunRecord {
+  run_id: string;
+  routine_id: string;
+  trigger_type: string;
+  run_count: number;
+  status: RoutineRunStatus;
+  created_at_ms: number;
+  updated_at_ms: number;
+  fired_at_ms?: number | null;
+  started_at_ms?: number | null;
+  finished_at_ms?: number | null;
+  requires_approval: boolean;
+  approval_reason?: string | null;
+  denial_reason?: string | null;
+  paused_reason?: string | null;
+  detail?: string | null;
+  entrypoint: string;
+  args: Record<string, unknown>;
+  allowed_tools: string[];
+  output_targets: string[];
+  artifacts: RoutineRunArtifact[];
+}
+
+export interface RoutineRunDecisionRequest {
+  reason?: string;
+}
+
+export interface RoutineRunArtifactAddRequest {
+  uri: string;
+  kind: string;
+  label?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export async function routinesRuns(routineId: string, limit?: number): Promise<RoutineRunRecord[]> {
+  return invoke("routines_runs", { routineId, limit });
+}
+
+export async function routinesRunsAll(
+  routineId?: string,
+  limit?: number
+): Promise<RoutineRunRecord[]> {
+  return invoke("routines_runs_all", { routineId, limit });
+}
+
+export async function routinesRunGet(runId: string): Promise<RoutineRunRecord> {
+  return invoke("routines_run_get", { runId });
+}
+
+export async function routinesRunApprove(
+  runId: string,
+  request?: RoutineRunDecisionRequest
+): Promise<RoutineRunRecord> {
+  return invoke("routines_run_approve", { runId, request });
+}
+
+export async function routinesRunDeny(
+  runId: string,
+  request?: RoutineRunDecisionRequest
+): Promise<RoutineRunRecord> {
+  return invoke("routines_run_deny", { runId, request });
+}
+
+export async function routinesRunPause(
+  runId: string,
+  request?: RoutineRunDecisionRequest
+): Promise<RoutineRunRecord> {
+  return invoke("routines_run_pause", { runId, request });
+}
+
+export async function routinesRunResume(
+  runId: string,
+  request?: RoutineRunDecisionRequest
+): Promise<RoutineRunRecord> {
+  return invoke("routines_run_resume", { runId, request });
+}
+
+export async function routinesRunArtifacts(runId: string): Promise<RoutineRunArtifact[]> {
+  return invoke("routines_run_artifacts", { runId });
+}
+
+export async function routinesRunAddArtifact(
+  runId: string,
+  request: RoutineRunArtifactAddRequest
+): Promise<RoutineRunRecord> {
+  return invoke("routines_run_add_artifact", { runId, request });
+}
+
 // ============================================================================
 // Sidecar Management
 // ============================================================================

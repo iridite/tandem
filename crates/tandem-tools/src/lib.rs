@@ -5,6 +5,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use regex::Regex;
@@ -16,6 +17,14 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use futures_util::StreamExt;
+use tandem_agent_teams::compat::{
+    send_message_schema, task_create_schema, task_list_schema, task_schema, task_update_schema,
+    team_create_schema,
+};
+use tandem_agent_teams::{
+    AgentTeamPaths, SendMessageInput, SendMessageType, TaskCreateInput, TaskInput, TaskListInput,
+    TaskUpdateInput, TeamCreateInput,
+};
 use tandem_memory::types::{MemorySearchResult, MemoryTier};
 use tandem_memory::MemoryManager;
 use tandem_types::{ToolResult, ToolSchema};
@@ -48,10 +57,7 @@ impl ToolRegistry {
         map.insert("glob".to_string(), Arc::new(GlobTool));
         map.insert("grep".to_string(), Arc::new(GrepTool));
         map.insert("webfetch".to_string(), Arc::new(WebFetchTool));
-        map.insert(
-            "webfetch_document".to_string(),
-            Arc::new(WebFetchDocumentTool),
-        );
+        map.insert("webfetch_html".to_string(), Arc::new(WebFetchHtmlTool));
         map.insert("mcp_debug".to_string(), Arc::new(McpDebugTool));
         map.insert("websearch".to_string(), Arc::new(WebSearchTool));
         map.insert("codesearch".to_string(), Arc::new(CodeSearchTool));
@@ -69,6 +75,11 @@ impl ToolRegistry {
         map.insert("apply_patch".to_string(), Arc::new(ApplyPatchTool));
         map.insert("batch".to_string(), Arc::new(BatchTool));
         map.insert("lsp".to_string(), Arc::new(LspTool));
+        map.insert("teamcreate".to_string(), Arc::new(TeamCreateTool));
+        map.insert("taskcreate".to_string(), Arc::new(TaskCreateCompatTool));
+        map.insert("taskupdate".to_string(), Arc::new(TaskUpdateCompatTool));
+        map.insert("tasklist".to_string(), Arc::new(TaskListCompatTool));
+        map.insert("sendmessage".to_string(), Arc::new(SendMessageCompatTool));
         Self {
             tools: Arc::new(RwLock::new(map)),
         }
@@ -82,6 +93,28 @@ impl ToolRegistry {
         let mut schemas = dedup.into_values().collect::<Vec<_>>();
         schemas.sort_by(|a, b| a.name.cmp(&b.name));
         schemas
+    }
+
+    pub async fn register_tool(&self, name: String, tool: Arc<dyn Tool>) {
+        self.tools.write().await.insert(name, tool);
+    }
+
+    pub async fn unregister_tool(&self, name: &str) -> bool {
+        self.tools.write().await.remove(name).is_some()
+    }
+
+    pub async fn unregister_by_prefix(&self, prefix: &str) -> usize {
+        let mut tools = self.tools.write().await;
+        let keys = tools
+            .keys()
+            .filter(|name| name.starts_with(prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed = keys.len();
+        for key in keys {
+            tools.remove(&key);
+        }
+        removed
     }
 
     pub async fn execute(&self, name: &str, args: Value) -> anyhow::Result<ToolResult> {
@@ -335,20 +368,217 @@ fn validate_schema_node(
     Ok(())
 }
 
-fn is_path_allowed(path: &str) -> bool {
+fn workspace_root_from_args(args: &Value) -> Option<PathBuf> {
+    args.get("__workspace_root")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+fn effective_cwd_from_args(args: &Value) -> PathBuf {
+    args.get("__effective_cwd")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| workspace_root_from_args(args))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn normalize_path_for_compare(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn normalize_existing_or_lexical(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|_| normalize_path_for_compare(path))
+}
+
+fn is_within_workspace_root(path: &Path, workspace_root: &Path) -> bool {
+    // First compare lexical-normalized paths so non-existent target files under symlinked
+    // workspace roots still pass containment checks.
+    let candidate_lexical = normalize_path_for_compare(path);
+    let root_lexical = normalize_path_for_compare(workspace_root);
+    if candidate_lexical.starts_with(&root_lexical) {
+        return true;
+    }
+
+    // Fallback to canonical comparison when available (best for existing paths and symlink
+    // resolution consistency).
+    let candidate = normalize_existing_or_lexical(path);
+    let root = normalize_existing_or_lexical(workspace_root);
+    candidate.starts_with(root)
+}
+
+fn resolve_tool_path(path: &str, args: &Value) -> Option<PathBuf> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
-        return false;
+        return None;
+    }
+    if trimmed == "." || trimmed == "./" || trimmed == ".\\" {
+        let cwd = effective_cwd_from_args(args);
+        if let Some(workspace_root) = workspace_root_from_args(args) {
+            if !is_within_workspace_root(&cwd, &workspace_root) {
+                return None;
+            }
+        }
+        return Some(cwd);
     }
     if is_root_only_path_token(trimmed) || is_malformed_tool_path_token(trimmed) {
-        return false;
+        return None;
     }
     let raw = Path::new(trimmed);
-    if raw.is_absolute() {
-        return false;
+    if !raw.is_absolute()
+        && raw
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
     }
-    !raw.components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
+
+    let resolved = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        effective_cwd_from_args(args).join(raw)
+    };
+
+    if let Some(workspace_root) = workspace_root_from_args(args) {
+        if !is_within_workspace_root(&resolved, &workspace_root) {
+            return None;
+        }
+    } else if raw.is_absolute() {
+        return None;
+    }
+
+    Some(resolved)
+}
+
+fn resolve_walk_root(path: &str, args: &Value) -> Option<PathBuf> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if is_malformed_tool_path_token(trimmed) {
+        return None;
+    }
+    resolve_tool_path(path, args)
+}
+
+fn resolve_read_path_fallback(path: &str, args: &Value) -> Option<PathBuf> {
+    let token = path.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let raw = Path::new(token);
+    if raw.is_absolute() || token.contains('\\') || token.contains('/') || raw.extension().is_none()
+    {
+        return None;
+    }
+
+    let workspace_root = workspace_root_from_args(args);
+    let effective_cwd = effective_cwd_from_args(args);
+    let mut search_roots = vec![effective_cwd.clone()];
+    if let Some(root) = workspace_root.as_ref() {
+        if *root != effective_cwd {
+            search_roots.push(root.clone());
+        }
+    }
+
+    let token_lower = token.to_lowercase();
+    for root in search_roots {
+        if let Some(workspace_root) = workspace_root.as_ref() {
+            if !is_within_workspace_root(&root, workspace_root) {
+                continue;
+            }
+        }
+
+        let mut matches = Vec::new();
+        for entry in WalkBuilder::new(&root).build().flatten() {
+            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let candidate = entry.path();
+            if let Some(workspace_root) = workspace_root.as_ref() {
+                if !is_within_workspace_root(candidate, workspace_root) {
+                    continue;
+                }
+            }
+            let file_name = candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_lowercase();
+            if file_name == token_lower || file_name.ends_with(&token_lower) {
+                matches.push(candidate.to_path_buf());
+                if matches.len() > 8 {
+                    break;
+                }
+            }
+        }
+
+        if matches.len() == 1 {
+            return matches.into_iter().next();
+        }
+    }
+
+    None
+}
+
+fn sandbox_path_denied_result(path: &str, args: &Value) -> ToolResult {
+    let requested = path.trim();
+    let workspace_root = workspace_root_from_args(args);
+    let effective_cwd = effective_cwd_from_args(args);
+    let suggested_path = Path::new(requested)
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .map(PathBuf::from)
+        .and_then(|name| {
+            if let Some(root) = workspace_root.as_ref() {
+                if is_within_workspace_root(&effective_cwd, root) {
+                    Some(effective_cwd.join(name))
+                } else {
+                    Some(root.join(name))
+                }
+            } else {
+                Some(effective_cwd.join(name))
+            }
+        });
+
+    let mut output =
+        "path denied by sandbox policy (outside workspace root, malformed path, or missing workspace context)"
+            .to_string();
+    if let Some(suggested) = suggested_path.as_ref() {
+        output.push_str(&format!(
+            "\nrequested: {}\ntry: {}",
+            requested,
+            suggested.to_string_lossy()
+        ));
+    }
+    if let Some(root) = workspace_root.as_ref() {
+        output.push_str(&format!("\nworkspace_root: {}", root.to_string_lossy()));
+    }
+
+    ToolResult {
+        output,
+        metadata: json!({
+            "path": path,
+            "workspace_root": workspace_root.map(|p| p.to_string_lossy().to_string()),
+            "effective_cwd": effective_cwd.to_string_lossy().to_string(),
+            "suggested_path": suggested_path.map(|p| p.to_string_lossy().to_string())
+        }),
+    }
 }
 
 fn is_root_only_path_token(path: &str) -> bool {
@@ -383,7 +613,33 @@ fn is_malformed_tool_path_token(path: &str) -> bool {
     if path.contains('\n') || path.contains('\r') {
         return true;
     }
-    if path.contains('*') || path.contains('?') {
+    if path.contains('*') {
+        return true;
+    }
+    // Allow Windows verbatim prefixes (\\?\C:\... / //?/C:/... / \\?\UNC\...).
+    // These can appear in tool outputs and should not be treated as malformed.
+    if path.contains('?') {
+        let trimmed = path.trim();
+        let is_windows_verbatim = trimmed.starts_with("\\\\?\\") || trimmed.starts_with("//?/");
+        if !is_windows_verbatim {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_malformed_tool_pattern_token(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    if lower.contains("<tool_call")
+        || lower.contains("</tool_call")
+        || lower.contains("<function=")
+        || lower.contains("<parameter=")
+        || lower.contains("</function>")
+        || lower.contains("</parameter>")
+    {
+        return true;
+    }
+    if pattern.contains('\n') || pattern.contains('\r') {
         return true;
     }
     false
@@ -434,6 +690,8 @@ impl Tool for BashTool {
             os_guardrail_applied,
             guardrail_reason,
         } = shell;
+        let effective_cwd = effective_cwd_from_args(&args);
+        command.current_dir(&effective_cwd);
         if let Some(env) = args.get("env").and_then(|v| v.as_object()) {
             for (k, v) in env {
                 if let Some(value) = v.as_str() {
@@ -449,6 +707,19 @@ impl Tool for BashTool {
             guardrail_reason.as_deref(),
             stderr,
         );
+        let mut metadata = metadata;
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert(
+                "effective_cwd".to_string(),
+                Value::String(effective_cwd.to_string_lossy().to_string()),
+            );
+            if let Some(workspace_root) = workspace_root_from_args(&args) {
+                obj.insert(
+                    "workspace_root".to_string(),
+                    Value::String(workspace_root.to_string_lossy().to_string()),
+                );
+            }
+        }
         Ok(ToolResult {
             output: String::from_utf8_lossy(&output.stdout).to_string(),
             metadata,
@@ -477,6 +748,8 @@ impl Tool for BashTool {
             os_guardrail_applied,
             guardrail_reason,
         } = shell;
+        let effective_cwd = effective_cwd_from_args(&args);
+        command.current_dir(&effective_cwd);
         if let Some(env) = args.get("env").and_then(|v| v.as_object()) {
             for (k, v) in env {
                 if let Some(value) = v.as_str() {
@@ -484,7 +757,7 @@ impl Tool for BashTool {
                 }
             }
         }
-        command.stdout(Stdio::null());
+        command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         let mut child = command.spawn()?;
         let status = tokio::select! {
@@ -496,6 +769,15 @@ impl Tool for BashTool {
                 });
             }
             result = child.wait() => result?
+        };
+        let stdout = match child.stdout.take() {
+            Some(mut handle) => {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                let _ = handle.read_to_end(&mut buf).await;
+                String::from_utf8_lossy(&buf).to_string()
+            }
+            None => String::new(),
         };
         let stderr = match child.stderr.take() {
             Some(mut handle) => {
@@ -514,9 +796,23 @@ impl Tool for BashTool {
         );
         if let Some(obj) = metadata.as_object_mut() {
             obj.insert("exit_code".to_string(), json!(status.code()));
+            obj.insert(
+                "effective_cwd".to_string(),
+                Value::String(effective_cwd.to_string_lossy().to_string()),
+            );
+            if let Some(workspace_root) = workspace_root_from_args(&args) {
+                obj.insert(
+                    "workspace_root".to_string(),
+                    Value::String(workspace_root.to_string_lossy().to_string()),
+                );
+            }
         }
         Ok(ToolResult {
-            output: format!("command exited: {}", status),
+            output: if stdout.is_empty() {
+                format!("command exited: {}", status)
+            } else {
+                stdout
+            },
             metadata,
         })
     }
@@ -781,15 +1077,57 @@ impl Tool for ReadTool {
         }
     }
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let path = args["path"].as_str().unwrap_or("");
-        if !is_path_allowed(path) {
+        let path = args["path"].as_str().unwrap_or("").trim();
+        let Some(mut path_buf) = resolve_tool_path(path, &args) else {
+            return Ok(sandbox_path_denied_result(path, &args));
+        };
+
+        let metadata = match fs::metadata(&path_buf).await {
+            Ok(meta) => meta,
+            Err(first_err) => {
+                if let Some(recovered) = resolve_read_path_fallback(path, &args) {
+                    path_buf = recovered;
+                    match fs::metadata(&path_buf).await {
+                        Ok(meta) => meta,
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                output: format!("read failed: {}", e),
+                                metadata: json!({
+                                    "ok": false,
+                                    "reason": "path_not_found",
+                                    "path": path,
+                                    "resolved_path": path_buf.to_string_lossy(),
+                                    "error": e.to_string()
+                                }),
+                            });
+                        }
+                    }
+                } else {
+                    return Ok(ToolResult {
+                        output: format!("read failed: {}", first_err),
+                        metadata: json!({
+                            "ok": false,
+                            "reason": "path_not_found",
+                            "path": path,
+                            "error": first_err.to_string()
+                        }),
+                    });
+                }
+            }
+        };
+        if metadata.is_dir() {
             return Ok(ToolResult {
-                output: "path denied by sandbox policy".to_string(),
-                metadata: json!({"path": path}),
+                output: format!(
+                    "read failed: `{}` is a directory. Use `glob` to enumerate files, then `read` a concrete file path.",
+                    path
+                ),
+                metadata: json!({
+                    "ok": false,
+                    "reason": "path_is_directory",
+                    "path": path
+                }),
             });
         }
-
-        let path_buf = PathBuf::from(path);
 
         // Check if it's a document format
         if is_document_file(&path_buf) {
@@ -829,10 +1167,23 @@ impl Tool for ReadTool {
         }
 
         // Fallback to text reading
-        let data = fs::read_to_string(path).await.unwrap_or_default();
+        let data = match fs::read_to_string(&path_buf).await {
+            Ok(data) => data,
+            Err(e) => {
+                return Ok(ToolResult {
+                    output: format!("read failed: {}", e),
+                    metadata: json!({
+                        "ok": false,
+                        "reason": "read_text_failed",
+                        "path": path_buf.to_string_lossy(),
+                        "error": e.to_string()
+                    }),
+                });
+            }
+        };
         Ok(ToolResult {
             output: data,
-            metadata: json!({"path": path, "type": "text"}),
+            metadata: json!({"path": path_buf.to_string_lossy(), "type": "text"}),
         })
     }
 }
@@ -862,12 +1213,9 @@ impl Tool for WriteTool {
             .get("allow_empty")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if !is_path_allowed(path) {
-            return Ok(ToolResult {
-                output: "path denied by sandbox policy".to_string(),
-                metadata: json!({"path": path}),
-            });
-        }
+        let Some(path_buf) = resolve_tool_path(path, &args) else {
+            return Ok(sandbox_path_denied_result(path, &args));
+        };
         let Some(content) = content else {
             return Ok(ToolResult {
                 output: "write requires `content`".to_string(),
@@ -880,15 +1228,15 @@ impl Tool for WriteTool {
                 metadata: json!({"ok": false, "reason": "empty_content", "path": path}),
             });
         }
-        if let Some(parent) = Path::new(path).parent() {
+        if let Some(parent) = path_buf.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).await?;
             }
         }
-        fs::write(path, content).await?;
+        fs::write(&path_buf, content).await?;
         Ok(ToolResult {
             output: "ok".to_string(),
-            metadata: json!({}),
+            metadata: json!({"path": path_buf.to_string_lossy()}),
         })
     }
 }
@@ -915,18 +1263,15 @@ impl Tool for EditTool {
         let path = args["path"].as_str().unwrap_or("");
         let old = args["old"].as_str().unwrap_or("");
         let new = args["new"].as_str().unwrap_or("");
-        if !is_path_allowed(path) {
-            return Ok(ToolResult {
-                output: "path denied by sandbox policy".to_string(),
-                metadata: json!({"path": path}),
-            });
-        }
-        let content = fs::read_to_string(path).await.unwrap_or_default();
+        let Some(path_buf) = resolve_tool_path(path, &args) else {
+            return Ok(sandbox_path_denied_result(path, &args));
+        };
+        let content = fs::read_to_string(&path_buf).await.unwrap_or_default();
         let updated = content.replace(old, new);
-        fs::write(path, updated).await?;
+        fs::write(&path_buf, updated).await?;
         Ok(ToolResult {
             output: "ok".to_string(),
-            metadata: json!({}),
+            metadata: json!({"path": path_buf.to_string_lossy()}),
         })
     }
 }
@@ -949,10 +1294,28 @@ impl Tool for GlobTool {
                 metadata: json!({"pattern": pattern}),
             });
         }
+        if is_malformed_tool_pattern_token(pattern) {
+            return Ok(ToolResult {
+                output: "pattern denied by sandbox policy".to_string(),
+                metadata: json!({"pattern": pattern}),
+            });
+        }
+        let workspace_root = workspace_root_from_args(&args);
+        let effective_cwd = effective_cwd_from_args(&args);
+        let scoped_pattern = if Path::new(pattern).is_absolute() {
+            pattern.to_string()
+        } else {
+            effective_cwd.join(pattern).to_string_lossy().to_string()
+        };
         let mut files = Vec::new();
-        for path in (glob::glob(pattern)?).flatten() {
+        for path in (glob::glob(&scoped_pattern)?).flatten() {
             if is_discovery_ignored_path(&path) {
                 continue;
+            }
+            if let Some(root) = workspace_root.as_ref() {
+                if !is_within_workspace_root(&path, root) {
+                    continue;
+                }
             }
             files.push(path.display().to_string());
             if files.len() >= 100 {
@@ -961,7 +1324,7 @@ impl Tool for GlobTool {
         }
         Ok(ToolResult {
             output: files.join("\n"),
-            metadata: json!({"count": files.len()}),
+            metadata: json!({"count": files.len(), "effective_cwd": effective_cwd, "workspace_root": workspace_root}),
         })
     }
 }
@@ -984,15 +1347,12 @@ impl Tool for GrepTool {
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let pattern = args["pattern"].as_str().unwrap_or("");
         let root = args["path"].as_str().unwrap_or(".");
-        if !is_path_allowed(root) {
-            return Ok(ToolResult {
-                output: "path denied by sandbox policy".to_string(),
-                metadata: json!({"path": root}),
-            });
-        }
+        let Some(root_path) = resolve_walk_root(root, &args) else {
+            return Ok(sandbox_path_denied_result(root, &args));
+        };
         let regex = Regex::new(pattern)?;
         let mut out = Vec::new();
-        for entry in WalkBuilder::new(root).build().flatten() {
+        for entry in WalkBuilder::new(&root_path).build().flatten() {
             if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
                 continue;
             }
@@ -1016,7 +1376,7 @@ impl Tool for GrepTool {
         }
         Ok(ToolResult {
             output: out.join("\n"),
-            metadata: json!({"count": out.len()}),
+            metadata: json!({"count": out.len(), "path": root_path.to_string_lossy()}),
         })
     }
 }
@@ -1027,26 +1387,6 @@ impl Tool for WebFetchTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "webfetch".to_string(),
-            description: "Fetch URL text".to_string(),
-            input_schema: json!({"type":"object","properties":{"url":{"type":"string"}}}),
-        }
-    }
-    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let url = args["url"].as_str().unwrap_or("");
-        let body = reqwest::get(url).await?.text().await?;
-        Ok(ToolResult {
-            output: body.chars().take(20_000).collect(),
-            metadata: json!({"truncated": body.len() > 20_000}),
-        })
-    }
-}
-
-struct WebFetchDocumentTool;
-#[async_trait]
-impl Tool for WebFetchDocumentTool {
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            name: "webfetch_document".to_string(),
             description: "Fetch URL content and return a structured markdown document".to_string(),
             input_schema: json!({
                 "type":"object",
@@ -1070,7 +1410,7 @@ impl Tool for WebFetchDocumentTool {
             });
         }
         let mode = args["mode"].as_str().unwrap_or("auto");
-        let return_mode = args["return"].as_str().unwrap_or("both");
+        let return_mode = args["return"].as_str().unwrap_or("markdown");
         let timeout_ms = args["timeout_ms"]
             .as_u64()
             .unwrap_or(15_000)
@@ -1078,54 +1418,20 @@ impl Tool for WebFetchDocumentTool {
         let max_bytes = args["max_bytes"].as_u64().unwrap_or(500_000).min(5_000_000) as usize;
         let max_redirects = args["max_redirects"].as_u64().unwrap_or(5).min(20) as usize;
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(timeout_ms))
-            .redirect(reqwest::redirect::Policy::limited(max_redirects))
-            .build()?;
-
         let started = std::time::Instant::now();
-        let res = client
-            .get(url)
-            .header(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
-            .send()
-            .await?;
-        let final_url = res.url().to_string();
-        let content_type = res
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        let mut stream = res.bytes_stream();
-        let mut buffer: Vec<u8> = Vec::new();
-        let mut truncated = false;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            if buffer.len() + chunk.len() > max_bytes {
-                let remaining = max_bytes.saturating_sub(buffer.len());
-                buffer.extend_from_slice(&chunk[..remaining]);
-                truncated = true;
-                break;
-            }
-            buffer.extend_from_slice(&chunk);
-        }
-        let raw = String::from_utf8_lossy(&buffer).to_string();
+        let fetched = fetch_url_with_limits(url, timeout_ms, max_bytes, max_redirects).await?;
+        let raw = String::from_utf8_lossy(&fetched.buffer).to_string();
 
         let cleaned = strip_html_noise(&raw);
         let title = extract_title(&cleaned).unwrap_or_default();
         let canonical = extract_canonical(&cleaned);
         let links = extract_links(&cleaned);
 
-        let markdown = if content_type.contains("html") || content_type.is_empty() {
+        let markdown = if fetched.content_type.contains("html") || fetched.content_type.is_empty() {
             html2md::parse_html(&cleaned)
         } else {
             cleaned.clone()
         };
-
         let text = markdown_to_text(&markdown);
 
         let markdown_out = if return_mode == "text" {
@@ -1149,9 +1455,9 @@ impl Tool for WebFetchDocumentTool {
 
         let output = json!({
             "url": url,
-            "final_url": final_url,
+            "final_url": fetched.final_url,
             "title": title,
-            "content_type": content_type,
+            "content_type": fetched.content_type,
             "markdown": markdown_out,
             "text": text_out,
             "links": links,
@@ -1160,13 +1466,13 @@ impl Tool for WebFetchDocumentTool {
                 "mode": mode
             },
             "stats": {
-                "bytes_in": buffer.len(),
+                "bytes_in": fetched.buffer.len(),
                 "bytes_out": markdown_chars,
                 "raw_chars": raw_chars,
                 "markdown_chars": markdown_chars,
                 "reduction_pct": reduction_pct,
                 "elapsed_ms": started.elapsed().as_millis(),
-                "truncated": truncated
+                "truncated": fetched.truncated
             }
         });
 
@@ -1174,12 +1480,119 @@ impl Tool for WebFetchDocumentTool {
             output: serde_json::to_string_pretty(&output)?,
             metadata: json!({
                 "url": url,
-                "final_url": final_url,
-                "content_type": content_type,
-                "truncated": truncated
+                "final_url": fetched.final_url,
+                "content_type": fetched.content_type,
+                "truncated": fetched.truncated
             }),
         })
     }
+}
+
+struct WebFetchHtmlTool;
+#[async_trait]
+impl Tool for WebFetchHtmlTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "webfetch_html".to_string(),
+            description: "Fetch URL and return raw HTML content".to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "url":{"type":"string"},
+                    "max_bytes":{"type":"integer"},
+                    "timeout_ms":{"type":"integer"},
+                    "max_redirects":{"type":"integer"}
+                }
+            }),
+        }
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let url = args["url"].as_str().unwrap_or("").trim();
+        if url.is_empty() {
+            return Ok(ToolResult {
+                output: "url is required".to_string(),
+                metadata: json!({"url": url}),
+            });
+        }
+        let timeout_ms = args["timeout_ms"]
+            .as_u64()
+            .unwrap_or(15_000)
+            .clamp(1_000, 120_000);
+        let max_bytes = args["max_bytes"].as_u64().unwrap_or(500_000).min(5_000_000) as usize;
+        let max_redirects = args["max_redirects"].as_u64().unwrap_or(5).min(20) as usize;
+
+        let started = std::time::Instant::now();
+        let fetched = fetch_url_with_limits(url, timeout_ms, max_bytes, max_redirects).await?;
+        let output = String::from_utf8_lossy(&fetched.buffer).to_string();
+
+        Ok(ToolResult {
+            output,
+            metadata: json!({
+                "url": url,
+                "final_url": fetched.final_url,
+                "content_type": fetched.content_type,
+                "truncated": fetched.truncated,
+                "bytes_in": fetched.buffer.len(),
+                "elapsed_ms": started.elapsed().as_millis()
+            }),
+        })
+    }
+}
+
+struct FetchedResponse {
+    final_url: String,
+    content_type: String,
+    buffer: Vec<u8>,
+    truncated: bool,
+}
+
+async fn fetch_url_with_limits(
+    url: &str,
+    timeout_ms: u64,
+    max_bytes: usize,
+    max_redirects: usize,
+) -> anyhow::Result<FetchedResponse> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .redirect(reqwest::redirect::Policy::limited(max_redirects))
+        .build()?;
+
+    let res = client
+        .get(url)
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .send()
+        .await?;
+    let final_url = res.url().to_string();
+    let content_type = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let mut stream = res.bytes_stream();
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if buffer.len() + chunk.len() > max_bytes {
+            let remaining = max_bytes.saturating_sub(buffer.len());
+            buffer.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+
+    Ok(FetchedResponse {
+        final_url,
+        content_type,
+        buffer,
+        truncated,
+    })
 }
 
 fn strip_html_noise(input: &str) -> String {
@@ -1552,9 +1965,8 @@ fn extract_websearch_query(args: &Value) -> Option<String> {
     const QUERY_KEYS: [&str; 5] = ["query", "q", "search_query", "searchQuery", "keywords"];
     for key in QUERY_KEYS {
         if let Some(query) = args.get(key).and_then(|v| v.as_str()) {
-            let trimmed = query.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+            if let Some(cleaned) = sanitize_websearch_query_candidate(query) {
+                return Some(cleaned);
             }
         }
     }
@@ -1564,9 +1976,8 @@ fn extract_websearch_query(args: &Value) -> Option<String> {
         if let Some(obj) = args.get(container) {
             for key in QUERY_KEYS {
                 if let Some(query) = obj.get(key).and_then(|v| v.as_str()) {
-                    let trimmed = query.trim();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed.to_string());
+                    if let Some(cleaned) = sanitize_websearch_query_candidate(query) {
+                        return Some(cleaned);
                     }
                 }
             }
@@ -1574,10 +1985,60 @@ fn extract_websearch_query(args: &Value) -> Option<String> {
     }
 
     // Last resort: plain string args.
-    args.as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
+    args.as_str().and_then(sanitize_websearch_query_candidate)
+}
+
+fn sanitize_websearch_query_candidate(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(start) = lower.find("<arg_value>") {
+        let value_start = start + "<arg_value>".len();
+        let tail = &trimmed[value_start..];
+        let value = if let Some(end) = tail.to_ascii_lowercase().find("</arg_value>") {
+            &tail[..end]
+        } else {
+            tail
+        };
+        let cleaned = value.trim();
+        if !cleaned.is_empty() {
+            return Some(cleaned.to_string());
+        }
+    }
+
+    let without_wrappers = trimmed
+        .replace("<arg_key>", " ")
+        .replace("</arg_key>", " ")
+        .replace("<arg_value>", " ")
+        .replace("</arg_value>", " ");
+    let collapsed = without_wrappers
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+
+    let collapsed_lower = collapsed.to_ascii_lowercase();
+    if let Some(rest) = collapsed_lower.strip_prefix("websearch query ") {
+        let offset = collapsed.len() - rest.len();
+        let q = collapsed[offset..].trim();
+        if !q.is_empty() {
+            return Some(q.to_string());
+        }
+    }
+    if let Some(rest) = collapsed_lower.strip_prefix("query ") {
+        let offset = collapsed.len() - rest.len();
+        let q = collapsed[offset..].trim();
+        if !q.is_empty() {
+            return Some(q.to_string());
+        }
+    }
+
+    Some(collapsed)
 }
 
 fn extract_websearch_limit(args: &Value) -> Option<u64> {
@@ -1626,19 +2087,16 @@ impl Tool for CodeSearchTool {
             });
         }
         let root = args["path"].as_str().unwrap_or(".");
-        if !is_path_allowed(root) {
-            return Ok(ToolResult {
-                output: "path denied by sandbox policy".to_string(),
-                metadata: json!({"path": root}),
-            });
-        }
+        let Some(root_path) = resolve_walk_root(root, &args) else {
+            return Ok(sandbox_path_denied_result(root, &args));
+        };
         let limit = args["limit"]
             .as_u64()
             .map(|v| v.clamp(1, 200) as usize)
             .unwrap_or(50);
         let mut hits = Vec::new();
         let lower = query.to_lowercase();
-        for entry in WalkBuilder::new(root).build().flatten() {
+        for entry in WalkBuilder::new(&root_path).build().flatten() {
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;
             }
@@ -1666,7 +2124,7 @@ impl Tool for CodeSearchTool {
         }
         Ok(ToolResult {
             output: hits.join("\n"),
-            metadata: json!({"count": hits.len(), "query": query}),
+            metadata: json!({"count": hits.len(), "query": query, "path": root_path.to_string_lossy()}),
         })
     }
 }
@@ -1712,15 +2170,86 @@ impl Tool for TaskTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "task".to_string(),
-            description: "Create a subtask summary for orchestrator".to_string(),
-            input_schema: json!({"type":"object","properties":{"description":{"type":"string"},"prompt":{"type":"string"}}}),
+            description: "Create a subtask summary or spawn a teammate when team_name is provided."
+                .to_string(),
+            input_schema: task_schema(),
         }
     }
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let description = args["description"].as_str().unwrap_or("subtask");
+        let input = serde_json::from_value::<TaskInput>(args.clone())
+            .map_err(|err| anyhow!("invalid Task args: {}", err))?;
+        let description = input.description;
+        if let Some(team_name_raw) = input.team_name {
+            let team_name = sanitize_team_name(&team_name_raw)?;
+            let paths = resolve_agent_team_paths(&args)?;
+            fs::create_dir_all(paths.team_dir(&team_name)).await?;
+            fs::create_dir_all(paths.tasks_dir(&team_name)).await?;
+            fs::create_dir_all(paths.mailboxes_dir(&team_name)).await?;
+            fs::create_dir_all(paths.requests_dir(&team_name)).await?;
+            upsert_team_index(&paths, &team_name).await?;
+
+            let member_name = if let Some(requested_name) = input.name {
+                sanitize_member_name(&requested_name)?
+            } else {
+                next_default_member_name(&paths, &team_name).await?
+            };
+            let inserted = upsert_team_member(
+                &paths,
+                &team_name,
+                &member_name,
+                Some(input.subagent_type.clone()),
+                input.model.clone(),
+            )
+            .await?;
+            append_mailbox_message(
+                &paths,
+                &team_name,
+                &member_name,
+                json!({
+                    "id": format!("msg_{}", uuid_like(now_ms_u64())),
+                    "type": "task_prompt",
+                    "from": args.get("sender").and_then(|v| v.as_str()).unwrap_or("team-lead"),
+                    "to": member_name,
+                    "content": input.prompt,
+                    "summary": description,
+                    "timestampMs": now_ms_u64(),
+                    "read": false
+                }),
+            )
+            .await?;
+            let mut events = Vec::new();
+            if inserted {
+                events.push(json!({
+                    "type": "agent_team.member.spawned",
+                    "properties": {
+                        "teamName": team_name,
+                        "memberName": member_name,
+                        "agentType": input.subagent_type,
+                        "model": input.model,
+                    }
+                }));
+            }
+            events.push(json!({
+                "type": "agent_team.mailbox.enqueued",
+                "properties": {
+                    "teamName": team_name,
+                    "recipient": member_name,
+                    "messageType": "task_prompt",
+                }
+            }));
+            return Ok(ToolResult {
+                output: format!("Teammate task queued for {}", member_name),
+                metadata: json!({
+                    "ok": true,
+                    "team_name": team_name,
+                    "teammate_name": member_name,
+                    "events": events
+                }),
+            });
+        }
         Ok(ToolResult {
             output: format!("Subtask planned: {description}"),
-            metadata: json!({"description": description, "prompt": args["prompt"]}),
+            metadata: json!({"description": description, "prompt": input.prompt}),
         })
     }
 }
@@ -1750,11 +2279,173 @@ impl Tool for QuestionTool {
         }
     }
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let questions = normalize_question_payload(&args);
+        if questions.is_empty() {
+            return Err(anyhow!(
+                "QUESTION_INVALID_ARGS: expected non-empty `questions` with at least one non-empty `question` string"
+            ));
+        }
         Ok(ToolResult {
             output: "Question requested. Use /question endpoints to respond.".to_string(),
-            metadata: json!({"questions": args["questions"]}),
+            metadata: json!({"questions": questions}),
         })
     }
+}
+
+fn normalize_question_payload(args: &Value) -> Vec<Value> {
+    let parsed_args;
+    let args = if let Some(raw) = args.as_str() {
+        if let Ok(decoded) = serde_json::from_str::<Value>(raw) {
+            parsed_args = decoded;
+            &parsed_args
+        } else {
+            args
+        }
+    } else {
+        args
+    };
+
+    let Some(obj) = args.as_object() else {
+        return Vec::new();
+    };
+
+    if let Some(items) = obj.get("questions").and_then(|v| v.as_array()) {
+        let normalized = items
+            .iter()
+            .filter_map(normalize_question_entry)
+            .collect::<Vec<_>>();
+        if !normalized.is_empty() {
+            return normalized;
+        }
+    }
+
+    let question = obj
+        .get("question")
+        .or_else(|| obj.get("prompt"))
+        .or_else(|| obj.get("query"))
+        .or_else(|| obj.get("text"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(question) = question else {
+        return Vec::new();
+    };
+    let options = obj
+        .get("options")
+        .or_else(|| obj.get("choices"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(normalize_question_choice)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let multiple = obj
+        .get("multiple")
+        .or_else(|| obj.get("multi_select"))
+        .or_else(|| obj.get("multiSelect"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let custom = obj
+        .get("custom")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(options.is_empty());
+    vec![json!({
+        "header": obj.get("header").and_then(|v| v.as_str()).unwrap_or("Question"),
+        "question": question,
+        "options": options,
+        "multiple": multiple,
+        "custom": custom
+    })]
+}
+
+fn normalize_question_entry(entry: &Value) -> Option<Value> {
+    if let Some(raw) = entry.as_str() {
+        let question = raw.trim();
+        if question.is_empty() {
+            return None;
+        }
+        return Some(json!({
+            "header": "Question",
+            "question": question,
+            "options": [],
+            "multiple": false,
+            "custom": true
+        }));
+    }
+    let obj = entry.as_object()?;
+    let question = obj
+        .get("question")
+        .or_else(|| obj.get("prompt"))
+        .or_else(|| obj.get("query"))
+        .or_else(|| obj.get("text"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let options = obj
+        .get("options")
+        .or_else(|| obj.get("choices"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(normalize_question_choice)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let multiple = obj
+        .get("multiple")
+        .or_else(|| obj.get("multi_select"))
+        .or_else(|| obj.get("multiSelect"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let custom = obj
+        .get("custom")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(options.is_empty());
+    Some(json!({
+        "header": obj.get("header").and_then(|v| v.as_str()).unwrap_or("Question"),
+        "question": question,
+        "options": options,
+        "multiple": multiple,
+        "custom": custom
+    }))
+}
+
+fn normalize_question_choice(choice: &Value) -> Option<Value> {
+    if let Some(label) = choice.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(json!({
+            "label": label,
+            "description": ""
+        }));
+    }
+    let obj = choice.as_object()?;
+    let label = obj
+        .get("label")
+        .or_else(|| obj.get("title"))
+        .or_else(|| obj.get("name"))
+        .or_else(|| obj.get("value"))
+        .or_else(|| obj.get("text"))
+        .and_then(|v| {
+            if let Some(s) = v.as_str() {
+                Some(s.trim().to_string())
+            } else {
+                v.as_i64()
+                    .map(|n| n.to_string())
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            }
+        })
+        .filter(|s| !s.is_empty())?;
+    let description = obj
+        .get("description")
+        .or_else(|| obj.get("hint"))
+        .or_else(|| obj.get("subtitle"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(json!({
+        "label": label,
+        "description": description
+    }))
 }
 
 struct SpawnAgentTool;
@@ -1790,6 +2481,777 @@ impl Tool for SpawnAgentTool {
             }),
         })
     }
+}
+
+struct TeamCreateTool;
+#[async_trait]
+impl Tool for TeamCreateTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "TeamCreate".to_string(),
+            description: "Create a coordinated team and shared task context.".to_string(),
+            input_schema: team_create_schema(),
+        }
+    }
+
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let input = serde_json::from_value::<TeamCreateInput>(args.clone())
+            .map_err(|err| anyhow!("invalid TeamCreate args: {}", err))?;
+        let now_ms = now_ms_u64();
+        let paths = resolve_agent_team_paths(&args)?;
+        let team_name = sanitize_team_name(&input.team_name)?;
+        let team_dir = paths.team_dir(&team_name);
+        fs::create_dir_all(paths.tasks_dir(&team_name)).await?;
+        fs::create_dir_all(paths.mailboxes_dir(&team_name)).await?;
+        fs::create_dir_all(paths.requests_dir(&team_name)).await?;
+
+        let config = json!({
+            "teamName": team_name,
+            "description": input.description,
+            "agentType": input.agent_type,
+            "createdAtMs": now_ms
+        });
+        write_json_file(paths.config_file(&team_name), &config).await?;
+
+        let lead_name = args
+            .get("lead_name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("A1");
+        let members = json!([{
+            "name": lead_name,
+            "agentType": input.agent_type.clone().unwrap_or_else(|| "lead".to_string()),
+            "createdAtMs": now_ms
+        }]);
+        write_json_file(paths.members_file(&team_name), &members).await?;
+
+        upsert_team_index(&paths, &team_name).await?;
+        if let Some(session_id) = args.get("__session_id").and_then(|v| v.as_str()) {
+            write_team_session_context(&paths, session_id, &team_name).await?;
+        }
+
+        Ok(ToolResult {
+            output: format!("Team created: {}", team_name),
+            metadata: json!({
+                "ok": true,
+                "team_name": team_name,
+                "path": team_dir.to_string_lossy(),
+                "events": [{
+                    "type": "agent_team.team.created",
+                    "properties": {
+                        "teamName": team_name,
+                        "path": team_dir.to_string_lossy(),
+                    }
+                }]
+            }),
+        })
+    }
+}
+
+struct TaskCreateCompatTool;
+#[async_trait]
+impl Tool for TaskCreateCompatTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "TaskCreate".to_string(),
+            description: "Create a task in the shared team task list.".to_string(),
+            input_schema: task_create_schema(),
+        }
+    }
+
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let input = serde_json::from_value::<TaskCreateInput>(args.clone())
+            .map_err(|err| anyhow!("invalid TaskCreate args: {}", err))?;
+        let paths = resolve_agent_team_paths(&args)?;
+        let team_name = resolve_team_name(&paths, &args).await?;
+        let tasks_dir = paths.tasks_dir(&team_name);
+        fs::create_dir_all(&tasks_dir).await?;
+        let next_id = next_task_id(&tasks_dir).await?;
+        let now_ms = now_ms_u64();
+        let task = json!({
+            "id": next_id.to_string(),
+            "subject": input.subject,
+            "description": input.description,
+            "activeForm": input.active_form,
+            "status": "pending",
+            "owner": Value::Null,
+            "blocks": [],
+            "blockedBy": [],
+            "metadata": input.metadata.unwrap_or_else(|| json!({})),
+            "createdAtMs": now_ms,
+            "updatedAtMs": now_ms
+        });
+        write_json_file(paths.task_file(&team_name, &next_id.to_string()), &task).await?;
+        Ok(ToolResult {
+            output: format!("Task created: {}", next_id),
+            metadata: json!({
+                "ok": true,
+                "team_name": team_name,
+                "task": task,
+                "events": [{
+                    "type": "agent_team.task.created",
+                    "properties": {
+                        "teamName": team_name,
+                        "taskId": next_id.to_string(),
+                    }
+                }]
+            }),
+        })
+    }
+}
+
+struct TaskUpdateCompatTool;
+#[async_trait]
+impl Tool for TaskUpdateCompatTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "TaskUpdate".to_string(),
+            description: "Update ownership/state/dependencies of a shared task.".to_string(),
+            input_schema: task_update_schema(),
+        }
+    }
+
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let input = serde_json::from_value::<TaskUpdateInput>(args.clone())
+            .map_err(|err| anyhow!("invalid TaskUpdate args: {}", err))?;
+        let paths = resolve_agent_team_paths(&args)?;
+        let team_name = resolve_team_name(&paths, &args).await?;
+        let task_path = paths.task_file(&team_name, &input.task_id);
+        if !task_path.exists() {
+            return Ok(ToolResult {
+                output: format!("Task not found: {}", input.task_id),
+                metadata: json!({"ok": false, "code": "TASK_NOT_FOUND"}),
+            });
+        }
+        let raw = fs::read_to_string(&task_path).await?;
+        let mut task = serde_json::from_str::<Value>(&raw)
+            .map_err(|err| anyhow!("failed parsing task {}: {}", input.task_id, err))?;
+        let Some(obj) = task.as_object_mut() else {
+            return Err(anyhow!("task payload is not an object"));
+        };
+
+        if let Some(subject) = input.subject {
+            obj.insert("subject".to_string(), Value::String(subject));
+        }
+        if let Some(description) = input.description {
+            obj.insert("description".to_string(), Value::String(description));
+        }
+        if let Some(active) = input.active_form {
+            obj.insert("activeForm".to_string(), Value::String(active));
+        }
+        if let Some(status) = input.status {
+            if status == "deleted" {
+                let _ = fs::remove_file(&task_path).await;
+                return Ok(ToolResult {
+                    output: format!("Task deleted: {}", input.task_id),
+                    metadata: json!({
+                        "ok": true,
+                        "deleted": true,
+                        "taskId": input.task_id,
+                        "events": [{
+                            "type": "agent_team.task.deleted",
+                            "properties": {
+                                "teamName": team_name,
+                                "taskId": input.task_id
+                            }
+                        }]
+                    }),
+                });
+            }
+            obj.insert("status".to_string(), Value::String(status));
+        }
+        if let Some(owner) = input.owner {
+            obj.insert("owner".to_string(), Value::String(owner));
+        }
+        if let Some(add_blocks) = input.add_blocks {
+            let current = obj
+                .get("blocks")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            obj.insert(
+                "blocks".to_string(),
+                Value::Array(merge_unique_strings(current, add_blocks)),
+            );
+        }
+        if let Some(add_blocked_by) = input.add_blocked_by {
+            let current = obj
+                .get("blockedBy")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            obj.insert(
+                "blockedBy".to_string(),
+                Value::Array(merge_unique_strings(current, add_blocked_by)),
+            );
+        }
+        if let Some(metadata) = input.metadata {
+            if let Some(current) = obj.get_mut("metadata").and_then(|v| v.as_object_mut()) {
+                if let Some(incoming) = metadata.as_object() {
+                    for (k, v) in incoming {
+                        if v.is_null() {
+                            current.remove(k);
+                        } else {
+                            current.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            } else {
+                obj.insert("metadata".to_string(), metadata);
+            }
+        }
+        obj.insert("updatedAtMs".to_string(), json!(now_ms_u64()));
+        write_json_file(task_path, &task).await?;
+        Ok(ToolResult {
+            output: format!("Task updated: {}", input.task_id),
+            metadata: json!({
+                "ok": true,
+                "team_name": team_name,
+                "task": task,
+                "events": [{
+                    "type": "agent_team.task.updated",
+                    "properties": {
+                        "teamName": team_name,
+                        "taskId": input.task_id
+                    }
+                }]
+            }),
+        })
+    }
+}
+
+struct TaskListCompatTool;
+#[async_trait]
+impl Tool for TaskListCompatTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "TaskList".to_string(),
+            description: "List tasks from the shared task list.".to_string(),
+            input_schema: task_list_schema(),
+        }
+    }
+
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let _ = serde_json::from_value::<TaskListInput>(args.clone())
+            .map_err(|err| anyhow!("invalid TaskList args: {}", err))?;
+        let paths = resolve_agent_team_paths(&args)?;
+        let team_name = resolve_team_name(&paths, &args).await?;
+        let tasks = read_tasks(&paths.tasks_dir(&team_name)).await?;
+        let mut lines = Vec::new();
+        for task in &tasks {
+            let id = task
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let subject = task
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(untitled)")
+                .to_string();
+            let status = task
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pending")
+                .to_string();
+            let owner = task
+                .get("owner")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            lines.push(format!(
+                "{} [{}] {}{}",
+                id,
+                status,
+                subject,
+                if owner.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(" (owner: {})", owner)
+                }
+            ));
+        }
+        Ok(ToolResult {
+            output: if lines.is_empty() {
+                "No tasks.".to_string()
+            } else {
+                lines.join("\n")
+            },
+            metadata: json!({
+                "ok": true,
+                "team_name": team_name,
+                "tasks": tasks
+            }),
+        })
+    }
+}
+
+struct SendMessageCompatTool;
+#[async_trait]
+impl Tool for SendMessageCompatTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "SendMessage".to_string(),
+            description: "Send teammate messages and coordination protocol responses.".to_string(),
+            input_schema: send_message_schema(),
+        }
+    }
+
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let input = serde_json::from_value::<SendMessageInput>(args.clone())
+            .map_err(|err| anyhow!("invalid SendMessage args: {}", err))?;
+        let paths = resolve_agent_team_paths(&args)?;
+        let team_name = resolve_team_name(&paths, &args).await?;
+        fs::create_dir_all(paths.mailboxes_dir(&team_name)).await?;
+        let sender = args
+            .get("sender")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("team-lead")
+            .to_string();
+        let now_ms = now_ms_u64();
+
+        match input.message_type {
+            SendMessageType::Message | SendMessageType::ShutdownRequest => {
+                let recipient = required_non_empty(input.recipient, "recipient")?;
+                let content = required_non_empty(input.content, "content")?;
+                append_mailbox_message(
+                    &paths,
+                    &team_name,
+                    &recipient,
+                    json!({
+                        "id": format!("msg_{}", uuid_like(now_ms)),
+                        "type": message_type_name(&input.message_type),
+                        "from": sender,
+                        "to": recipient,
+                        "content": content,
+                        "summary": input.summary,
+                        "timestampMs": now_ms,
+                        "read": false
+                    }),
+                )
+                .await?;
+                Ok(ToolResult {
+                    output: "Message queued.".to_string(),
+                    metadata: json!({
+                        "ok": true,
+                        "team_name": team_name,
+                        "events": [{
+                            "type": "agent_team.mailbox.enqueued",
+                            "properties": {
+                                "teamName": team_name,
+                                "recipient": recipient,
+                                "messageType": message_type_name(&input.message_type),
+                            }
+                        }]
+                    }),
+                })
+            }
+            SendMessageType::Broadcast => {
+                let content = required_non_empty(input.content, "content")?;
+                let members = read_team_member_names(&paths, &team_name).await?;
+                for recipient in members {
+                    append_mailbox_message(
+                        &paths,
+                        &team_name,
+                        &recipient,
+                        json!({
+                            "id": format!("msg_{}_{}", uuid_like(now_ms), recipient),
+                            "type": "broadcast",
+                            "from": sender,
+                            "to": recipient,
+                            "content": content,
+                            "summary": input.summary,
+                            "timestampMs": now_ms,
+                            "read": false
+                        }),
+                    )
+                    .await?;
+                }
+                Ok(ToolResult {
+                    output: "Broadcast queued.".to_string(),
+                    metadata: json!({
+                        "ok": true,
+                        "team_name": team_name,
+                        "events": [{
+                            "type": "agent_team.mailbox.enqueued",
+                            "properties": {
+                                "teamName": team_name,
+                                "recipient": "*",
+                                "messageType": "broadcast",
+                            }
+                        }]
+                    }),
+                })
+            }
+            SendMessageType::ShutdownResponse | SendMessageType::PlanApprovalResponse => {
+                let request_id = required_non_empty(input.request_id, "request_id")?;
+                let request = json!({
+                    "requestId": request_id,
+                    "type": message_type_name(&input.message_type),
+                    "from": sender,
+                    "recipient": input.recipient,
+                    "approve": input.approve,
+                    "content": input.content,
+                    "updatedAtMs": now_ms
+                });
+                write_json_file(paths.request_file(&team_name, &request_id), &request).await?;
+                Ok(ToolResult {
+                    output: "Response recorded.".to_string(),
+                    metadata: json!({
+                        "ok": true,
+                        "team_name": team_name,
+                        "request": request,
+                        "events": [{
+                            "type": "agent_team.request.resolved",
+                            "properties": {
+                                "teamName": team_name,
+                                "requestId": request_id,
+                                "requestType": message_type_name(&input.message_type),
+                                "approve": input.approve
+                            }
+                        }]
+                    }),
+                })
+            }
+        }
+    }
+}
+
+fn message_type_name(ty: &SendMessageType) -> &'static str {
+    match ty {
+        SendMessageType::Message => "message",
+        SendMessageType::Broadcast => "broadcast",
+        SendMessageType::ShutdownRequest => "shutdown_request",
+        SendMessageType::ShutdownResponse => "shutdown_response",
+        SendMessageType::PlanApprovalResponse => "plan_approval_response",
+    }
+}
+
+fn required_non_empty(value: Option<String>, field: &str) -> anyhow::Result<String> {
+    let Some(v) = value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(anyhow!("{} is required", field));
+    };
+    Ok(v)
+}
+
+fn resolve_agent_team_paths(args: &Value) -> anyhow::Result<AgentTeamPaths> {
+    let workspace_root = args
+        .get("__workspace_root")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| anyhow!("workspace root unavailable"))?;
+    Ok(AgentTeamPaths::new(workspace_root.join(".tandem")))
+}
+
+async fn resolve_team_name(paths: &AgentTeamPaths, args: &Value) -> anyhow::Result<String> {
+    if let Some(name) = args
+        .get("team_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return sanitize_team_name(name);
+    }
+    if let Some(session_id) = args.get("__session_id").and_then(|v| v.as_str()) {
+        let context_path = paths
+            .root()
+            .join("session-context")
+            .join(format!("{}.json", session_id));
+        if context_path.exists() {
+            let raw = fs::read_to_string(context_path).await?;
+            let parsed = serde_json::from_str::<Value>(&raw)?;
+            if let Some(name) = parsed
+                .get("team_name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return sanitize_team_name(name);
+            }
+        }
+    }
+    Err(anyhow!(
+        "team_name is required (no active team context for this session)"
+    ))
+}
+
+fn sanitize_team_name(input: &str) -> anyhow::Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("team_name cannot be empty"));
+    }
+    let sanitized = trimmed
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    Ok(sanitized)
+}
+
+fn sanitize_member_name(input: &str) -> anyhow::Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("member name cannot be empty"));
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix('A')
+        .or_else(|| trimmed.strip_prefix('a'))
+    {
+        if let Ok(n) = rest.parse::<u32>() {
+            if n > 0 {
+                return Ok(format!("A{}", n));
+            }
+        }
+    }
+    let sanitized = trimmed
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        return Err(anyhow!("member name cannot be empty"));
+    }
+    Ok(sanitized)
+}
+
+async fn next_default_member_name(
+    paths: &AgentTeamPaths,
+    team_name: &str,
+) -> anyhow::Result<String> {
+    let names = read_team_member_names(paths, team_name).await?;
+    let mut max_index = 1u32;
+    for name in names {
+        let trimmed = name.trim();
+        let Some(rest) = trimmed
+            .strip_prefix('A')
+            .or_else(|| trimmed.strip_prefix('a'))
+        else {
+            continue;
+        };
+        let Ok(index) = rest.parse::<u32>() else {
+            continue;
+        };
+        if index > max_index {
+            max_index = index;
+        }
+    }
+    Ok(format!("A{}", max_index.saturating_add(1)))
+}
+
+async fn write_json_file(path: PathBuf, value: &Value) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(value)?).await?;
+    Ok(())
+}
+
+async fn upsert_team_index(paths: &AgentTeamPaths, team_name: &str) -> anyhow::Result<()> {
+    let index_path = paths.index_file();
+    let mut teams = if index_path.exists() {
+        let raw = fs::read_to_string(&index_path).await?;
+        serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if !teams.iter().any(|team| team == team_name) {
+        teams.push(team_name.to_string());
+        teams.sort();
+    }
+    write_json_file(index_path, &json!(teams)).await
+}
+
+async fn write_team_session_context(
+    paths: &AgentTeamPaths,
+    session_id: &str,
+    team_name: &str,
+) -> anyhow::Result<()> {
+    let context_path = paths
+        .root()
+        .join("session-context")
+        .join(format!("{}.json", session_id));
+    write_json_file(context_path, &json!({ "team_name": team_name })).await
+}
+
+async fn next_task_id(tasks_dir: &Path) -> anyhow::Result<u64> {
+    let mut max_id = 0u64;
+    let mut entries = match fs::read_dir(tasks_dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(1),
+        Err(err) => return Err(err.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Ok(id) = stem.parse::<u64>() {
+            max_id = max_id.max(id);
+        }
+    }
+    Ok(max_id + 1)
+}
+
+fn merge_unique_strings(current: Vec<Value>, incoming: Vec<String>) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in current {
+        if let Some(text) = value.as_str() {
+            let text = text.to_string();
+            if seen.insert(text.clone()) {
+                out.push(Value::String(text));
+            }
+        }
+    }
+    for value in incoming {
+        if seen.insert(value.clone()) {
+            out.push(Value::String(value));
+        }
+    }
+    out
+}
+
+async fn read_tasks(tasks_dir: &Path) -> anyhow::Result<Vec<Value>> {
+    let mut tasks = Vec::new();
+    let mut entries = match fs::read_dir(tasks_dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(tasks),
+        Err(err) => return Err(err.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let raw = fs::read_to_string(path).await?;
+        let task = serde_json::from_str::<Value>(&raw)?;
+        tasks.push(task);
+    }
+    tasks.sort_by_key(|task| {
+        task.get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    });
+    Ok(tasks)
+}
+
+async fn append_mailbox_message(
+    paths: &AgentTeamPaths,
+    team_name: &str,
+    recipient: &str,
+    message: Value,
+) -> anyhow::Result<()> {
+    let mailbox_path = paths.mailbox_file(team_name, recipient);
+    if let Some(parent) = mailbox_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let line = format!("{}\n", serde_json::to_string(&message)?);
+    if mailbox_path.exists() {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(mailbox_path)
+            .await?;
+        file.write_all(line.as_bytes()).await?;
+        file.flush().await?;
+    } else {
+        fs::write(mailbox_path, line).await?;
+    }
+    Ok(())
+}
+
+async fn read_team_member_names(
+    paths: &AgentTeamPaths,
+    team_name: &str,
+) -> anyhow::Result<Vec<String>> {
+    let members_path = paths.members_file(team_name);
+    if !members_path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(members_path).await?;
+    let parsed = serde_json::from_str::<Value>(&raw)?;
+    let Some(items) = parsed.as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in items {
+        if let Some(name) = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            out.push(name.to_string());
+        }
+    }
+    Ok(out)
+}
+
+async fn upsert_team_member(
+    paths: &AgentTeamPaths,
+    team_name: &str,
+    member_name: &str,
+    agent_type: Option<String>,
+    model: Option<String>,
+) -> anyhow::Result<bool> {
+    let members_path = paths.members_file(team_name);
+    let mut members = if members_path.exists() {
+        let raw = fs::read_to_string(&members_path).await?;
+        serde_json::from_str::<Value>(&raw)?
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let already_present = members.iter().any(|item| {
+        item.get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s == member_name)
+            .unwrap_or(false)
+    });
+    if already_present {
+        return Ok(false);
+    }
+    members.push(json!({
+        "name": member_name,
+        "agentType": agent_type,
+        "model": model,
+        "createdAtMs": now_ms_u64()
+    }));
+    write_json_file(members_path, &Value::Array(members)).await?;
+    Ok(true)
+}
+
+fn now_ms_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn uuid_like(seed: u64) -> String {
+    format!("{:x}", seed)
 }
 
 struct MemorySearchTool;
@@ -2352,6 +3814,15 @@ fn resolve_memory_db_path(args: &Value) -> PathBuf {
             return PathBuf::from(trimmed);
         }
     }
+    if let Ok(state_dir) = std::env::var("TANDEM_STATE_DIR") {
+        let trimmed = state_dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("memory.sqlite");
+        }
+    }
+    if let Some(data_dir) = dirs::data_dir() {
+        return data_dir.join("tandem").join("memory.sqlite");
+    }
     PathBuf::from("memory.sqlite")
 }
 
@@ -2622,34 +4093,37 @@ impl Tool for LspTool {
     }
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let operation = args["operation"].as_str().unwrap_or("symbols");
+        let workspace_root =
+            workspace_root_from_args(&args).unwrap_or_else(|| effective_cwd_from_args(&args));
         let output = match operation {
             "diagnostics" => {
                 let path = args["filePath"].as_str().unwrap_or("");
-                if path.is_empty() || !is_path_allowed(path) {
-                    "missing or unsafe filePath".to_string()
-                } else {
-                    diagnostics_for_path(path).await
+                match resolve_tool_path(path, &args) {
+                    Some(resolved_path) => {
+                        diagnostics_for_path(&resolved_path.to_string_lossy()).await
+                    }
+                    None => "missing or unsafe filePath".to_string(),
                 }
             }
             "definition" => {
                 let symbol = args["symbol"].as_str().unwrap_or("");
-                find_symbol_definition(symbol).await
+                find_symbol_definition(symbol, &workspace_root).await
             }
             "references" => {
                 let symbol = args["symbol"].as_str().unwrap_or("");
-                find_symbol_references(symbol).await
+                find_symbol_references(symbol, &workspace_root).await
             }
             _ => {
                 let query = args["query"]
                     .as_str()
                     .or_else(|| args["symbol"].as_str())
                     .unwrap_or("");
-                list_symbols(query).await
+                list_symbols(query, &workspace_root).await
             }
         };
         Ok(ToolResult {
             output,
-            metadata: json!({"operation": operation}),
+            metadata: json!({"operation": operation, "workspace_root": workspace_root.to_string_lossy()}),
         })
     }
 }
@@ -2721,12 +4195,12 @@ async fn diagnostics_for_path(path: &str) -> String {
     }
 }
 
-async fn list_symbols(query: &str) -> String {
+async fn list_symbols(query: &str, root: &Path) -> String {
     let query = query.to_lowercase();
     let rust_fn = Regex::new(r"^\s*(pub\s+)?(async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
         .unwrap_or_else(|_| Regex::new("$^").expect("regex"));
     let mut out = Vec::new();
-    for entry in WalkBuilder::new(".").build().flatten() {
+    for entry in WalkBuilder::new(root).build().flatten() {
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
@@ -2755,11 +4229,11 @@ async fn list_symbols(query: &str) -> String {
     out.join("\n")
 }
 
-async fn find_symbol_definition(symbol: &str) -> String {
+async fn find_symbol_definition(symbol: &str, root: &Path) -> String {
     if symbol.trim().is_empty() {
         return "missing symbol".to_string();
     }
-    let listed = list_symbols(symbol).await;
+    let listed = list_symbols(symbol, root).await;
     listed
         .lines()
         .find(|line| line.ends_with(&format!("fn {symbol}")))
@@ -2771,6 +4245,8 @@ async fn find_symbol_definition(symbol: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::path::PathBuf;
+    use tokio::fs;
 
     #[test]
     fn validator_rejects_array_without_items() {
@@ -2824,6 +4300,12 @@ mod tests {
         assert_eq!(
             extract_websearch_query(&as_string).as_deref(),
             Some("find docs")
+        );
+
+        let malformed = json!({"query":"websearch query</arg_key><arg_value>taj card what is it benefits how to apply</arg_value>"});
+        assert_eq!(
+            extract_websearch_query(&malformed).as_deref(),
+            Some("taj card what is it benefits how to apply")
         );
     }
 
@@ -2954,12 +4436,54 @@ mod tests {
 
     #[test]
     fn path_policy_rejects_tool_markup_and_globs() {
-        assert!(!is_path_allowed(
-            "<tool_call><function=glob><parameter=pattern>**/*</parameter></function></tool_call>"
-        ));
-        assert!(!is_path_allowed("**/*"));
-        assert!(!is_path_allowed("/"));
-        assert!(!is_path_allowed("C:\\"));
+        assert!(resolve_tool_path(
+            "<tool_call><function=glob><parameter=pattern>**/*</parameter></function></tool_call>",
+            &json!({})
+        )
+        .is_none());
+        assert!(resolve_tool_path("**/*", &json!({})).is_none());
+        assert!(resolve_tool_path("/", &json!({})).is_none());
+        assert!(resolve_tool_path("C:\\", &json!({})).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_policy_allows_windows_verbatim_paths_within_workspace() {
+        let args = json!({
+            "__workspace_root": r"C:\tandem-examples",
+            "__effective_cwd": r"C:\tandem-examples\docs"
+        });
+        assert!(resolve_tool_path(r"\\?\C:\tandem-examples\docs\index.html", &args).is_some());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn path_policy_allows_absolute_linux_paths_within_workspace() {
+        let args = json!({
+            "__workspace_root": "/tmp/tandem-examples",
+            "__effective_cwd": "/tmp/tandem-examples/docs"
+        });
+        assert!(resolve_tool_path("/tmp/tandem-examples/docs/index.html", &args).is_some());
+        assert!(resolve_tool_path("/etc/passwd", &args).is_none());
+    }
+
+    #[test]
+    fn read_fallback_resolves_unique_suffix_filename() {
+        let root =
+            std::env::temp_dir().join(format!("tandem-read-fallback-{}", uuid_like(now_ms_u64())));
+        std::fs::create_dir_all(&root).expect("create root");
+        let target = root.join("T1011U kitöltési útmutató.pdf");
+        std::fs::write(&target, b"stub").expect("write test file");
+
+        let args = json!({
+            "__workspace_root": root.to_string_lossy().to_string(),
+            "__effective_cwd": root.to_string_lossy().to_string()
+        });
+        let resolved = resolve_read_path_fallback("útmutató.pdf", &args)
+            .expect("expected unique suffix match");
+        assert_eq!(resolved, target);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -3046,9 +4570,52 @@ mod tests {
             .expect("batch should return ToolResult");
         assert_eq!(result.metadata["count"], json!(0));
     }
+
+    #[test]
+    fn sanitize_member_name_normalizes_agent_aliases() {
+        assert_eq!(sanitize_member_name("A2").expect("valid"), "A2");
+        assert_eq!(sanitize_member_name("a7").expect("valid"), "A7");
+        assert_eq!(
+            sanitize_member_name("  qa reviewer ").expect("valid"),
+            "qa-reviewer"
+        );
+        assert!(sanitize_member_name("   ").is_err());
+    }
+
+    #[tokio::test]
+    async fn next_default_member_name_skips_existing_indices() {
+        let root = std::env::temp_dir().join(format!(
+            "tandem-agent-team-test-{}",
+            uuid_like(now_ms_u64())
+        ));
+        let paths = AgentTeamPaths::new(root.join(".tandem"));
+        let team_name = "alpha";
+        fs::create_dir_all(paths.team_dir(team_name))
+            .await
+            .expect("create team dir");
+        write_json_file(
+            paths.members_file(team_name),
+            &json!([
+                {"name":"A1"},
+                {"name":"A2"},
+                {"name":"agent-x"},
+                {"name":"A5"}
+            ]),
+        )
+        .await
+        .expect("write members");
+
+        let next = next_default_member_name(&paths, team_name)
+            .await
+            .expect("next member");
+        assert_eq!(next, "A6");
+
+        let _ =
+            fs::remove_dir_all(PathBuf::from(paths.root().parent().unwrap_or(paths.root()))).await;
+    }
 }
 
-async fn find_symbol_references(symbol: &str) -> String {
+async fn find_symbol_references(symbol: &str, root: &Path) -> String {
     if symbol.trim().is_empty() {
         return "missing symbol".to_string();
     }
@@ -3058,7 +4625,7 @@ async fn find_symbol_references(symbol: &str) -> String {
         return "invalid symbol".to_string();
     };
     let mut refs = Vec::new();
-    for entry in WalkBuilder::new(".").build().flatten() {
+    for entry in WalkBuilder::new(root).build().flatten() {
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }

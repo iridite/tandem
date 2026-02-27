@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { api } from "../api";
 import { MessageSquareQuote, ChevronRight, RotateCcw } from "lucide-react";
+import { handleCommonRunEvent } from "../utils/liveEventDebug";
 
 interface GameEvent {
   id: string;
@@ -59,11 +60,34 @@ export const TextAdventure: React.FC = () => {
           setEvents(restoredEvents);
           maybeAddChoiceFromLastAssistant(restoredEvents);
         }
+
+        const runState = await api.getActiveRun(savedSessionId);
+        const active = runState?.active || null;
+        const activeRunId =
+          (active?.runID as string | undefined) ||
+          (active?.runId as string | undefined) ||
+          (active?.run_id as string | undefined) ||
+          "";
+        if (activeRunId) {
+          setIsLoading(true);
+          addEvent({
+            type: "system",
+            content: `RESUMING ACTIVE RUN ${activeRunId.substring(0, 8)}...`,
+          });
+          connectStream(savedSessionId, activeRunId);
+        }
       } catch (err) {
         console.error("Failed to restore adventure session", err);
       }
     };
     void restore();
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const addEvent = (evt: Omit<GameEvent, "id">) => {
@@ -129,8 +153,9 @@ Keep responses under 3 paragraphs plus the 3 choices.`;
       const { runId } = await api.startAsyncRun(sid, prompt);
 
       connectStream(sid, runId);
-    } catch (err: any) {
-      addEvent({ type: "system", content: `CRITICAL ERROR: ${err.message}` });
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      addEvent({ type: "system", content: `CRITICAL ERROR: ${errorMessage}` });
       setIsLoading(false);
     }
   };
@@ -142,12 +167,53 @@ Keep responses under 3 paragraphs plus the 3 choices.`;
     }
     const eventSource = new EventSource(api.getEventStreamUrl(sid, rid));
     eventSourceRef.current = eventSource;
-    let activeText = "";
     let finalized = false;
+    let sawRunEvent = false;
+    const watchdog = window.setTimeout(async () => {
+      if (finalized || sawRunEvent) return;
+      try {
+        const runState = await api.getActiveRun(sid);
+        if (!runState?.active) {
+          addEvent({
+            type: "system",
+            content:
+              "RUN ENDED BEFORE LIVE EVENTS ARRIVED. CHECK PROVIDER KEY/MODEL AND ENGINE LOGS.",
+          });
+          void finalize();
+          return;
+        }
+        addEvent({
+          type: "system",
+          content: "RUN ACTIVE, WAITING FOR LIVE DELTAS...",
+        });
+      } catch {
+        addEvent({
+          type: "system",
+          content: "NO LIVE EVENTS YET AND FAILED TO QUERY RUN STATE.",
+        });
+      }
+    }, 4000);
+    const runStatePoll = window.setInterval(async () => {
+      if (finalized) return;
+      try {
+        const runState = await api.getActiveRun(sid);
+        if (!runState?.active) {
+          addEvent({
+            type: "system",
+            content: "RUN BECAME INACTIVE WITHOUT A TERMINAL STREAM EVENT. SYNCING HISTORY...",
+          });
+          void finalize();
+        }
+      } catch {
+        // Non-fatal; keep stream attached.
+      }
+    }, 5000);
 
     const finalize = async () => {
       if (finalized) return;
       finalized = true;
+      window.clearTimeout(watchdog);
+      window.clearInterval(runStatePoll);
       try {
         const messages = await api.getSessionMessages(sid);
         const restoredEvents = buildAdventureEventsFromMessages(messages);
@@ -167,55 +233,74 @@ Keep responses under 3 paragraphs plus the 3 choices.`;
     };
 
     eventSource.onmessage = (evt) => {
-      const data = JSON.parse(evt.data);
+      try {
+        const data = JSON.parse(evt.data);
+        if (data.type !== "server.connected" && data.type !== "engine.lifecycle.ready") {
+          sawRunEvent = true;
+        }
 
-      if (
-        data.type === "message.part.updated" &&
-        data.properties.part.type === "text" &&
-        data.properties.delta
-      ) {
-        activeText += data.properties.delta;
-        // Live typing effect (we could throttle this to React state, but to avoid
-        // huge re-renders for every token, we accumulate and flush periodically,
-        // or just rely on the end of the text chunk)
-        setEvents((prev) => {
-          const updated = [...prev];
-          const last = updated[updated.length - 1];
-          if (last && last.type === "text") {
-            last.content += data.properties.delta;
-            return updated;
-          } else {
-            return [
-              ...updated,
-              { id: Math.random().toString(), type: "text", content: data.properties.delta },
-            ];
+        const handledCommon = handleCommonRunEvent(
+          data,
+          ({ content }) => addEvent({ type: "system", content: content.toUpperCase() }),
+          (status) => {
+            if (
+              status === "completed" ||
+              status === "failed" ||
+              status === "error" ||
+              status === "cancelled" ||
+              status === "canceled" ||
+              status === "timeout" ||
+              status === "timed_out"
+            ) {
+              void finalize();
+            }
           }
-        });
-      } else if (data.type === "question.asked") {
-        // Format the question as a choice
-        const qData = data.properties;
-        // Assuming the engine emits a list of options in the UI definition
-        addEvent({
-          type: "choice",
-          content: qData.question,
-          // Extract choices from question properties if they exist, or fallback
-          options: qData.options || ["Look around", "Check pockets", "Call out for help"],
-          questionId: qData.question_id,
-        });
-      } else if (
-        data.type === "run.status.updated" &&
-        (data.properties.status === "completed" || data.properties.status === "failed")
-      ) {
-        void finalize();
-      } else if (
-        data.type === "session.run.finished" &&
-        (data.properties?.status === "completed" || data.properties?.status === "failed")
-      ) {
+        );
+        if (handledCommon) {
+          return;
+        }
+
+        if (
+          data.type === "message.part.updated" &&
+          data.properties?.part?.type === "text" &&
+          data.properties?.delta
+        ) {
+          // Live typing effect (we could throttle this to React state, but to avoid
+          // huge re-renders for every token, we accumulate and flush periodically,
+          // or just rely on the end of the text chunk)
+          setEvents((prev) => {
+            const updated = [...prev];
+            const last = updated[updated.length - 1];
+            if (last && last.type === "text") {
+              last.content += data.properties.delta;
+              return updated;
+            } else {
+              return [
+                ...updated,
+                { id: Math.random().toString(), type: "text", content: data.properties.delta },
+              ];
+            }
+          });
+        } else if (data.type === "question.asked") {
+          // Format the question as a choice
+          const qData = data.properties || {};
+          addEvent({
+            type: "choice",
+            content: qData.question,
+            options: qData.options || ["Look around", "Check pockets", "Call out for help"],
+            questionId: qData.question_id,
+          });
+        }
+      } catch {
+        addEvent({ type: "system", content: "STREAM EVENT PARSE ERROR." });
         void finalize();
       }
     };
 
     eventSource.onerror = () => {
+      window.clearTimeout(watchdog);
+      window.clearInterval(runStatePoll);
+      addEvent({ type: "system", content: "STREAM DISCONNECTED." });
       setIsLoading(false);
       eventSource.close();
       if (eventSourceRef.current === eventSource) {
@@ -257,8 +342,9 @@ Keep responses under 3 paragraphs plus the 3 choices.`;
       // Also emit as a message to resume the conversation flow
       const { runId } = await api.startAsyncRun(sessionId, choice);
       connectStream(sessionId, runId);
-    } catch (err: any) {
-      addEvent({ type: "system", content: `ERROR: ${err.message}` });
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      addEvent({ type: "system", content: `ERROR: ${errorMessage}` });
       setIsLoading(false);
     }
   };

@@ -57,19 +57,19 @@ export const DEFAULT_ORCHESTRATOR_CONFIG: OrchestratorConfig = {
 };
 
 export type RunStatus =
-  | "idle"
+  | "queued"
   | "planning"
+  | "running"
   | "awaiting_approval"
-  | "revision_requested"
-  | "executing"
   | "paused"
+  | "blocked"
   | "completed"
   | "failed"
   | "cancelled";
 
 export type RunSource = "orchestrator" | "command_center";
 
-export type TaskState = "pending" | "in_progress" | "blocked" | "done" | "failed";
+export type TaskState = "pending" | "runnable" | "in_progress" | "blocked" | "done" | "failed";
 
 export interface Task {
   id: string;
@@ -118,16 +118,21 @@ export interface RunSnapshot {
 export interface RunSummary {
   run_id: string;
   session_id: string;
+  workspace_root?: string | null;
   source?: RunSource;
   objective: string;
   status: RunStatus;
   created_at: string;
   updated_at: string;
+  started_at?: string;
+  ended_at?: string | null;
+  last_error?: string | null;
 }
 
 export interface Run {
   run_id: string;
   session_id: string;
+  workspace_root?: string | null;
   objective: string;
   config: OrchestratorConfig;
   status: RunStatus;
@@ -137,6 +142,7 @@ export interface Run {
   ended_at?: string;
   error_message?: string;
   revision_feedback?: string;
+  why_next_step?: string;
 }
 
 export interface OrchestratorEvent {
@@ -144,4 +150,70 @@ export interface OrchestratorEvent {
   run_id: string;
   timestamp: string;
   [key: string]: unknown;
+}
+
+export interface RunEventRecord {
+  event_id: string;
+  run_id: string;
+  seq: number;
+  ts_ms: number;
+  type: string;
+  status: RunStatus;
+  step_id?: string | null;
+  payload: Record<string, unknown>;
+}
+
+export interface BlackboardItem {
+  id: string;
+  ts_ms: number;
+  text: string;
+  step_id?: string | null;
+  source_event_id?: string | null;
+}
+
+export interface BlackboardArtifactRef {
+  id: string;
+  ts_ms: number;
+  path: string;
+  artifact_type: "patch" | "notes" | "sources" | "fact_cards" | "file";
+  step_id?: string | null;
+  source_event_id?: string | null;
+}
+
+export interface BlackboardSummaries {
+  rolling: string;
+  latest_context_pack: string;
+}
+
+export interface Blackboard {
+  facts: BlackboardItem[];
+  decisions: BlackboardItem[];
+  open_questions: BlackboardItem[];
+  artifacts: BlackboardArtifactRef[];
+  summaries: BlackboardSummaries;
+  revision: number;
+}
+
+export interface ReplayDrift {
+  mismatch: boolean;
+  status_mismatch: boolean;
+  why_next_step_mismatch: boolean;
+  step_count_mismatch: boolean;
+}
+
+export interface RunReplaySummary {
+  ok: boolean;
+  run_id: string;
+  from_checkpoint: boolean;
+  checkpoint_seq?: number | null;
+  events_applied: number;
+  drift: ReplayDrift;
+}
+
+export interface RunCheckpointSummary {
+  checkpoint_id: string;
+  run_id: string;
+  seq: number;
+  ts_ms: number;
+  reason: string;
 }
